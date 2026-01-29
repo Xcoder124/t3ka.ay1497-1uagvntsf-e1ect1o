@@ -6,7 +6,7 @@ const app = express();
 
 // 1. SECURITY: Only allow requests from your specific frontend URL
 app.use(cors({
-    origin: 'https://your-frontend-link.onrender.com' 
+    origin: 'https://tsf-sslg-election-endpoint.onrender.com' 
 }));
 
 app.use(express.json());
