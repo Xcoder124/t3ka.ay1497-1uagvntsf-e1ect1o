@@ -108,8 +108,9 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
         }
 
         // SUCCESS: Generate a secure Token
+        // CRITICAL FIX: Use 'lvn' from request, not 'voterData.lvn' (which might be undefined)
         const token = jwt.sign(
-            { lvn: voterData.lvn, grade: voterData.grade }, // Payload
+            { lvn: lvn, grade: voterData.grade }, // <--- CHANGED THIS LINE
             JWT_SECRET,
             { expiresIn: '20m' } // Token expires in 20 minutes
         );
@@ -129,9 +130,15 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
 // --- 5. TALLIER API (Voting) ---
 // Protected by 'authenticateToken'
 app.post('/api/vote', authenticateToken, async (req, res) => {
-    // SECURITY: Get lvn from the secure token, NOT the request body
+    // SECURITY: Get lvn from the secure token
     const lvn = req.user.lvn; 
     const { selections } = req.body; 
+
+    // Diagnostic Log
+    if (!lvn) {
+        console.error("TOKEN ERROR: LVN is missing from token payload.", req.user);
+        return res.status(400).json({ error: "Security Token Malformed. Please Login Again." });
+    }
 
     // Input Validation
     if (!selections || !selections.president || !selections.vp) {
@@ -143,6 +150,7 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
             const voterRef = db.collection('voters').doc(lvn);
             const voterSnap = await t.get(voterRef);
 
+            if (!voterSnap.exists) throw new Error("Voter not found in registry.");
             if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
 
             // 1. Audit Log (The Black Box)
