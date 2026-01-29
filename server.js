@@ -169,13 +169,14 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
                 votedAt: admin.firestore.FieldValue.serverTimestamp() 
             });
 
-            // 3. Increment candidate counts
+            // 3. Increment candidate counts (AUTO-CREATION FIX)
             const presRef = db.collection('results').doc(selections.president);
             const vpRef = db.collection('results').doc(selections.vp);
 
-            // Note: Ensure these documents exist in Firestore or this will fail
-            t.update(presRef, { votes: admin.firestore.FieldValue.increment(1) });
-            t.update(vpRef, { votes: admin.firestore.FieldValue.increment(1) });
+            // CHANGED: used 'set' with { merge: true } instead of 'update'
+            // This creates the document with 1 vote if it's missing, or adds 1 if it exists.
+            t.set(presRef, { votes: admin.firestore.FieldValue.increment(1) }, { merge: true });
+            t.set(vpRef, { votes: admin.firestore.FieldValue.increment(1) }, { merge: true });
         });
 
         res.json({ success: true, hash: `TSF-${Date.now().toString(16).toUpperCase()}` });
