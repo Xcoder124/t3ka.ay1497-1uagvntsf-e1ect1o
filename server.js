@@ -102,5 +102,27 @@ app.post('/api/vote', async (req, res) => {
     }
 });
 
+// NEW ENDPOINT: Fetch Candidate Lists
+app.get('/api/candidates', async (req, res) => {
+    try {
+        // Fetch candidate documents from Firestore
+        const presSnap = await db.collection('candidates').doc('president').get();
+        const vpSnap = await db.collection('candidates').doc('vp').get();
+
+        if (!presSnap.exists || !vpSnap.exists) {
+            return res.status(404).json({ error: "Candidate data not found in database." });
+        }
+
+        // Return the options arrays to the frontend
+        res.json({
+            president: presSnap.data().options,
+            vp: vpSnap.data().options
+        });
+    } catch (err) {
+        console.error("Error fetching candidates:", err);
+        res.status(500).json({ error: "Failed to load candidates from the registrar." });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Election Server live on port ${PORT}`));
