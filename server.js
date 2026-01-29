@@ -20,7 +20,7 @@ const loginLimiter = rateLimit({
     message: { error: "Too many login attempts. Please try again later." }
 });
 
-// CORS: Allow specific origins
+// CORS: Only allow requests from your specific authorized URLs
 const allowedOrigins = [
     'http://127.0.0.1:5500',                            
     'http://localhost:3000',                            
@@ -30,11 +30,8 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) === -1) {
-            // Optional: For development, you can uncomment the line below to allow ALL origins temporarily
-            // return callback(null, true); 
             const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
             return callback(new Error(msg), false);
         }
@@ -60,13 +57,13 @@ const db = admin.firestore();
 // --- 3. MIDDLEWARE: TOKEN AUTHENTICATION ---
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer <token>"
+    const token = authHeader && authHeader.split(' ')[1]; 
 
     if (!token) return res.status(401).json({ error: "Access Denied. Missing Ballot Token." });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.status(403).json({ error: "Session expired. Please login again." });
-        req.user = user; // Contains { lvn, grade, iat, exp }
+        req.user = user; 
         next();
     });
 }
@@ -76,14 +73,12 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
     const { lvn, code } = req.body;
 
     try {
-        // Fetch current election status
         const settingsSnap = await db.collection('settings').doc('electionStatus').get();
         if (!settingsSnap.exists) return res.status(500).json({ error: "System config missing." });
         
         const settings = settingsSnap.data();
-        if (!settings.isLive) return res.status(403).json({ error: "Election is paused. Please wait for instructions." });
+        if (!settings.isLive) return res.status(403).json({ error: "Election is paused." });
 
-        // Fetch voter details
         const voterRef = db.collection('voters').doc(lvn);
         const voterSnap = await voterRef.get();
 
@@ -94,23 +89,17 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
         const voterData = voterSnap.data();
         if (voterData.hasVoted) return res.status(403).json({ error: "You have already voted." });
 
-        // Grade Level Gate (Optional - enables checking if current grade is allowed)
         if (settings.activeGrade && settings.activeGrade !== "ALL" && voterData.grade !== settings.activeGrade) {
             return res.status(403).json({ error: `Voting session is currently for Grade ${settings.activeGrade}.` });
         }
 
-        // GENERATE TOKEN (Now includes GRADE)
         const token = jwt.sign(
             { lvn: lvn, grade: voterData.grade }, 
             JWT_SECRET,
             { expiresIn: '20m' }
         );
 
-        res.json({ 
-            name: voterData.name, 
-            grade: voterData.grade,
-            token: token 
-        });
+        res.json({ name: voterData.name, grade: voterData.grade, token: token });
 
     } catch (err) {
         console.error("Registrar Error:", err);
@@ -118,14 +107,14 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
     }
 });
 
-// --- 5. TALLIER API (Voting) ---
+// --- 5. TALLIER API (Voting - Atomic & Tamper Proof) ---
 app.post('/api/vote', authenticateToken, async (req, res) => {
-    const { lvn, grade } = req.user; // Retrieved securely from Token
+    const { lvn, grade } = req.user; 
     const { selections } = req.body; 
 
     if (!lvn) return res.status(400).json({ error: "Token Malformed." });
     if (!selections || !selections.president || !selections.vp) {
-        return res.status(400).json({ error: "Invalid ballot: President and VP are required." });
+        return res.status(400).json({ error: "Invalid ballot selection." });
     }
 
     try {
@@ -134,9 +123,11 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
             const voterSnap = await t.get(voterRef);
 
             if (!voterSnap.exists) throw new Error("Voter not found.");
+            
+            // SECURITY: Atomic check prevents double-voting during race conditions
             if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
 
-            // 1. Audit Log
+            // 1. Audit Log (Permanent trail for forensic verification)
             const logRef = db.collection('audit_logs').doc();
             t.set(logRef, {
                 lvn: lvn,
@@ -153,19 +144,17 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
                 votedAt: admin.firestore.FieldValue.serverTimestamp() 
             });
 
-            // 3. Tally Votes (With Grade Breakdown)
+            // 3. Tally Votes with Grade Breakdown
             Object.keys(selections).forEach(posKey => {
                 const candidateId = selections[posKey];
                 if(candidateId) {
                     const resRef = db.collection('results').doc(candidateId);
                     
-                    // Increment Total Votes
                     const updateData = { votes: admin.firestore.FieldValue.increment(1) };
                     
-                    // Increment Grade-Specific Votes (e.g., votes_12, votes_10)
-                    if(grade) {
-                        updateData[`votes_${grade}`] = admin.firestore.FieldValue.increment(1);
-                    }
+                    // SECURITY: Ensure math always balances by using 'votes_unknown' if grade is missing
+                    const gradeKey = grade ? `votes_${grade}` : 'votes_unknown';
+                    updateData[gradeKey] = admin.firestore.FieldValue.increment(1);
 
                     t.set(resRef, updateData, { merge: true });
                 }
@@ -195,90 +184,60 @@ app.get('/api/candidates', async (req, res) => {
 
         res.json(data);
     } catch (err) {
-        console.error("Candidate Fetch Error:", err);
         res.status(500).json({ error: "Failed to load candidates." });
     }
 });
 
 // --- 7. ADMIN API: MANAGE CANDIDATES ---
 
-// A. BULK ADD PARTY (Transactional - Fixed for Read/Write Order)
 app.post('/api/admin/add-party', async (req, res) => {
     const { candidates } = req.body; 
-
-    if (!candidates || !Array.isArray(candidates)) {
-        return res.status(400).json({ error: "Invalid data format." });
-    }
+    if (!candidates || !Array.isArray(candidates)) return res.status(400).json({ error: "Invalid data format." });
 
     try {
         await db.runTransaction(async (t) => {
-            // Group by position
             const groupedData = {};
             candidates.forEach(c => {
                 if (!groupedData[c.position]) groupedData[c.position] = [];
                 groupedData[c.position].push({
-                    id: c.id,
-                    name: c.name.toUpperCase(),
-                    party: c.party.toUpperCase(),
-                    img: c.img || "none"
+                    id: c.id, name: c.name.toUpperCase(), party: c.party.toUpperCase(), img: c.img || "none"
                 });
             });
 
             const uniquePositions = Object.keys(groupedData);
             const snapshotMap = {};
 
-            // READ PHASE
             for (const pos of uniquePositions) {
                 const docRef = db.collection('candidates').doc(pos);
-                const doc = await t.get(docRef);
-                snapshotMap[pos] = doc;
+                snapshotMap[pos] = await t.get(docRef);
             }
 
-            // WRITE PHASE
             for (const pos of uniquePositions) {
                 const docRef = db.collection('candidates').doc(pos);
                 const doc = snapshotMap[pos];
                 const newCandidates = groupedData[pos];
 
-                if (!doc.exists) {
-                    t.set(docRef, { options: newCandidates });
-                } else {
-                    t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(...newCandidates) });
-                }
+                if (!doc.exists) t.set(docRef, { options: newCandidates });
+                else t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(...newCandidates) });
             }
         });
-
-        res.json({ success: true, message: "Party successfully registered." });
-    } catch (err) {
-        console.error("Admin Add Error:", err);
-        res.status(500).json({ error: err.message });
-    }
+        res.json({ success: true, message: "Party registered successfully." });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// B. DELETE CANDIDATE
 app.post('/api/admin/delete', async (req, res) => {
     const { position, candidateId } = req.body;
     try {
         const docRef = db.collection('candidates').doc(position);
         const doc = await docRef.get();
-
         if (!doc.exists) return res.status(404).json({ error: "Position not found." });
 
-        const options = doc.data().options;
-        const updatedOptions = options.filter(c => c.id.toString() !== candidateId.toString());
-
-        if (options.length === updatedOptions.length) {
-            return res.status(404).json({ error: "Candidate ID not found." });
-        }
-
+        const updatedOptions = doc.data().options.filter(c => c.id.toString() !== candidateId.toString());
         await docRef.update({ options: updatedOptions });
         res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// C. EDIT CANDIDATE
 app.post('/api/admin/edit', async (req, res) => {
     const { position, candidateId, newData } = req.body;
     try {
@@ -289,40 +248,27 @@ app.post('/api/admin/edit', async (req, res) => {
 
             const options = doc.data().options;
             const index = options.findIndex(c => c.id.toString() === candidateId.toString());
-
             if (index === -1) throw new Error("Candidate not found.");
 
             options[index] = { ...options[index], ...newData };
             t.update(docRef, { options: options });
         });
         res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // --- 8. LIVE DASHBOARD API (With Grade Breakdown & Live Status) ---
 app.get('/api/dashboard', async (req, res) => {
     try {
-        // 1. Get Election Status (For "Ended" Screen)
         const settingsSnap = await db.collection('settings').doc('electionStatus').get();
         const isLive = settingsSnap.exists ? settingsSnap.data().isLive : false;
 
-        // 2. Get Voter Statistics Per Grade
         const votersSnap = await db.collection('voters').get();
-        
-        const stats = {
-            total: 0,
-            voted: 0,
-            percentage: 0,
-            grades: {} // Structure: { "12": { total: 10, voted: 5, missed: 5 } }
-        };
+        const stats = { total: 0, voted: 0, percentage: 0, grades: {} };
 
         votersSnap.forEach(doc => {
             const d = doc.data();
             const g = d.grade || "Unknown";
-            
-            // Init grade object if missing
             if(!stats.grades[g]) stats.grades[g] = { total: 0, voted: 0, missed: 0 };
             
             stats.total++;
@@ -336,10 +282,8 @@ app.get('/api/dashboard', async (req, res) => {
             }
         });
 
-        // Calculate global percentage
         if(stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
 
-        // 3. Fetch Candidates
         const positions = [
             'president', 'vp', 'secretary', 'treasurer', 'auditor', 
             'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
@@ -351,38 +295,29 @@ app.get('/api/dashboard', async (req, res) => {
             candidateMap[pos] = snap.exists ? snap.data().options : [];
         }));
 
-        // 4. Fetch Detailed Results (with Grade Breakdown keys)
         const resultsSnap = await db.collection('results').get();
         const resultsData = {}; 
-        
-        resultsSnap.forEach(doc => {
-            resultsData[doc.id] = doc.data(); 
-        });
+        resultsSnap.forEach(doc => { resultsData[doc.id] = doc.data(); });
 
-        // 5. Merge Data
         const finalResults = {};
         positions.forEach(pos => {
             const candidates = candidateMap[pos].map(c => {
                 const r = resultsData[c.id] || {};
-                return {
-                    ...c,
-                    votes: r.votes || 0,
-                    breakdown: r // Pass raw breakdown (votes_12, votes_11, etc) to frontend
-                };
+                return { ...c, votes: r.votes || 0, breakdown: r };
             });
             candidates.sort((a, b) => b.votes - a.votes);
             finalResults[pos] = candidates;
         });
 
         res.json({
-            isLive: isLive, // Sent to frontend to control End Screen
+            isLive: isLive,
             stats: stats,
             leaderboard: finalResults
         });
 
     } catch (err) {
         console.error("Dashboard API Error:", err);
-        res.status(500).json({ error: "Failed to fetch results." });
+        res.status(500).json({ error: "Failed to fetch live results." });
     }
 });
 
