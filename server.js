@@ -26,7 +26,7 @@ const loginLimiter = rateLimit({
 const allowedOrigins = [
     'http://127.0.0.1:5500',                         
     'https://tsf-sslg-election-endpoint.onrender.com',
-    'https://tsf-g-digital-election.web.app/vote' 
+    'https://tsf-g-digital-election.web.app' 
 ];
 
 app.use(cors({
