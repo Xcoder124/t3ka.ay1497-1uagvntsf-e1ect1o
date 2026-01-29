@@ -209,10 +209,9 @@ app.get('/api/candidates', async (req, res) => {
 
 // --- 7. ADMIN API: MANAGE CANDIDATES ---
 
-// A. BULK ADD PARTY (Transactional)
+// A. BULK ADD PARTY (Transactional - Fixed)
 app.post('/api/admin/add-party', async (req, res) => {
-    // In a real app, add middleware to check for an Admin Password here
-    const { candidates } = req.body; // Expects array of { position, id, name, party, img }
+    const { candidates } = req.body; 
 
     if (!candidates || !Array.isArray(candidates)) {
         return res.status(400).json({ error: "Invalid data format." });
@@ -220,26 +219,46 @@ app.post('/api/admin/add-party', async (req, res) => {
 
     try {
         await db.runTransaction(async (t) => {
-            for (const c of candidates) {
-                const docRef = db.collection('candidates').doc(c.position);
-                const doc = await t.get(docRef);
-
-                const newCandidate = {
+            // STEP 1: PREPARE DATA & READS
+            // Group candidates by position first (e.g., separate all 'president' entries)
+            const groupedData = {};
+            candidates.forEach(c => {
+                if (!groupedData[c.position]) groupedData[c.position] = [];
+                groupedData[c.position].push({
                     id: c.id,
                     name: c.name.toUpperCase(),
                     party: c.party.toUpperCase(),
                     img: c.img || "none"
-                };
+                });
+            });
+
+            const uniquePositions = Object.keys(groupedData);
+            const snapshotMap = {};
+
+            // READ PHASE: Fetch all necessary documents *before* writing anything
+            for (const pos of uniquePositions) {
+                const docRef = db.collection('candidates').doc(pos);
+                const doc = await t.get(docRef);
+                snapshotMap[pos] = doc; // Store snapshot in memory
+            }
+
+            // WRITE PHASE: Now safe to write
+            for (const pos of uniquePositions) {
+                const docRef = db.collection('candidates').doc(pos);
+                const doc = snapshotMap[pos];
+                const newCandidates = groupedData[pos];
 
                 if (!doc.exists) {
-                    // Create document if missing
-                    t.set(docRef, { options: [newCandidate] });
+                    // If position doesn't exist yet, create it with the list
+                    t.set(docRef, { options: newCandidates });
                 } else {
-                    // Add to existing array
-                    t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(newCandidate) });
+                    // If it exists, append new candidates to the array
+                    // We use spread (...) to add multiple candidates at once
+                    t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(...newCandidates) });
                 }
             }
         });
+
         res.json({ success: true, message: "Party successfully registered." });
     } catch (err) {
         console.error("Admin Add Error:", err);
