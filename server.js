@@ -73,7 +73,7 @@ function authenticateToken(req, res, next) {
 // --- 4. REGISTRAR API (Login) ---
 // Applies Rate Limiting here
 app.post('/api/verify', loginLimiter, async (req, res) => {
-    const { lrn, code } = req.body;
+    const { lvn, code } = req.body;
 
     try {
         // Fetch current election status
@@ -87,7 +87,7 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
         }
 
         // Fetch voter details
-        const voterRef = db.collection('voters').doc(lrn);
+        const voterRef = db.collection('voters').doc(lvn);
         const voterSnap = await voterRef.get();
 
         // Security Check: Does user exist and code match?
@@ -109,7 +109,7 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
 
         // SUCCESS: Generate a secure Token
         const token = jwt.sign(
-            { lrn: voterData.lrn, grade: voterData.grade }, // Payload
+            { lvn: voterData.lvn, grade: voterData.grade }, // Payload
             JWT_SECRET,
             { expiresIn: '20m' } // Token expires in 20 minutes
         );
@@ -129,8 +129,8 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
 // --- 5. TALLIER API (Voting) ---
 // Protected by 'authenticateToken'
 app.post('/api/vote', authenticateToken, async (req, res) => {
-    // SECURITY: Get LRN from the secure token, NOT the request body
-    const lrn = req.user.lrn; 
+    // SECURITY: Get lvn from the secure token, NOT the request body
+    const lvn = req.user.lvn; 
     const { selections } = req.body; 
 
     // Input Validation
@@ -140,7 +140,7 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
 
     try {
         await db.runTransaction(async (t) => {
-            const voterRef = db.collection('voters').doc(lrn);
+            const voterRef = db.collection('voters').doc(lvn);
             const voterSnap = await t.get(voterRef);
 
             if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
@@ -148,7 +148,7 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
             // 1. Audit Log (The Black Box)
             const logRef = db.collection('audit_logs').doc();
             t.set(logRef, {
-                lrn: lrn,
+                lvn: lvn,
                 action: "VOTE_CAST",
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 ip: req.ip,
