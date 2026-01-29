@@ -129,21 +129,15 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
 });
 
 // --- 5. TALLIER API (Voting) ---
-// Protected by 'authenticateToken'
 app.post('/api/vote', authenticateToken, async (req, res) => {
-    // SECURITY: Get lvn from the secure token
     const lvn = req.user.lvn; 
     const { selections } = req.body; 
 
-    // Diagnostic Log
-    if (!lvn) {
-        console.error("TOKEN ERROR: LVN is missing from token payload.", req.user);
-        return res.status(400).json({ error: "Security Token Malformed. Please Login Again." });
-    }
+    if (!lvn) return res.status(400).json({ error: "Security Token Malformed." });
 
-    // Input Validation
+    // Validate only critical positions (Pres/VP), others can be optional if you prefer
     if (!selections || !selections.president || !selections.vp) {
-        return res.status(400).json({ error: "Invalid ballot: Missing selections." });
+        return res.status(400).json({ error: "Invalid ballot: President and VP are required." });
     }
 
     try {
@@ -151,10 +145,10 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
             const voterRef = db.collection('voters').doc(lvn);
             const voterSnap = await t.get(voterRef);
 
-            if (!voterSnap.exists) throw new Error("Voter not found in registry.");
+            if (!voterSnap.exists) throw new Error("Voter not found.");
             if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
 
-            // 1. Audit Log (The Black Box)
+            // 1. Audit Log
             const logRef = db.collection('audit_logs').doc();
             t.set(logRef, {
                 lvn: lvn,
@@ -164,20 +158,21 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
                 userAgent: req.headers['user-agent'] || 'Unknown'
             });
 
-            // 2. Mark voter as done
+            // 2. Mark voter
             t.update(voterRef, { 
                 hasVoted: true, 
                 votedAt: admin.firestore.FieldValue.serverTimestamp() 
             });
 
-            // 3. Increment candidate counts (AUTO-CREATION FIX)
-            const presRef = db.collection('results').doc(selections.president);
-            const vpRef = db.collection('results').doc(selections.vp);
-
-            // CHANGED: used 'set' with { merge: true } instead of 'update'
-            // This creates the document with 1 vote if it's missing, or adds 1 if it exists.
-            t.set(presRef, { votes: admin.firestore.FieldValue.increment(1) }, { merge: true });
-            t.set(vpRef, { votes: admin.firestore.FieldValue.increment(1) }, { merge: true });
+            // 3. Tally Votes (Dynamic Loop for all keys)
+            // This loops through every position sent (pres, vp, secretary, etc.) and updates results
+            Object.keys(selections).forEach(posKey => {
+                const candidateId = selections[posKey];
+                if(candidateId) {
+                    const resRef = db.collection('results').doc(candidateId);
+                    t.set(resRef, { votes: admin.firestore.FieldValue.increment(1) }, { merge: true });
+                }
+            });
         });
 
         res.json({ success: true, hash: `TSF-${Date.now().toString(16).toUpperCase()}` });
@@ -190,17 +185,22 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
 // --- 6. PUBLIC API: CANDIDATES ---
 app.get('/api/candidates', async (req, res) => {
     try {
-        const presSnap = await db.collection('candidates').doc('president').get();
-        const vpSnap = await db.collection('candidates').doc('vp').get();
+        // We define the list of positions we need to fetch
+        const positions = [
+            'president', 'vp', 'secretary', 'treasurer', 'auditor', 
+            'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
+        ];
+        
+        const data = {};
 
-        if (!presSnap.exists || !vpSnap.exists) {
-            return res.status(404).json({ error: "Candidate data not found." });
-        }
+        // Fetch all candidates in parallel for speed
+        await Promise.all(positions.map(async (pos) => {
+            const snap = await db.collection('candidates').doc(pos).get();
+            // If document exists, use its options; otherwise return empty list
+            data[pos] = snap.exists ? snap.data().options : [];
+        }));
 
-        res.json({
-            president: presSnap.data().options,
-            vp: vpSnap.data().options
-        });
+        res.json(data);
     } catch (err) {
         console.error("Candidate Fetch Error:", err);
         res.status(500).json({ error: "Failed to load candidates." });
