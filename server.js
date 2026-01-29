@@ -207,5 +207,96 @@ app.get('/api/candidates', async (req, res) => {
     }
 });
 
+// --- 7. ADMIN API: MANAGE CANDIDATES ---
+
+// A. BULK ADD PARTY (Transactional)
+app.post('/api/admin/add-party', async (req, res) => {
+    // In a real app, add middleware to check for an Admin Password here
+    const { candidates } = req.body; // Expects array of { position, id, name, party, img }
+
+    if (!candidates || !Array.isArray(candidates)) {
+        return res.status(400).json({ error: "Invalid data format." });
+    }
+
+    try {
+        await db.runTransaction(async (t) => {
+            for (const c of candidates) {
+                const docRef = db.collection('candidates').doc(c.position);
+                const doc = await t.get(docRef);
+
+                const newCandidate = {
+                    id: c.id,
+                    name: c.name.toUpperCase(),
+                    party: c.party.toUpperCase(),
+                    img: c.img || "none"
+                };
+
+                if (!doc.exists) {
+                    // Create document if missing
+                    t.set(docRef, { options: [newCandidate] });
+                } else {
+                    // Add to existing array
+                    t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(newCandidate) });
+                }
+            }
+        });
+        res.json({ success: true, message: "Party successfully registered." });
+    } catch (err) {
+        console.error("Admin Add Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// B. DELETE CANDIDATE
+app.post('/api/admin/delete', async (req, res) => {
+    const { position, candidateId } = req.body;
+
+    try {
+        const docRef = db.collection('candidates').doc(position);
+        const doc = await docRef.get();
+
+        if (!doc.exists) return res.status(404).json({ error: "Position not found." });
+
+        const options = doc.data().options;
+        const updatedOptions = options.filter(c => c.id.toString() !== candidateId.toString());
+
+        if (options.length === updatedOptions.length) {
+            return res.status(404).json({ error: "Candidate ID not found." });
+        }
+
+        await docRef.update({ options: updatedOptions });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// C. EDIT CANDIDATE
+app.post('/api/admin/edit', async (req, res) => {
+    const { position, candidateId, newData } = req.body;
+
+    try {
+        await db.runTransaction(async (t) => {
+            const docRef = db.collection('candidates').doc(position);
+            const doc = await t.get(docRef);
+
+            if (!doc.exists) throw new Error("Position document missing.");
+
+            const options = doc.data().options;
+            const index = options.findIndex(c => c.id.toString() === candidateId.toString());
+
+            if (index === -1) throw new Error("Candidate not found.");
+
+            // Update specific fields
+            options[index] = { ...options[index], ...newData };
+            
+            t.update(docRef, { options: options });
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Election Server live on port ${PORT}`));
