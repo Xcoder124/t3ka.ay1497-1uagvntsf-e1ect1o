@@ -24,8 +24,9 @@ const loginLimiter = rateLimit({
 
 // CORS: Only allow requests from your specific frontend URL
 const allowedOrigins = [
-    'http://127.0.0.1:5500',                            // Local testing
-    'https://tsf-sslg-election-endpoint.onrender.com'   // Your actual frontend URL
+    'http://127.0.0.1:5500',                         
+    'https://tsf-sslg-election-endpoint.onrender.com',
+    'https://tsf-g-digital-election.web.app/vote' 
 ];
 
 app.use(cors({
