@@ -317,5 +317,67 @@ app.post('/api/admin/edit', async (req, res) => {
     }
 });
 
+// --- 8. LIVE DASHBOARD API ---
+app.get('/api/dashboard', async (req, res) => {
+    try {
+        // 1. Get Voter Statistics (Count registered vs voted)
+        const votersSnap = await db.collection('voters').get();
+        const totalVoters = votersSnap.size;
+        // fast filter to count those who voted
+        const totalVoted = votersSnap.docs.filter(doc => doc.data().hasVoted).length;
+
+        // 2. Fetch Candidates Structure
+        const positions = [
+            'president', 'vp', 'secretary', 'treasurer', 'auditor', 
+            'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
+        ];
+        
+        const candidateMap = {}; // Will hold raw candidates by position
+        
+        // Fetch candidate lists
+        await Promise.all(positions.map(async (pos) => {
+            const snap = await db.collection('candidates').doc(pos).get();
+            candidateMap[pos] = snap.exists ? snap.data().options : [];
+        }));
+
+        // 3. Fetch Vote Counts (The Results)
+        const resultsSnap = await db.collection('results').get();
+        const voteCounts = {};
+        
+        resultsSnap.forEach(doc => {
+            voteCounts[doc.id] = doc.data().votes || 0;
+        });
+
+        // 4. Merge Data & Sort for Leaderboard
+        const finalResults = {};
+        
+        positions.forEach(pos => {
+            const candidates = candidateMap[pos].map(c => ({
+                ...c,
+                votes: voteCounts[c.id] || 0 // Attach vote count or 0
+            }));
+
+            // Sort: Highest votes first
+            candidates.sort((a, b) => b.votes - a.votes);
+            
+            finalResults[pos] = candidates;
+        });
+
+        // Send everything to frontend
+        res.json({
+            stats: {
+                totalVoters,
+                totalVoted,
+                percentage: totalVoters > 0 ? ((totalVoted / totalVoters) * 100).toFixed(1) : 0
+            },
+            leaderboard: finalResults
+        });
+
+    } catch (err) {
+        console.error("Dashboard API Error:", err);
+        res.status(500).json({ error: "Failed to fetch live results." });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Election Server live on port ${PORT}`));
