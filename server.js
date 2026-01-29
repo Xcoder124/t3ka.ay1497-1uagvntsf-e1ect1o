@@ -81,7 +81,7 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
         if (!settingsSnap.exists) return res.status(500).json({ error: "System config missing." });
         
         const settings = settingsSnap.data();
-        if (!settings.isLive) return res.status(403).json({ error: "Election is paused." });
+        if (!settings.isLive) return res.status(403).json({ error: "Election is paused. Please wait for instructions." });
 
         // Fetch voter details
         const voterRef = db.collection('voters').doc(lvn);
@@ -301,10 +301,14 @@ app.post('/api/admin/edit', async (req, res) => {
     }
 });
 
-// --- 8. LIVE DASHBOARD API (With Grade Breakdown) ---
+// --- 8. LIVE DASHBOARD API (With Grade Breakdown & Live Status) ---
 app.get('/api/dashboard', async (req, res) => {
     try {
-        // 1. Get Voter Statistics Per Grade
+        // 1. Get Election Status (For "Ended" Screen)
+        const settingsSnap = await db.collection('settings').doc('electionStatus').get();
+        const isLive = settingsSnap.exists ? settingsSnap.data().isLive : false;
+
+        // 2. Get Voter Statistics Per Grade
         const votersSnap = await db.collection('voters').get();
         
         const stats = {
@@ -335,7 +339,7 @@ app.get('/api/dashboard', async (req, res) => {
         // Calculate global percentage
         if(stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
 
-        // 2. Fetch Candidates
+        // 3. Fetch Candidates
         const positions = [
             'president', 'vp', 'secretary', 'treasurer', 'auditor', 
             'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
@@ -347,7 +351,7 @@ app.get('/api/dashboard', async (req, res) => {
             candidateMap[pos] = snap.exists ? snap.data().options : [];
         }));
 
-        // 3. Fetch Detailed Results (with Grade Breakdown keys)
+        // 4. Fetch Detailed Results (with Grade Breakdown keys)
         const resultsSnap = await db.collection('results').get();
         const resultsData = {}; 
         
@@ -355,7 +359,7 @@ app.get('/api/dashboard', async (req, res) => {
             resultsData[doc.id] = doc.data(); 
         });
 
-        // 4. Merge Data
+        // 5. Merge Data
         const finalResults = {};
         positions.forEach(pos => {
             const candidates = candidateMap[pos].map(c => {
@@ -371,6 +375,7 @@ app.get('/api/dashboard', async (req, res) => {
         });
 
         res.json({
+            isLive: isLive, // Sent to frontend to control End Screen
             stats: stats,
             leaderboard: finalResults
         });
