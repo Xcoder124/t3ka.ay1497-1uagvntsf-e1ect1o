@@ -1,26 +1,23 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-const jwt = require('jsonwebtoken'); // Secure session tokens
-const rateLimit = require('express-rate-limit'); // Brute force protection
-const helmet = require('helmet'); // Security headers
+const jwt = require('jsonwebtoken'); 
+const rateLimit = require('express-rate-limit'); 
+const helmet = require('helmet'); 
 
 const app = express();
 
 // --- 1. SECURITY CONFIGURATION ---
 app.use(helmet());
 
-// JWT Secret Key (In production, use a long random string in env variables)
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-this-in-prod";
 
-// Rate Limiter: Maximum 10 login attempts per 15 minutes per IP address
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     max: 10, 
     message: { error: "Too many login attempts. Please try again later." }
 });
 
-// CORS: Only allow requests from your specific authorized URLs
 const allowedOrigins = [
     'http://127.0.0.1:5500',                            
     'http://localhost:3000',                            
@@ -87,6 +84,28 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
         }
 
         const voterData = voterSnap.data();
+
+        // --- NEW SECURITY CHECK: AUDIT LOG VERIFICATION ---
+        // Even if the 'voterData.hasVoted' flag is false, we check the immutable audit logs
+        // to see if this LVN has ever submitted a vote before.
+        const auditCheck = await db.collection('audit_logs')
+            .where('lvn', '==', lvn)
+            .limit(1) // We only need to know if at least one exists
+            .get();
+
+        if (!auditCheck.empty) {
+            console.warn(`SECURITY: Blocked login for ${lvn}. Audit log found despite hasVoted flag.`);
+            
+            // OPTIONAL: Self-healing
+            // If we find an audit log but hasVoted is false, fix it now.
+            if (!voterData.hasVoted) {
+                 voterRef.update({ hasVoted: true });
+            }
+
+            return res.status(403).json({ error: "Security Alert: A vote trace exists for this ID." });
+        }
+        // --------------------------------------------------
+
         if (voterData.hasVoted) return res.status(403).json({ error: "You have already voted." });
 
         if (settings.activeGrade && settings.activeGrade !== "ALL" && voterData.grade !== settings.activeGrade) {
@@ -118,13 +137,24 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
     }
 
     try {
+        // --- NEW SECURITY CHECK: FINAL AUDIT VERIFICATION ---
+        // Just before writing, check one last time.
+        const auditCheck = await db.collection('audit_logs')
+            .where('lvn', '==', lvn)
+            .limit(1)
+            .get();
+
+        if (!auditCheck.empty) {
+            return res.status(403).json({ error: "Vote rejected: Duplicate transaction detected." });
+        }
+        // ----------------------------------------------------
+
         await db.runTransaction(async (t) => {
             const voterRef = db.collection('voters').doc(lvn);
             const voterSnap = await t.get(voterRef);
 
             if (!voterSnap.exists) throw new Error("Voter not found.");
             
-            // SECURITY: Atomic check prevents double-voting during race conditions
             if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
 
             // 1. Audit Log (Permanent trail for forensic verification)
@@ -152,7 +182,6 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
                     
                     const updateData = { votes: admin.firestore.FieldValue.increment(1) };
                     
-                    // SECURITY: Ensure math always balances by using 'votes_unknown' if grade is missing
                     const gradeKey = grade ? `votes_${grade}` : 'votes_unknown';
                     updateData[gradeKey] = admin.firestore.FieldValue.increment(1);
 
@@ -168,7 +197,7 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
     }
 });
 
-// --- 6. PUBLIC API: CANDIDATES ---
+// ... (Rest of your server.js logic for Candidates, Admin, Dashboard remains unchanged)
 app.get('/api/candidates', async (req, res) => {
     try {
         const positions = [
@@ -187,8 +216,6 @@ app.get('/api/candidates', async (req, res) => {
         res.status(500).json({ error: "Failed to load candidates." });
     }
 });
-
-// --- 7. ADMIN API: MANAGE CANDIDATES ---
 
 app.post('/api/admin/add-party', async (req, res) => {
     const { candidates } = req.body; 
@@ -257,7 +284,6 @@ app.post('/api/admin/edit', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 8. LIVE DASHBOARD API (With Grade Breakdown & Live Status) ---
 app.get('/api/dashboard', async (req, res) => {
     try {
         const settingsSnap = await db.collection('settings').doc('electionStatus').get();
