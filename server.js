@@ -50,22 +50,21 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// --- 3. IN-MEMORY CACHE (THE VARIABLES) ---
-// This replaces direct DB reads for public endpoints
+// --- 3. IN-MEMORY CACHE ---
 const GlobalCache = {
-    candidates: {},          // Stores the list of candidates
-    dashboard: {             // Stores the full results/stats object
+    candidates: {},          
+    dashboard: {             
         isLive: false,
-        stats: { total: 0, voted: 0, percentage: 0, grades: {} },
+        stats: { total: 0, voted: 0, percentage: 0, grades: {} }, // <--- Stats live here
         leaderboard: {}
     },
-    timestamps: {            // Stores when the variables were last updated
+    timestamps: {            
         candidates: "Not yet loaded",
         results: "Not yet loaded"
     }
 };
 
-// --- HELPER: REFRESH CANDIDATES FROM DB ---
+// --- HELPER: REFRESH CANDIDATES ---
 async function refreshLocalCandidates() {
     try {
         const positions = [
@@ -89,20 +88,25 @@ async function refreshLocalCandidates() {
     }
 }
 
-// --- HELPER: REFRESH RESULTS/DASHBOARD FROM DB ---
+// --- HELPER: REFRESH RESULTS & VOTER STATS ---
 async function refreshLocalResults() {
     try {
+        console.log("CACHE: Starting full refresh of Results & Stats...");
+
         // 1. Get Election Status
         const settingsSnap = await db.collection('settings').doc('electionStatus').get();
         const isLive = settingsSnap.exists ? settingsSnap.data().isLive : false;
 
-        // 2. Get Voter Stats
+        // 2. RE-CALCULATE VOTER STATS (The part you asked about)
+        // We query the 'voters' collection to get the absolute latest counts.
         const votersSnap = await db.collection('voters').get();
         const stats = { total: 0, voted: 0, percentage: 0, grades: {} };
 
         votersSnap.forEach(doc => {
             const d = doc.data();
             const g = d.grade || "Unknown";
+            
+            // Initialize grade group if missing
             if(!stats.grades[g]) stats.grades[g] = { total: 0, voted: 0, missed: 0 };
             
             stats.total++;
@@ -116,16 +120,18 @@ async function refreshLocalResults() {
             }
         });
 
+        // Calculate Global Percentage
         if(stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
+        
+        console.log(`CACHE: Stats updated. Total: ${stats.total}, Voted: ${stats.voted}`);
 
         // 3. Get Votes (Leaderboard)
-        // Note: We use the *Cached Candidates* to map the results
         const resultsSnap = await db.collection('results').get();
         const resultsData = {}; 
         resultsSnap.forEach(doc => { resultsData[doc.id] = doc.data(); });
 
         const finalResults = {};
-        const positions = Object.keys(GlobalCache.candidates); // Use cached keys
+        const positions = Object.keys(GlobalCache.candidates); 
 
         positions.forEach(pos => {
             const candidates = GlobalCache.candidates[pos].map(c => {
@@ -139,7 +145,8 @@ async function refreshLocalResults() {
         // 4. Update Cache
         GlobalCache.dashboard = { isLive, stats, leaderboard: finalResults };
         GlobalCache.timestamps.results = new Date().toLocaleString();
-        console.log("CACHE: Results updated.");
+        
+        console.log("CACHE: Results & Stats refresh complete.");
         return true;
 
     } catch (err) {
@@ -169,8 +176,6 @@ function authenticateToken(req, res, next) {
 app.post('/api/verify', loginLimiter, async (req, res) => {
     const { lvn, code } = req.body;
     try {
-        // Read "isLive" from Cache for speed, or DB if critical. 
-        // For login, we'll keep DB read to ensure pausing is instant.
         const settingsSnap = await db.collection('settings').doc('electionStatus').get();
         if (!settingsSnap.exists || !settingsSnap.data().isLive) {
             return res.status(403).json({ error: "Election is paused." });
@@ -244,17 +249,25 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
             });
         });
 
-        // 4. INSTANT LOCAL UPDATE (Keep Cache Live without DB Read)
-        // This ensures the Dashboard updates immediately after a vote without waiting for Admin Refresh
-        GlobalCache.dashboard.stats.voted++;
-        if(GlobalCache.dashboard.stats.grades[grade]) {
-            GlobalCache.dashboard.stats.grades[grade].voted++;
-            GlobalCache.dashboard.stats.grades[grade].missed--;
+        // 4. INSTANT LOCAL UPDATE
+        // Updates the STATS cache immediately for the dashboard
+        if (GlobalCache.dashboard.stats) {
+            GlobalCache.dashboard.stats.voted++;
+            // Update percentage
+            if(GlobalCache.dashboard.stats.total > 0) {
+                GlobalCache.dashboard.stats.percentage = 
+                    ((GlobalCache.dashboard.stats.voted / GlobalCache.dashboard.stats.total) * 100).toFixed(1);
+            }
+            // Update Grade specific stats
+            if(GlobalCache.dashboard.stats.grades[grade]) {
+                GlobalCache.dashboard.stats.grades[grade].voted++;
+                GlobalCache.dashboard.stats.grades[grade].missed--;
+            }
         }
         
+        // Updates the CANDIDATE cache immediately
         Object.keys(selections).forEach(posKey => {
              const cId = selections[posKey];
-             // Find candidate in dashboard leaderboard and increment
              if(GlobalCache.dashboard.leaderboard[posKey]) {
                  const cand = GlobalCache.dashboard.leaderboard[posKey].find(c => c.id == cId);
                  if(cand) {
@@ -263,7 +276,6 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
                      const gKey = `votes_${grade}`;
                      cand.breakdown[gKey] = (cand.breakdown[gKey] || 0) + 1;
                  }
-                 // Re-sort that position
                  GlobalCache.dashboard.leaderboard[posKey].sort((a,b) => b.votes - a.votes);
              }
         });
@@ -275,40 +287,36 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
     }
 });
 
-// --- 7. PUBLIC API: CANDIDATES (Reads from Variable) ---
+// --- 7. PUBLIC API: CANDIDATES ---
 app.get('/api/candidates', (req, res) => {
-    // Directly return the variable
     res.json(GlobalCache.candidates);
 });
 
-// --- 8. LIVE DASHBOARD (Reads from Variable) ---
+// --- 8. LIVE DASHBOARD ---
 app.get('/api/dashboard', (req, res) => {
-    // Directly return the variable
     res.json(GlobalCache.dashboard);
 });
 
 // --- 9. ADMIN API: MANAGEMENT & REFRESH ---
 
-// Trigger: Refresh Candidates Variable
+// Trigger: Refresh Candidates
 app.post('/api/admin/refresh/candidates', async (req, res) => {
     const success = await refreshLocalCandidates();
     if(success) res.json({ success: true, timestamp: GlobalCache.timestamps.candidates });
     else res.status(500).json({ error: "Failed to refresh candidates." });
 });
 
-// Trigger: Refresh Results Variable
+// Trigger: Refresh Results & Stats
 app.post('/api/admin/refresh/results', async (req, res) => {
     const success = await refreshLocalResults();
     if(success) res.json({ success: true, timestamp: GlobalCache.timestamps.results });
     else res.status(500).json({ error: "Failed to refresh results." });
 });
 
-// Get Cache Timestamps
 app.get('/api/admin/status', (req, res) => {
     res.json(GlobalCache.timestamps);
 });
 
-// Add Party (Writes to DB -> Auto Updates Cache)
 app.post('/api/admin/add-party', async (req, res) => {
     const { candidates } = req.body; 
     try {
@@ -329,14 +337,11 @@ app.post('/api/admin/add-party', async (req, res) => {
                 else t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(...newCandidates) });
             }
         });
-        
-        // Auto-refresh cache so Admin sees it immediately
         await refreshLocalCandidates();
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Delete Candidate (Writes to DB -> Auto Updates Cache)
 app.post('/api/admin/delete', async (req, res) => {
     const { position, candidateId } = req.body;
     try {
@@ -347,7 +352,6 @@ app.post('/api/admin/delete', async (req, res) => {
         const updatedOptions = doc.data().options.filter(c => c.id.toString() !== candidateId.toString());
         await docRef.update({ options: updatedOptions });
 
-        // Auto-refresh cache
         await refreshLocalCandidates();
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
