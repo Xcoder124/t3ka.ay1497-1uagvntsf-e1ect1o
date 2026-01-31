@@ -12,7 +12,7 @@ const app = express();
 
 // --- 1. STRICT SECURITY CONFIGURATION ---
 app.use(helmet());
-app.use(express.json()); // ✅ only once
+app.use(express.json());
 
 // CRITICAL: Fail if secrets are missing
 if (!process.env.JWT_SECRET || !process.env.ADMIN_KEY) {
@@ -39,9 +39,7 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // allow server-to-server / curl (no origin)
     if (!origin) return callback(null, true);
-
     if (!allowedOrigins.includes(origin)) {
       return callback(new Error('CORS Policy: Origin not allowed'), false);
     }
@@ -83,16 +81,17 @@ const GlobalCache = {
   }
 };
 
+// --- POSITIONS (single source of truth) ---
+const ALL_POSITIONS = [
+  'president', 'vp', 'secretary', 'treasurer', 'auditor',
+  'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
+];
+
 // --- HELPER: REFRESH CANDIDATES ---
 async function refreshLocalCandidates() {
   try {
-    const positions = [
-      'president', 'vp', 'secretary', 'treasurer', 'auditor',
-      'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
-    ];
-
     const data = {};
-    await Promise.all(positions.map(async (pos) => {
+    await Promise.all(ALL_POSITIONS.map(async (pos) => {
       const snap = await db.collection('candidates').doc(pos).get();
       data[pos] = snap.exists ? (snap.data().options || []) : [];
     }));
@@ -112,11 +111,10 @@ async function refreshLocalResults() {
   try {
     console.log("CACHE: Starting full refresh of Results & Stats...");
 
-    // 1. Get Election Status
     const settingsSnap = await db.collection('settings').doc('electionStatus').get();
     const isLive = settingsSnap.exists ? !!settingsSnap.data().isLive : false;
 
-    // 2. Re-calc voter stats
+    // voter stats
     const votersSnap = await db.collection('voters').get();
     const stats = { total: 0, voted: 0, percentage: 0, grades: {} };
 
@@ -139,9 +137,7 @@ async function refreshLocalResults() {
 
     if (stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
 
-    console.log(`CACHE: Stats updated. Total: ${stats.total}, Voted: ${stats.voted}`);
-
-    // 3. Votes leaderboard
+    // leaderboard from results collection
     const resultsSnap = await db.collection('results').get();
     const resultsData = {};
     resultsSnap.forEach(docSnap => { resultsData[docSnap.id] = docSnap.data(); });
@@ -154,17 +150,15 @@ async function refreshLocalResults() {
         const r = resultsData[c.id] || {};
         return { ...c, votes: r.votes || 0, breakdown: r };
       });
-      candidates.sort((a, b) => b.votes - a.votes);
+      candidates.sort((a, b) => (b.votes || 0) - (a.votes || 0));
       finalResults[pos] = candidates;
     });
 
-    // 4. Update Cache
     GlobalCache.dashboard = { isLive, stats, leaderboard: finalResults };
     GlobalCache.timestamps.results = new Date().toLocaleString();
 
     console.log("CACHE: Results & Stats refresh complete.");
     return true;
-
   } catch (err) {
     console.error("CACHE ERROR (Results):", err);
     return false;
@@ -173,6 +167,38 @@ async function refreshLocalResults() {
 
 // Initialize Cache on Server Start
 refreshLocalCandidates().then(() => refreshLocalResults());
+
+// --- HELPER: validate selections against cached candidates ---
+function validateSelectionsOrThrow(selections) {
+  if (!selections || typeof selections !== 'object' || Array.isArray(selections)) {
+    throw new Error("INVALID_PAYLOAD");
+  }
+
+  // Must have candidates loaded
+  if (!GlobalCache.candidates || Object.keys(GlobalCache.candidates).length === 0) {
+    throw new Error("CANDIDATES_NOT_READY");
+  }
+
+  const validated = {};
+
+  for (const [posKey, candidateIdRaw] of Object.entries(selections)) {
+    if (!ALL_POSITIONS.includes(posKey)) {
+      throw new Error(`INVALID_POSITION:${posKey}`);
+    }
+
+    const candidateId = String(candidateIdRaw);
+    const list = GlobalCache.candidates[posKey] || [];
+
+    const existsInPosition = list.some(c => String(c.id) === candidateId);
+    if (!existsInPosition) {
+      throw new Error(`INVALID_CANDIDATE:${posKey}`);
+    }
+
+    validated[posKey] = candidateId;
+  }
+
+  return validated;
+}
 
 // --- 4. MIDDLEWARE: TOKEN AUTH ---
 function authenticateToken(req, res, next) {
@@ -190,7 +216,7 @@ function authenticateToken(req, res, next) {
 // --- AUDIT LOGGING HELPER ---
 async function logAudit(action, performer, details) {
   try {
-    await admin.firestore().collection('audit_logs').add({
+    await db.collection('audit_logs').add({
       action,
       performer,
       details,
@@ -201,6 +227,24 @@ async function logAudit(action, performer, details) {
     console.error("Audit Log Failed:", e);
   }
 }
+
+// --- ADMIN KEY MIDDLEWARE (applies to ALL /api/admin/*) ---
+function requireAdminKey(req, res, next) {
+  const key =
+    req.headers['x-admin-key'] ||
+    req.body?.adminKey ||
+    req.query?.adminKey;
+
+  if (!key || String(key) !== String(ADMIN_KEY)) {
+    logAudit("UNAUTHORIZED_ADMIN_ACTION", req.ip, { path: req.path }).catch(() => {});
+    return res.status(403).json({ error: "Unauthorized: Invalid Admin Key" });
+  }
+
+  next();
+}
+
+// ✅ This makes every /api/admin/* require admin key
+app.use('/api/admin', requireAdminKey);
 
 // --- 5. REGISTRAR API (Login) ---
 app.post('/api/verify', loginLimiter, async (req, res) => {
@@ -233,7 +277,6 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
       return res.status(403).json({ error: `Voting session is for Grade ${activeGrade} only.` });
     }
 
-    // ✅ token includes lvn (consistent everywhere)
     const token = jwt.sign(
       { lvn: String(lvn), grade: voterData.grade },
       JWT_SECRET,
@@ -249,43 +292,69 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
 });
 
 // --- 6. TALLIER API (Voting) ---
-// ✅ use middleware instead of re-verifying manually
+// ✅ validates candidates + writes to results inside transaction
 app.post('/api/vote', authenticateToken, async (req, res) => {
-  const { selections } = req.body;
+  const lvn = req.user.lvn;
+  const grade = req.user.grade || "Unknown";
 
-  // A. Validate payload
-  if (!selections || typeof selections !== 'object' || Array.isArray(selections)) {
-    return res.status(400).json({ error: "Invalid payload format." });
+  let selections;
+  try {
+    selections = validateSelectionsOrThrow(req.body.selections);
+  } catch (e) {
+    const msg = String(e.message || "");
+    if (msg === "INVALID_PAYLOAD") return res.status(400).json({ error: "Invalid payload format." });
+    if (msg === "CANDIDATES_NOT_READY") return res.status(503).json({ error: "Candidates not ready. Try again." });
+    if (msg.startsWith("INVALID_POSITION")) return res.status(400).json({ error: "Invalid position in selections." });
+    if (msg.startsWith("INVALID_CANDIDATE")) return res.status(400).json({ error: "Invalid candidate selection." });
+    return res.status(400).json({ error: "Invalid selections." });
   }
 
-  const lvn = req.user.lvn;     // ✅ consistent with /api/verify
-  const grade = req.user.grade; // used for cache breakdown updates
-
   try {
-    // B. Transaction: block double vote + save vote receipt + mark voter voted
     const receiptHash = await db.runTransaction(async (t) => {
+      // ✅ Check election status + active grade inside the transaction
+      const settingsRef = db.collection('settings').doc('electionStatus');
+      const settingsSnap = await t.get(settingsRef);
+
+      if (!settingsSnap.exists || !settingsSnap.data().isLive) {
+        throw new Error("ELECTION_PAUSED");
+      }
+
+      const activeGrade = settingsSnap.data().activeGrade;
+      if (activeGrade && activeGrade !== "ALL" && grade !== activeGrade) {
+        throw new Error("GRADE_NOT_ALLOWED");
+      }
+
+      // voter checks
       const voterRef = db.collection('voters').doc(String(lvn));
       const voterDoc = await t.get(voterRef);
 
-      if (!voterDoc.exists) {
-        throw new Error("VOTER_NOT_FOUND");
-      }
-      if (voterDoc.data().hasVoted) {
-        throw new Error("ALREADY_VOTED");
-      }
+      if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
+      if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
 
-      // C. Generate Receipt Hash (Integrity Check)
+      // receipt hash
       const voteString = `${String(lvn)}-${new Date().toISOString()}-${JSON.stringify(selections)}`;
       const hash = crypto.createHash('sha256').update(voteString).digest('hex');
 
-      // D. Save vote record (anonymous)
+      // store the anonymized vote record
       t.set(db.collection('votes').doc(), {
         selections,
         hash,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // E. Update voter
+      // ✅ REAL-TIME TALLY: update results per candidate INSIDE transaction
+      // results/<candidateId> { votes: +1, votes_<grade>: +1 }
+      for (const candidateId of Object.values(selections)) {
+        const resultRef = db.collection('results').doc(String(candidateId));
+
+        t.set(resultRef, {
+          votes: admin.firestore.FieldValue.increment(1),
+          [`votes_${grade}`]: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      // mark voter voted
       t.update(voterRef, {
         hasVoted: true,
         votedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -294,10 +363,10 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
       return hash;
     });
 
-    // ✅ log audit outside transaction
+    // audit outside transaction
     logAudit("VOTE_CAST", "ANONYMOUS", { hash: receiptHash }).catch(() => {});
 
-    // ✅ 4. INSTANT LOCAL UPDATE (now properly inside the route)
+    // ✅ instant local cache updates (dashboard)
     if (GlobalCache.dashboard?.stats) {
       GlobalCache.dashboard.stats.voted++;
 
@@ -306,43 +375,41 @@ app.post('/api/vote', authenticateToken, async (req, res) => {
           ((GlobalCache.dashboard.stats.voted / GlobalCache.dashboard.stats.total) * 100).toFixed(1);
       }
 
-      if (grade && GlobalCache.dashboard.stats.grades?.[grade]) {
+      if (GlobalCache.dashboard.stats.grades?.[grade]) {
         GlobalCache.dashboard.stats.grades[grade].voted++;
         GlobalCache.dashboard.stats.grades[grade].missed =
           Math.max(0, (GlobalCache.dashboard.stats.grades[grade].missed || 0) - 1);
       }
     }
 
-    // Update candidate cache immediately
+    // ✅ instant local cache updates (leaderboard)
     if (GlobalCache.dashboard?.leaderboard) {
-      Object.keys(selections).forEach(posKey => {
-        const cId = selections[posKey];
+      for (const [posKey, candidateId] of Object.entries(selections)) {
         const list = GlobalCache.dashboard.leaderboard[posKey];
+        if (!Array.isArray(list)) continue;
 
-        if (Array.isArray(list)) {
-          const cand = list.find(c => String(c.id) === String(cId));
-          if (cand) {
-            cand.votes = (cand.votes || 0) + 1;
+        const cand = list.find(c => String(c.id) === String(candidateId));
+        if (!cand) continue;
 
-            if (!cand.breakdown) cand.breakdown = {};
-            const gKey = `votes_${grade || 'Unknown'}`;
-            cand.breakdown[gKey] = (cand.breakdown[gKey] || 0) + 1;
+        cand.votes = (cand.votes || 0) + 1;
 
-            list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
-          }
-        }
-      });
+        if (!cand.breakdown) cand.breakdown = {};
+        const gKey = `votes_${grade}`;
+        cand.breakdown[gKey] = (cand.breakdown[gKey] || 0) + 1;
+
+        list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
+      }
     }
 
     return res.json({ success: true, hash: receiptHash });
 
   } catch (err) {
-    if (err.message === "ALREADY_VOTED") {
-      return res.status(403).json({ error: "You have already voted." });
-    }
-    if (err.message === "VOTER_NOT_FOUND") {
-      return res.status(404).json({ error: "Voter record not found." });
-    }
+    const m = String(err.message || "");
+    if (m === "ALREADY_VOTED") return res.status(403).json({ error: "You have already voted." });
+    if (m === "VOTER_NOT_FOUND") return res.status(404).json({ error: "Voter record not found." });
+    if (m === "ELECTION_PAUSED") return res.status(403).json({ error: "Election is paused." });
+    if (m === "GRADE_NOT_ALLOWED") return res.status(403).json({ error: "Not allowed in current grade session." });
+
     console.error("Vote Error:", err);
     return res.status(500).json({ error: "Server error while casting vote." });
   }
@@ -359,19 +426,23 @@ app.get('/api/dashboard', (req, res) => {
 });
 
 // --- 9. ADMIN API: MANAGEMENT & REFRESH ---
+// ✅ all routes below automatically require ADMIN_KEY due to app.use('/api/admin', requireAdminKey)
 
+// Refresh Candidates
 app.post('/api/admin/refresh/candidates', async (req, res) => {
   const success = await refreshLocalCandidates();
   if (success) res.json({ success: true, timestamp: GlobalCache.timestamps.candidates });
   else res.status(500).json({ error: "Failed to refresh candidates." });
 });
 
+// Refresh Results & Stats
 app.post('/api/admin/refresh/results', async (req, res) => {
   const success = await refreshLocalResults();
   if (success) res.json({ success: true, timestamp: GlobalCache.timestamps.results });
   else res.status(500).json({ error: "Failed to refresh results." });
 });
 
+// Status (GET) - adminKey via header x-admin-key OR query ?adminKey=...
 app.get('/api/admin/status', (req, res) => {
   res.json(GlobalCache.timestamps);
 });
@@ -401,10 +472,10 @@ app.post('/api/admin/add-party', async (req, res) => {
 
       for (const pos of Object.keys(groupedData)) {
         const docRef = db.collection('candidates').doc(pos);
-        const doc = await t.get(docRef);
+        const docSnap = await t.get(docRef);
 
         const newCandidates = groupedData[pos];
-        if (!doc.exists) t.set(docRef, { options: newCandidates });
+        if (!docSnap.exists) t.set(docRef, { options: newCandidates });
         else t.update(docRef, { options: admin.firestore.FieldValue.arrayUnion(...newCandidates) });
       }
     });
@@ -419,18 +490,7 @@ app.post('/api/admin/add-party', async (req, res) => {
 
 // ---ADMIN DELETE ---
 app.post('/api/admin/delete', async (req, res) => {
-  const { position, candidateId, partyName, adminKey } = req.body;
-
-  // A. Server-Side Auth Check
-  if (!adminKey || adminKey !== ADMIN_KEY) {
-    logAudit("UNAUTHORIZED_DELETE_ATTEMPT", req.ip, { target: candidateId || partyName }).catch(() => {});
-    return res.status(403).json({ error: "Unauthorized: Invalid Admin Key" });
-  }
-
-  const ALL_POSITIONS = [
-    'president', 'vp', 'secretary', 'treasurer', 'auditor',
-    'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
-  ];
+  const { position, candidateId, partyName } = req.body;
 
   try {
     // SCENARIO 1: DELETE ENTIRE PARTYLIST
@@ -445,19 +505,22 @@ app.post('/api/admin/delete', async (req, res) => {
       const snapshots = await db.getAll(...refs);
 
       snapshots.forEach((docSnap, index) => {
-        if (docSnap.exists) {
-          const currentOptions = docSnap.data().options || [];
-          const newOptions = currentOptions.filter(c => String(c.party).toUpperCase() !== normalizedParty);
+        if (!docSnap.exists) return;
 
-          if (newOptions.length !== currentOptions.length) {
-            deletedCount += (currentOptions.length - newOptions.length);
-            batch.update(refs[index], { options: newOptions });
-          }
+        const currentOptions = docSnap.data().options || [];
+        const newOptions = currentOptions.filter(c => String(c.party).toUpperCase() !== normalizedParty);
+
+        if (newOptions.length !== currentOptions.length) {
+          deletedCount += (currentOptions.length - newOptions.length);
+          batch.update(refs[index], { options: newOptions });
         }
       });
 
       await batch.commit();
       await logAudit("DELETE_PARTY", "ADMIN", { party: normalizedParty, count: deletedCount });
+
+      await refreshLocalCandidates();
+      await refreshLocalResults();
 
       return res.json({
         success: true,
@@ -485,6 +548,10 @@ app.post('/api/admin/delete', async (req, res) => {
       });
 
       await logAudit("DELETE_CANDIDATE", "ADMIN", { position: pos, candidateId: candId });
+
+      await refreshLocalCandidates();
+      await refreshLocalResults();
+
       return res.json({ success: true, message: "Candidate deleted successfully." });
     }
 
