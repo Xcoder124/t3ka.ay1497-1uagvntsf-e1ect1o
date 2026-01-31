@@ -2,34 +2,43 @@ const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const jwt = require('jsonwebtoken'); 
-const rateLimit = require('express-rate-limit'); 
+const rateLimit = require('express-rate-limit');
 const helmet = require('helmet'); 
+const crypto = require('crypto'); // NEW: For generating Receipt Hashes
 
 const app = express();
 
-// --- 1. SECURITY CONFIGURATION ---
+// --- 1. STRICT SECURITY CONFIGURATION ---
 app.use(helmet());
+app.use(express.json()); // Ensure JSON body parsing is enabled
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-this-in-prod";
+// CRITICAL: Fail if secrets are missing
+if (!process.env.JWT_SECRET || !process.env.ADMIN_KEY) {
+    console.error("FATAL ERROR: JWT Key and Admin Secret is missing.");
+    process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_KEY = process.env.ADMIN_KEY; // New master password for admin actions
 
+// Rate Limiter
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
-    max: 10, 
-    message: { error: "Too many login attempts. Please try again later." }
+    max: 3, 
+    message: { error: "Too many attempts. Please try again later." }
 });
 
+// CORS
 const allowedOrigins = [
     'http://127.0.0.1:5500',                            
     'http://localhost:3000',                            
     'https://tsf-sslg-election-endpoint.onrender.com',
     'https://tsf-g-digital-election.web.app' 
 ];
-
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) === -1) {
-            return callback(new Error('CORS Policy violation'), false);
+            return callback(new Error('CORS Policy: Origin not allowed'), false);
         }
         return callback(null, true);
     }
@@ -39,7 +48,7 @@ app.use(express.json());
 
 // --- 2. FIREBASE INITIALIZATION ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    console.error("ERROR: Missing FIREBASE_SERVICE_ACCOUNT environment variable.");
+    console.error("ERROR: Missing FIREBASE SERVICE ACCOUNT.");
     process.exit(1);
 }
 
@@ -209,46 +218,73 @@ app.post('/api/verify', loginLimiter, async (req, res) => {
     }
 });
 
-// --- 6. TALLIER API (Voting) ---
-app.post('/api/vote', authenticateToken, async (req, res) => {
-    const { lvn, grade } = req.user; 
-    const { selections } = req.body; 
-
-    if (!lvn || !selections || !selections.president) {
-        return res.status(400).json({ error: "Invalid ballot." });
+// --- AUDIT LOGGING HELPER ---
+async function logAudit(action, performer, details) {
+    try {
+        await admin.firestore().collection('audit_logs').add({
+            action: action,
+            performer: performer, // IP or User ID
+            details: details,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`[AUDIT] ${action} by ${performer}`);
+    } catch (e) {
+        console.error("Audit Log Failed:", e);
     }
+}
+
+// --- 6. TALLIER API (Voting) ---
+app.post('/api/vote', async (req, res) => {
+    // A. Validate Auth Header
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Access Denied: No Token" });
 
     try {
+        // B. Verify Token
+        const user = jwt.verify(token, JWT_SECRET);
+        
+        // C. Input Sanitization
+        const { selections } = req.body;
+        if (!selections || typeof selections !== 'object') {
+            return res.status(400).json({ error: "Invalid payload format." });
+        }
+
+        // D. Transaction: Check Double Vote + Save
+        const db = admin.firestore();
         await db.runTransaction(async (t) => {
-            const voterRef = db.collection('voters').doc(lvn);
-            const voterSnap = await t.get(voterRef);
+            const voterRef = db.collection('voters').doc(user.lrn); // Assuming LRN is ID
+            const voterDoc = await t.get(voterRef);
 
-            if (!voterSnap.exists) throw new Error("Voter not found.");
-            if (voterSnap.data().hasVoted) throw new Error("Vote already recorded.");
+            if (voterDoc.exists && voterDoc.data().hasVoted) {
+                throw new Error("ALREADY_VOTED");
+            }
 
-            // 1. Audit Log
-            const logRef = db.collection('audit_logs').doc();
-            t.set(logRef, {
-                lvn, action: "VOTE_CAST", grade, timestamp: admin.firestore.FieldValue.serverTimestamp(), ip: req.ip
+            // E. Generate Receipt Hash (Integrity Check)
+            const voteString = `${user.lrn}-${new Date().toISOString()}-${JSON.stringify(selections)}`;
+            const receiptHash = crypto.createHash('sha256').update(voteString).digest('hex');
+
+            // F. Save Vote & Update Voter Status
+            t.set(db.collection('votes').doc(), {
+                selections: selections,
+                hash: receiptHash,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
-
-            // 2. Mark Voted
             t.update(voterRef, { hasVoted: true, votedAt: admin.firestore.FieldValue.serverTimestamp() });
+            
+            // Log this event (Anonymized for privacy, but logged for traffic analysis)
+            logAudit("VOTE_CAST", "ANONYMOUS", { hash: receiptHash });
 
-            // 3. Tally in Firestore
-            Object.keys(selections).forEach(posKey => {
-                const candidateId = selections[posKey];
-                if(candidateId) {
-                    const resRef = db.collection('results').doc(candidateId);
-                    const gradeKey = grade ? `votes_${grade}` : 'votes_unknown';
-                    t.set(resRef, { 
-                        votes: admin.firestore.FieldValue.increment(1),
-                        [gradeKey]: admin.firestore.FieldValue.increment(1)
-                    }, { merge: true });
-                }
-            });
+            return receiptHash;
+        }).then((hash) => {
+            res.json({ success: true, hash: hash });
         });
 
+    } catch (err) {
+        if (err.message === "ALREADY_VOTED") return res.status(403).json({ error: "You have already voted." });
+        return res.status(403).json({ error: "Invalid Token or Server Error" });
+    }
+});
         // 4. INSTANT LOCAL UPDATE
         // Updates the STATS cache immediately for the dashboard
         if (GlobalCache.dashboard.stats) {
@@ -342,19 +378,88 @@ app.post('/api/admin/add-party', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---ADMIN DELETE ---
 app.post('/api/admin/delete', async (req, res) => {
-    const { position, candidateId } = req.body;
+    const { position, candidateId, partyName, adminKey } = req.body;
+
+    // A. Server-Side Auth Check
+    if (!adminKey || adminKey !== ADMIN_KEY) {
+        logAudit("UNAUTHORIZED_DELETE_ATTEMPT", req.ip, { target: candidateId || partyName });
+        return res.status(403).json({ error: "Unauthorized: Invalid Admin Key" });
+    }
+
+    const db = admin.firestore();
+
+    const ALL_POSITIONS = [
+        'president', 'vp', 'secretary', 'treasurer', 'auditor', 
+        'pio', 'protocol', 'rep8', 'rep9', 'rep10', 'rep11', 'rep12'
+    ];
+
     try {
-        const docRef = db.collection('candidates').doc(position);
-        const doc = await docRef.get();
-        if (!doc.exists) return res.status(404).json({ error: "Position not found." });
+        // SCENARIO 1: DELETE ENTIRE PARTYLIST
+        if (partyName) {
+            console.log(`[ADMIN] Starting bulk delete for party: ${partyName}`);
+            
+            const batch = db.batch();
+            let deletedCount = 0;
 
-        const updatedOptions = doc.data().options.filter(c => c.id.toString() !== candidateId.toString());
-        await docRef.update({ options: updatedOptions });
+            const refs = ALL_POSITIONS.map(pos => db.collection('candidates').doc(pos));
+            const snapshots = await db.getAll(...refs);
 
-        await refreshLocalCandidates();
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+            snapshots.forEach((doc, index) => {
+                if (doc.exists) {
+                    const currentOptions = doc.data().options || [];
+                    
+                    // Filter out ANYONE who belongs to this party
+                    const newOptions = currentOptions.filter(c => c.party !== partyName);
+                    
+                    if (newOptions.length !== currentOptions.length) {
+                        const removedCount = currentOptions.length - newOptions.length;
+                        deletedCount += removedCount;
+                        
+                        // Update the document in the batch
+                        batch.update(refs[index], { options: newOptions });
+                    }
+                }
+            });
+            await batch.commit();
+
+            await logAudit("DELETE_PARTY", "ADMIN", { party: partyName, count: deletedCount });
+            return res.json({ success: true, message: `Deleted ${deletedCount} candidates from party '${partyName}' across all positions.` });
+        }
+            // SCENARIO 2: DELETE SINGLE CANDIDATE
+        else if (position && candidateId) {
+            const docRef = db.collection('candidates').doc(position);
+        
+            await db.runTransaction(async (t) => {
+                const doc = await t.get(docRef);
+                if (!doc.exists) throw new Error("Position document not found");
+
+                const currentOptions = doc.data().options || [];
+                
+                const exists = currentOptions.some(c => c.id === candidateId);
+                if (!exists) throw new Error("Candidate ID not found in this position");
+
+                const newOptions = currentOptions.filter(c => c.id !== candidateId);
+
+                t.update(docRef, { options: newOptions });
+            });
+
+            await logAudit("DELETE_CANDIDATE", "ADMIN", { position, candidateId });
+            return res.json({ success: true, message: "Candidate deleted successfully." });
+        }
+
+        // =========================================================
+        // INVALID REQUEST
+        // =========================================================
+        else {
+            return res.status(400).json({ error: "Missing parameters. Provide (position & candidateId) OR (partyName)." });
+        }
+
+    } catch (err) {
+        console.error("Delete Error:", err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 const PORT = process.env.PORT || 3000;
