@@ -792,7 +792,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     res.cookie("__session", token, {
         httpOnly: true,
         secure: true,
-        sameSite: "strict",
+        sameSite: "none",
         path: "/",
         maxAge: 60 * 60 * 1000
     });
