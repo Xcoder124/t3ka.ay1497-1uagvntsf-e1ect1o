@@ -16,13 +16,34 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // --- RENDER: Explicit Firebase Admin Initialization ---
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-  })
-});
+const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+if (!privateKey) {
+    console.error("ERROR: FIREBASE_PRIVATE_KEY environment variable is missing!");
+    console.error("Available env vars:", Object.keys(process.env).filter(k => k.includes('FIREBASE')));
+    process.exit(1);
+}
+
+try {
+    admin.initializeApp({
+        credential: admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: privateKey.replace(/\\n/g, '\n'),
+        })
+    });
+    console.log("Firebase Admin initialized successfully");
+} catch (error) {
+    console.error("Firebase initialization failed:", error.message);
+    process.exit(1);
+}
+
+console.log("=== SERVER STARTING ===");
+console.log("NODE_ENV:", process.env.NODE_ENV);
+console.log("FIREBASE_PROJECT_ID exists:", !!process.env.FIREBASE_PROJECT_ID);
+console.log("FIREBASE_CLIENT_EMAIL exists:", !!process.env.FIREBASE_CLIENT_EMAIL);
+console.log("FIREBASE_PRIVATE_KEY exists:", !!process.env.FIREBASE_PRIVATE_KEY);
+console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
+console.log("ADMIN_KEY exists:", !!process.env.ADMIN_KEY);
 
 const app = express();
 const db = admin.firestore();
