@@ -10,9 +10,12 @@ const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
 
+// --- ADD dotenv for local development ---
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config();
+}
+
 // --- RENDER: Explicit Firebase Admin Initialization ---
-// Set these environment variables in your Render dashboard:
-// FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
@@ -267,8 +270,9 @@ function requireMobile(req, res, next) {
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10kb' }));
 app.use(cookieParser());
-// --- SECURITY: ENHANCED HELMET CONFIGURATION ---
-// Main helmet setup (without CSP - we'll do that separately)
+
+// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+// Single helmet() call with all security headers
 app.use(helmet({
     referrerPolicy: { policy: 'no-referrer' },
     crossOriginOpenerPolicy: { policy: 'same-origin' },
@@ -277,11 +281,13 @@ app.use(helmet({
         includeSubDomains: true,
         preload: true
     },
-    contentSecurityPolicy: false // Disable default CSP, we'll set it manually
+    contentSecurityPolicy: false // Disable default CSP, we'll set it manually below
 }));
 
+// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
+    
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
@@ -291,18 +297,15 @@ app.use((req, res, next) => {
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
             imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
             frameAncestors: ["'none'"],
-            upgradeInsecureRequests: [],
+            // FIX: Remove empty upgradeInsecureRequests or set to null
         },
     })(req, res, next);
 });
 
-app.use(helmet.referrerPolicy({ policy: 'no-referrer' }));
-app.use(helmet.crossOriginOpenerPolicy({ policy: 'same-origin' }));
-app.use(helmet.hsts({
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true
-}));
+// REMOVE THESE DUPLICATE CALLS (they were causing issues):
+// app.use(helmet.referrerPolicy({ policy: 'no-referrer' }));
+// app.use(helmet.crossOriginOpenerPolicy({ policy: 'same-origin' }));
+// app.use(helmet.hsts({...}));
 
 const allowedOrigins = [
     "http://127.0.0.1:5500",
@@ -1784,3 +1787,12 @@ app.get("/admin/forms/submissions", async (req, res) => {
 
 // --- RENDER SERVERLESS EXPORT ---
 module.exports = app;
+
+// --- LOCAL DEVELOPMENT FALLBACK ---
+// Only start server if running locally (not on Render)
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
