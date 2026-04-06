@@ -267,15 +267,25 @@ function requireMobile(req, res, next) {
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10kb' }));
 app.use(cookieParser());
-app.use(helmet());
+// --- SECURITY: ENHANCED HELMET CONFIGURATION ---
+// Main helmet setup (without CSP - we'll do that separately)
+app.use(helmet({
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    },
+    contentSecurityPolicy: false // Disable default CSP, we'll set it manually
+}));
 
-// CSP Middleware with Signed Nonce Support
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `nonce-${req.cspNonce}`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
             connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
@@ -285,24 +295,6 @@ app.use((req, res, next) => {
         },
     })(req, res, next);
 });
-
-app.use(
-    helmet.contentSecurityPolicy({
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: (req, res) => {
-                const nonce = req.cspNonce;
-                return ["'self'", `nonce-${nonce}`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"];
-            },
-            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com"],
-            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
-            frameAncestors: ["'none'"],
-            upgradeInsecureRequests: [],
-        },
-    })
-);
 
 app.use(helmet.referrerPolicy({ policy: 'no-referrer' }));
 app.use(helmet.crossOriginOpenerPolicy({ policy: 'same-origin' }));
