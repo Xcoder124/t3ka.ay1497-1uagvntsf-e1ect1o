@@ -269,10 +269,21 @@ app.use(express.json({ limit: '10kb' }));
 app.use(cookieParser());
 app.use(helmet());
 
-// CSP Middleware
+// CSP Middleware with Signed Nonce Support
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
-    next();
+    helmet.contentSecurityPolicy({
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", `nonce-${req.cspNonce}`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"],
+            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
+            frameAncestors: ["'none'"],
+            upgradeInsecureRequests: [],
+        },
+    })(req, res, next);
 });
 
 app.use(
