@@ -1745,6 +1745,12 @@ app.get("/settings", async (req, res) => {
     }
 });
 
+function normalizeName(name) {
+    return String(name)
+        .trim()
+        .toUpperCase()
+        .replace(/\s+/g, " ");
+}
 app.get("/candidates", (req, res) => res.json(GlobalCache.candidates));
 
 app.get("/dashboard", async (req, res) => {
@@ -2021,7 +2027,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             await refreshLocalCandidates();
         }
 
-        // 🚨 CRITICAL FIX: Block voting if still empty
         if (Object.keys(GlobalCache.candidates).length === 0) {
             return res.status(500).json({
                 error: "Candidates not loaded. Please contact administrator."
@@ -2034,6 +2039,24 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 return res.status(500).json({
                     error: `No candidates available for ${pos}. Voting cannot proceed.`
                 });
+            }
+        }
+
+        const candidateMap = {};
+
+        for (const pos in GlobalCache.candidates) {
+            candidateMap[pos] = {};
+
+            for (const c of GlobalCache.candidates[pos]) {
+                const key = normalizeName(c.name);
+
+                if (candidateMap[pos][key]) {
+                    return res.status(500).json({
+                        error: `Duplicate candidate name detected in ${pos}`
+                    });
+                }
+
+                candidateMap[pos][key] = c.id;
             }
         }
 
@@ -2058,71 +2081,51 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         // 🔒 Validate selections strictly
         for (const position of allowedPositions) {
             let userSelection = selections[position];
-            const availableCandidates = GlobalCache.candidates[position] || [];
-            const availCount = availableCandidates.length;
 
-            if (availCount === 0) continue;
+            if (!userSelection) {
+                return res.status(400).json({
+                    error: `Missing selection for ${position}.`
+                });
+            }
 
             if (MULTI_POSITIONS.includes(position)) {
                 if (!Array.isArray(userSelection)) {
-                    userSelection = userSelection ? [userSelection] : [];
+                    userSelection = [userSelection];
                 }
 
-                const uniqueSelections = new Set(userSelection);
-                if (uniqueSelections.size !== userSelection.length) {
+                const unique = new Set(userSelection);
+                if (unique.size !== userSelection.length) {
                     return res.status(400).json({
-                        error: `${position}: Duplicate selections are not allowed.`
+                        error: `${position}: Duplicate selections not allowed.`
                     });
                 }
 
-                for (const selId of userSelection) {
-                    const exists = availableCandidates.some(
-                        c => String(c.id) === String(selId)
-                    );
-                    if (!exists) {
+                validSelections[position] = [];
+
+                for (const name of userSelection) {
+                    const key = normalizeName(name);
+                    const candidateId = candidateMap[position][key];
+
+                    if (!candidateId) {
                         return res.status(400).json({
-                            error: `Invalid candidate selected for ${position}.`
+                            error: `Invalid candidate for ${position}`
                         });
                     }
+
+                    validSelections[position].push(candidateId);
                 }
 
-                if (availCount >= 2 && userSelection.length !== 2) {
-                    return res.status(400).json({
-                        error: `${position}: You must select exactly 2 candidates.`
-                    });
-                }
-
-                if (availCount === 1 && userSelection.length !== 1) {
-                    return res.status(400).json({
-                        error: `${position}: You must select the candidate.`
-                    });
-                }
-
-                validSelections[position] = userSelection;
             } else {
-                if (Array.isArray(userSelection)) {
+                const key = normalizeName(userSelection);
+                const candidateId = candidateMap[position][key];
+
+                if (!candidateId) {
                     return res.status(400).json({
-                        error: `Multiple selections not allowed for ${position}.`
+                        error: `Invalid candidate for ${position}`
                     });
                 }
 
-                if (!userSelection) {
-                    return res.status(400).json({
-                        error: `Missing selection for ${position}.`
-                    });
-                }
-
-                const exists = availableCandidates.some(
-                    c => String(c.id) === String(userSelection)
-                );
-
-                if (!exists) {
-                    return res.status(400).json({
-                        error: `Invalid candidate selected for ${position}.`
-                    });
-                }
-
-                validSelections[position] = String(userSelection);
+                validSelections[position] = candidateId;
             }
         }
 
