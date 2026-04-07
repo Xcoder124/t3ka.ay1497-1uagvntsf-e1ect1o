@@ -1076,13 +1076,14 @@ app.use((req, res, next) => {
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com",  "https://challenges.cloudflare.com"],
+            frameSrc: ["'self'", "https://challenges.cloudflare.com" ],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
             imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
             frameAncestors: ["'none'"],
-            // FIX: Remove empty upgradeInsecureRequests or set to null
+            
         },
     })(req, res, next);
 });
@@ -1528,35 +1529,6 @@ app.use(async (req, res, next) => {
 });
 
 // --- ROUTES ---
-
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false
-  })
-);
-
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: [
-          "'self'",
-          "https://challenges.cloudflare.com"
-        ],
-        frameSrc: [
-          "'self'",
-          "https://challenges.cloudflare.com"
-        ],
-        connectSrc: [
-          "'self'",
-          "https://challenges.cloudflare.com"
-        ]
-      }
-    }
-  })
-);
 
 // -- VERIFY CLOUDFLARE
 async function verifyCaptcha(token) {
