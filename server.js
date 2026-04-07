@@ -1729,6 +1729,17 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     res.json({ success: true });
 });
 
+app.post("/admin/logout", (req, res) => {
+    res.clearCookie("__session", {
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        path: "/"
+    });
+
+    res.json({ success: true });
+});
+
 app.get("/admin/verify", requireAuth, requireRole("admin"), (req, res) => {
     res.json({ success: true });
 });
