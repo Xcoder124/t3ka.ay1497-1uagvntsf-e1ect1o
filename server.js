@@ -1013,7 +1013,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         res.cookie("__device_id", deviceFingerprint, {
             httpOnly: true,
             secure: true,
-            sameSite: "strict",
+            sameSite: "none",
             path: "/",
             maxAge: 365 * 24 * 60 * 60 * 1000
         });
@@ -1043,131 +1043,238 @@ app.post("/verify", loginLimiter, async (req, res) => {
     }
 });
 
-// --- VOTE ROUTE ---
 app.post("/vote", voteLimiter, verifyCSRF, requireAuth, requireRole("voter"), async (req, res) => {
     const hashedLVN = req.user.uid;
     const grade = req.user.grade;
     const { selections } = req.body;
+
     if (!selections || typeof selections !== 'object') {
         return res.status(400).json({ error: "Invalid ballot format." });
     }
+
     try {
         const settings = await db.collection("settings").doc("electionStatus").get();
+
         if (!settings.exists || !settings.data().isLive) {
             return res.status(403).json({ error: "Election closed." });
         }
+
         if (settings.data().endTime && Date.now() > settings.data().endTime.toMillis()) {
             return res.status(403).json({ error: "Voting period ended." });
         }
+
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
+
         if (!voterSnap.exists) {
             return res.status(403).json({ error: "Voter not found." });
         }
+
         const voter = voterSnap.data();
+
         if (voter.hasVoted) {
             await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
             return res.status(403).json({ error: "Already voted." });
         }
-        if (Object.keys(GlobalCache.candidates).length === 0) await refreshLocalCandidates();
+
+        // 🔥 Ensure candidates are loaded
+        if (Object.keys(GlobalCache.candidates).length === 0) {
+            await refreshLocalCandidates();
+        }
+
+        // 🚨 CRITICAL FIX: Block voting if still empty
+        if (Object.keys(GlobalCache.candidates).length === 0) {
+            return res.status(500).json({
+                error: "Candidates not loaded. Please contact administrator."
+            });
+        }
+
+        // 🚨 OPTIONAL HARDENING: ensure no empty positions
+        for (const pos of Object.keys(GlobalCache.candidates)) {
+            if ((GlobalCache.candidates[pos] || []).length === 0) {
+                return res.status(500).json({
+                    error: `No candidates available for ${pos}. Voting cannot proceed.`
+                });
+            }
+        }
+
         const validSelections = {};
         const { allowedRep, isAllowed } = buildAllowedPositionsForGrade(grade);
         const allowedPositions = Object.keys(GlobalCache.candidates).filter(isAllowed);
-        const repLabel = allowedRep ? `Grade ${String(allowedRep).replace('rep', '')} Representative` : "no grade-level representatives";
+        const repLabel = allowedRep
+            ? `Grade ${String(allowedRep).replace('rep', '')} Representative`
+            : "no grade-level representatives";
+
+        // 🔒 Prevent voting on restricted reps
         for (const repId of MULTI_POSITIONS) {
             if (!allowedRep || repId !== allowedRep) {
                 if (Object.prototype.hasOwnProperty.call(selections, repId)) {
-                    return res.status(403).json({ error: `Not allowed: Your grade can only vote for ${repLabel}.` });
+                    return res.status(403).json({
+                        error: `Not allowed: Your grade can only vote for ${repLabel}.`
+                    });
                 }
             }
         }
+
+        // 🔒 Validate selections strictly
         for (const position of allowedPositions) {
             let userSelection = selections[position];
             const availableCandidates = GlobalCache.candidates[position] || [];
             const availCount = availableCandidates.length;
+
             if (availCount === 0) continue;
+
             if (MULTI_POSITIONS.includes(position)) {
                 if (!Array.isArray(userSelection)) {
                     userSelection = userSelection ? [userSelection] : [];
                 }
+
                 for (const selId of userSelection) {
-                    const exists = availableCandidates.some(c => String(c.id) === String(selId));
-                    if (!exists) return res.status(400).json({ error: `Invalid candidate selected for ${position}.` });
-                }
-                if (availCount >= 2) {
-                    if (userSelection.length !== 2) {
-                        return res.status(400).json({ error: `${position}: You must select exactly 2 candidates.` });
-                    }
-                } else if (availCount === 1) {
-                    if (userSelection.length !== 1) {
-                        return res.status(400).json({ error: `${position}: You must select the candidate.` });
+                    const exists = availableCandidates.some(
+                        c => String(c.id) === String(selId)
+                    );
+                    if (!exists) {
+                        return res.status(400).json({
+                            error: `Invalid candidate selected for ${position}.`
+                        });
                     }
                 }
+
+                if (availCount >= 2 && userSelection.length !== 2) {
+                    return res.status(400).json({
+                        error: `${position}: You must select exactly 2 candidates.`
+                    });
+                }
+
+                if (availCount === 1 && userSelection.length !== 1) {
+                    return res.status(400).json({
+                        error: `${position}: You must select the candidate.`
+                    });
+                }
+
                 validSelections[position] = userSelection;
             } else {
-                if (Array.isArray(userSelection)) return res.status(400).json({ error: `Multiple selections not allowed for ${position}.` });
-                if (!userSelection) return res.status(400).json({ error: `Missing selection for ${position}.` });
-                const candidateExists = availableCandidates.some(c => String(c.id) === String(userSelection));
-                if (!candidateExists) {
-                    return res.status(400).json({ error: `Invalid candidate selected for ${position}.` });
+                if (Array.isArray(userSelection)) {
+                    return res.status(400).json({
+                        error: `Multiple selections not allowed for ${position}.`
+                    });
                 }
+
+                if (!userSelection) {
+                    return res.status(400).json({
+                        error: `Missing selection for ${position}.`
+                    });
+                }
+
+                const exists = availableCandidates.some(
+                    c => String(c.id) === String(userSelection)
+                );
+
+                if (!exists) {
+                    return res.status(400).json({
+                        error: `Invalid candidate selected for ${position}.`
+                    });
+                }
+
                 validSelections[position] = String(userSelection);
             }
         }
+
         if (Object.keys(validSelections).length === 0) {
             return res.status(400).json({ error: "No valid selections provided." });
         }
+
+        // 🔐 TRANSACTION (unchanged, already solid)
         const voteResult = await db.runTransaction(async (t) => {
             const settingsRef = db.collection("settings").doc("electionStatus");
             const settingsSnap = await t.get(settingsRef);
-            if (!settingsSnap.exists || !settingsSnap.data().isLive) throw new Error("PAUSED");
-            const voterRef = db.collection("voters").doc(hashedLVN);
+
+            if (!settingsSnap.exists || !settingsSnap.data().isLive) {
+                throw new Error("PAUSED");
+            }
+
             const voterDoc = await t.get(voterRef);
+
             if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
             if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
+
             const latestVoteQuery = await db.collection("votes")
                 .orderBy("createdAt", "desc")
                 .limit(1)
                 .get();
-            const prevHash = latestVoteQuery.empty ? "GENESIS" : latestVoteQuery.docs[0].data().hash;
+
+            const prevHash = latestVoteQuery.empty
+                ? "GENESIS"
+                : latestVoteQuery.docs[0].data().hash;
+
             const randomSalt = crypto.randomBytes(32).toString('hex');
-            const serverTimestamp = admin.firestore.FieldValue.serverTimestamp();
             const timestampMs = Date.now();
+
             const payload = JSON.stringify({
                 voter_hash: hashedLVN,
                 selected_candidates: validSelections,
                 timestamp: timestampMs
             });
+
             const receipt = crypto.createHash("sha256")
                 .update(payload + randomSalt)
                 .digest("hex");
+
             const currentHash = crypto.createHash("sha256")
                 .update(receipt + prevHash)
                 .digest("hex");
+
             const voteRef = db.collection("votes").doc();
+
             t.set(voteRef, {
                 selections: validSelections,
                 grade: String(grade),
-                createdAt: serverTimestamp,
-                receipt: receipt,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt,
                 hash: currentHash,
-                prevHash: prevHash,
+                prevHash,
                 salt: randomSalt
             });
+
             t.update(voterRef, {
                 hasVoted: true,
-                votedAt: serverTimestamp,
-                receipt: receipt
+                votedAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt
             });
-            return { receipt, currentHash, prevHash, timestamp: timestampMs };
+
+            return { receipt, currentHash, prevHash };
         });
-        await logSuccessEvent("VOTE_CAST", req, { receipt: voteResult.receipt.substring(0, 16) + '...', grade: grade });
-        res.json({ success: true, receipt: voteResult.receipt, hash: voteResult.currentHash, prevHash: voteResult.prevHash });
+
+        await logSuccessEvent("VOTE_CAST", req, {
+            receipt: voteResult.receipt.substring(0, 16) + '...',
+            grade
+        });
+
+        res.json({
+            success: true,
+            receipt: voteResult.receipt,
+            hash: voteResult.currentHash,
+            prevHash: voteResult.prevHash
+        });
+
     } catch (e) {
-        if (e.message === "ALREADY_VOTED") return res.status(403).json({ error: "Our records show you have already cast your vote." });
-        if (e.message === "PAUSED") return res.status(403).json({ error: "The election is currently paused by the administrator." });
+        if (e.message === "ALREADY_VOTED") {
+            return res.status(403).json({
+                error: "Our records show you have already cast your vote."
+            });
+        }
+
+        if (e.message === "PAUSED") {
+            return res.status(403).json({
+                error: "The election is currently paused by the administrator."
+            });
+        }
+
         console.error("Vote error:", e);
-        res.status(500).json({ error: "System failed to record vote. Please notify a facilitator." });
+
+        res.status(500).json({
+            error: "System failed to record vote. Please notify a facilitator."
+        });
     }
 });
 
