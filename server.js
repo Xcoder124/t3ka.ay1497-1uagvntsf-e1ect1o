@@ -94,10 +94,10 @@ const DOMPurify = createDOMPurify(window);
 
 function sanitizeHtml(input) {
     if (typeof input !== 'string') return '';
-    return DOMPurify.sanitize(input, { 
-        ALLOWED_TAGS: [], 
+    return DOMPurify.sanitize(input, {
+        ALLOWED_TAGS: [],
         ALLOWED_ATTR: [],
-        KEEP_CONTENT: true 
+        KEEP_CONTENT: true
     });
 }
 
@@ -218,22 +218,22 @@ async function recordVoterFailedAttempt(hashedLVN) {
         const ref = await getVoterBruteForceDoc(hashedLVN);
         const snap = await ref.get();
         if (!snap.exists) {
-            await ref.set({ 
-                failedAttempts: 1, 
-                lastAttempt: admin.firestore.FieldValue.serverTimestamp() 
+            await ref.set({
+                failedAttempts: 1,
+                lastAttempt: admin.firestore.FieldValue.serverTimestamp()
             });
         } else {
             const d = snap.data();
             const newAttempts = (d.failedAttempts || 0) + 1;
             if (newAttempts >= USER_LOCK_ATTEMPTS) {
                 const lockUntil = new Date(Date.now() + USER_LOCK_DURATION_MS);
-                await ref.update({ 
+                await ref.update({
                     failedAttempts: newAttempts,
                     lockUntil: admin.firestore.Timestamp.fromDate(lockUntil),
                     lastAttempt: admin.firestore.FieldValue.serverTimestamp()
                 });
             } else {
-                await ref.update({ 
+                await ref.update({
                     failedAttempts: newAttempts,
                     lastAttempt: admin.firestore.FieldValue.serverTimestamp()
                 });
@@ -280,7 +280,7 @@ function requireMobile(req, res, next) {
 
     if (!isMobileDevice(req)) {
         logSecurityEvent("DESKTOP_ACCESS_BLOCKED", req, { userAgent: req.headers['user-agent'] });
-        return res.status(403).json({ 
+        return res.status(403).json({
             error: "Access Denied: This endpoint is only accessible from mobile devices."
         });
     }
@@ -308,7 +308,7 @@ app.use(helmet({
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
-    
+
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
@@ -639,7 +639,7 @@ function verifySubmitToken(token) {
     const expected1 = crypto.createHmac("sha256", SECRET).update(payloadCurrent).digest("hex");
     const expected2 = crypto.createHmac("sha256", SECRET).update(payloadPrev).digest("hex");
     return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected1)) ||
-           crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected2));
+        crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected2));
 }
 
 // --- AUTH MIDDLEWARE ---
@@ -956,7 +956,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         if (deviceSnap.exists) {
             const usedLvns = deviceSnap.data().lvns || [];
             if (!usedLvns.includes(hashedLVN)) {
-                if (usedLvns.length >= 10) { 
+                if (usedLvns.length >= 10) {
                     return res.status(403).json({ error: "Device Limit Reached: Maximum 10 voters allowed per device." });
                 }
             }
@@ -1022,7 +1022,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
             maxAge: 365 * 24 * 60 * 60 * 1000
         });
         await clearVoterBruteForce(hashedLVN);
-         const csrfToken = crypto.randomBytes(32).toString('hex');
+        const csrfToken = crypto.randomBytes(32).toString('hex');
         const sessionToken = jwt.sign(
             { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, iat: Math.floor(Date.now() / 1000) },
             SECRET,
@@ -1125,6 +1125,13 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             if (MULTI_POSITIONS.includes(position)) {
                 if (!Array.isArray(userSelection)) {
                     userSelection = userSelection ? [userSelection] : [];
+                }
+
+                const uniqueSelections = new Set(userSelection);
+                if (uniqueSelections.size !== userSelection.length) {
+                    return res.status(400).json({
+                        error: `${position}: Duplicate selections are not allowed.`
+                    });
                 }
 
                 for (const selId of userSelection) {
@@ -1363,7 +1370,7 @@ app.get("/admin/voters", async (req, res) => {
                     integrityStatus = "VOTED";
                 }
             }
-            voters.push({ 
+            voters.push({
                 lvn: v.lvn || "***",
                 name: v.name,
                 grade: v.grade,
@@ -1371,7 +1378,7 @@ app.get("/admin/voters", async (req, res) => {
                 section: v.section,
                 hasVoted: v.hasVoted,
                 isMissed: v.isMissed,
-                integrityStatus 
+                integrityStatus
             });
         });
         await logSuccessEvent("ADMIN_VIEW_VOTERS", req, { count: voters.length });
@@ -1784,8 +1791,8 @@ app.post("/admin/delete", async (req, res) => {
             return res.json({ success: true });
         }
         res.status(400).json({ error: "Bad Params" });
-    } catch (e) { 
-        res.status(500).json({ error: e.message }); 
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
