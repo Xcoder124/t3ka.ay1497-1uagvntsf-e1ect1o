@@ -899,6 +899,29 @@ app.use(async (req, res, next) => {
 
 // --- ROUTES ---
 
+// -- ALERTS
+app.get("/admin/alerts", async (req, res) => {
+    try {
+        const snap = await db.collection("system_alerts")
+            .where("active", "==", true)
+            .get();
+
+        const alerts = [];
+
+        snap.forEach(doc => {
+            alerts.push({
+                id: doc.id,
+                ...doc.data()
+            });
+        });
+
+        res.json(alerts);
+
+    } catch (e) {
+        res.status(500).json({ error: "Failed to fetch alerts" });
+    }
+});
+
 // --- ADMIN AUTH ROUTES ---
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const username = sanitizeString(req.body.username || '');
