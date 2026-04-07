@@ -1529,6 +1529,35 @@ app.use(async (req, res, next) => {
 
 // --- ROUTES ---
 
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false
+  })
+);
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          "https://challenges.cloudflare.com"
+        ],
+        frameSrc: [
+          "'self'",
+          "https://challenges.cloudflare.com"
+        ],
+        connectSrc: [
+          "'self'",
+          "https://challenges.cloudflare.com"
+        ]
+      }
+    }
+  })
+);
+
 // -- VERIFY CLOUDFLARE
 async function verifyCaptcha(token) {
     const res = await axios.post(
@@ -1621,6 +1650,7 @@ app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, r
 
 // Client-side error reporting endpoint
 app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, res) => {
+    res.sendStatus(200);
     try {
         const { type, message, stack, url, line, column, userAgent } = req.body;
 
