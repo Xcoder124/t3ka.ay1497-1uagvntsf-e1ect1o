@@ -1022,6 +1022,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
             maxAge: 365 * 24 * 60 * 60 * 1000
         });
         await clearVoterBruteForce(hashedLVN);
+         const csrfToken = crypto.randomBytes(32).toString('hex');
         const sessionToken = jwt.sign(
             { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, iat: Math.floor(Date.now() / 1000) },
             SECRET,
@@ -1034,7 +1035,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
             path: "/",
             maxAge: 60 * 60 * 1000
         });
-        const csrfToken = crypto.randomBytes(32).toString('hex');
         return res.json({ success: true, name: d.name, grade: d.grade, token: sessionToken, csrfToken });
     } catch (e) {
         return res.status(500).json({ error: "Server error during verification." });
