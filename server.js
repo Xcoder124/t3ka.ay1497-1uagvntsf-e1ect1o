@@ -6,6 +6,7 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const crypto = require("crypto");
+const axios = require("axios");
 const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
@@ -50,6 +51,52 @@ const db = admin.firestore();
 
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
+
+// -- BACKUP
+async function createElectionBackup(db) {
+    const votesSnap = await db.collection("votes").get();
+    const votersSnap = await db.collection("voters").get();
+    const candidatesSnap = await db.collection("candidates").get();
+
+    const backup = {
+        timestamp: new Date().toISOString(),
+        totalVotes: votesSnap.size,
+        votes: votesSnap.docs.map(d => d.data()),
+        voters: votersSnap.docs.map(d => d.data()),
+        candidates: candidatesSnap.docs.map(d => d.data())
+    };
+
+    const json = JSON.stringify(backup, null, 2);
+
+    const hash = crypto
+        .createHash("sha256")
+        .update(json)
+        .digest("hex");
+
+    return { json, hash };
+}
+
+async function uploadToGitHub(json, hash) {
+    const path = `archives/election-${Date.now()}.json`;
+
+    const content = Buffer.from(json).toString("base64");
+
+    const res = await axios.put(
+        `https://api.github.com/repos/${process.env.GITHUB_REPO}/contents/${path}`,
+        {
+            message: `Election backup | ${new Date().toISOString()} | Hash: ${hash}`,
+            content: content
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                "Content-Type": "application/json"
+            }
+        }
+    );
+
+    return res.data.content.html_url;
+}
 
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
@@ -1572,10 +1619,28 @@ app.post("/admin/settings/timers", async (req, res) => {
 app.post("/admin/purge", async (req, res) => {
     try {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
+        const { json, hash } = await createElectionBackup(db);
+        const url = await uploadToGitHub(json, hash);
+        if (!hash || !url) {
+            throw new Error("Backup failed. Purge aborted.");
+        }
         await purgeElectionData();
-        await logSuccessEvent("ADMIN_PURGE_DATA", req, { success: true });
-        res.json({ success: true, message: "Election data purged successfully." });
+
+        await logSuccessEvent("ADMIN_PURGE_DATA", req, {
+            success: true,
+            backupHash: hash,
+            backupUrl: url
+        });
+
+        res.json({
+            success: true,
+            message: "Election purged with backup 🔥",
+            backupHash: hash,
+            backupUrl: url
+        });
+
     } catch (e) {
+        console.error("PURGE ERROR:", e);
         res.status(500).json({ error: "Purge failed: " + e.message });
     }
 });
