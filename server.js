@@ -903,41 +903,51 @@ async function randomDelay(minMs = 800, maxMs = 1200) {
 const BRUTE_FORCE_WINDOW_MS = 15 * 60 * 1000;
 const BRUTE_FORCE_MAX = 5;
 
-async function getBruteForceDoc(ip) {
-    return db.collection("brute_force").doc(ip.replace(/[:.]/g, "_"));
+function getDeviceBruteForceDoc(deviceId) {
+    return db.collection("device_brute_force").doc(deviceId);
 }
 
-async function isIPLocked(ip) {
-    try {
-        const ref = await getBruteForceDoc(ip);
-        const snap = await ref.get();
-        if (!snap.exists) return false;
-        const d = snap.data();
-        const windowStart = Date.now() - BRUTE_FORCE_WINDOW_MS;
-        if (d.windowStart && d.windowStart.toMillis() < windowStart) {
-            await ref.delete();
-            return false;
-        }
-        return (d.count || 0) >= BRUTE_FORCE_MAX;
-    } catch { return false; }
-}
+async function recordDeviceAttempt(deviceId) {
+    const ref = getDeviceBruteForceDoc(deviceId);
+    const snap = await ref.get();
 
-async function recordFailedAttempt(ip) {
-    try {
-        const ref = await getBruteForceDoc(ip);
-        const snap = await ref.get();
-        const windowStart = Date.now() - BRUTE_FORCE_WINDOW_MS;
-        if (!snap.exists || (snap.data().windowStart && snap.data().windowStart.toMillis() < windowStart)) {
-            await ref.set({ count: 1, windowStart: admin.firestore.FieldValue.serverTimestamp() });
+    if (!snap.exists) {
+        await ref.set({
+            attempts: 1,
+            lastAttempt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    } else {
+        const attempts = (snap.data().attempts || 0) + 1;
+
+        if (attempts >= 5) {
+            await ref.update({
+                attempts,
+                lockUntil: admin.firestore.Timestamp.fromMillis(Date.now() + 30 * 60 * 1000)
+            });
         } else {
-            await ref.update({ count: admin.firestore.FieldValue.increment(1) });
+            await ref.update({ attempts });
         }
-    } catch { }
+    }
 }
 
-async function clearBruteForce(ip) {
+async function isDeviceLocked(deviceId) {
+    const ref = getDeviceBruteForceDoc(deviceId);
+    const snap = await ref.get();
+
+    if (!snap.exists) return false;
+
+    const data = snap.data();
+
+    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
+        return true;
+    }
+
+    return false;
+}
+
+async function clearBruteForce(deviceId) {
     try {
-        const ref = await getBruteForceDoc(ip);
+        const ref = await getDeviceBruteForceDoc(deviceId);
         await ref.delete();
     } catch { }
 }
@@ -1519,8 +1529,20 @@ app.use(async (req, res, next) => {
 
 // --- ROUTES ---
 
+// -- VERIFY CLOUDFLARE
+async function verifyCaptcha(token) {
+    const res = await axios.post(
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        new URLSearchParams({
+            secret: process.env.TURNSTILE_SECRET,
+            response: token
+        })
+    );
+    return res.data.success;
+}
+
 // -- ALERTS
-app.get("/admin/alerts", async (req, res) => {
+app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const alerts = await alertManager.getActiveAlerts();
         res.json(alerts);
@@ -1530,7 +1552,7 @@ app.get("/admin/alerts", async (req, res) => {
     }
 });
 
-app.post("/admin/alerts/:id/dismiss", async (req, res) => {
+app.post("/admin/alerts/:id/dismiss", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const alertId = req.params.id;
         const adminId = req.user?.uid || req.user?.email || 'unknown';
@@ -1546,7 +1568,7 @@ app.post("/admin/alerts/:id/dismiss", async (req, res) => {
     }
 });
 
-app.post("/admin/alerts/:id/acknowledge", async (req, res) => {
+app.post("/admin/alerts/:id/acknowledge", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const alertId = req.params.id;
         const result = await alertManager.acknowledgeAlert(alertId);
@@ -1561,7 +1583,7 @@ app.post("/admin/alerts/:id/acknowledge", async (req, res) => {
     }
 });
 
-app.get("/admin/alerts/logs", async (req, res) => {
+app.get("/admin/alerts/logs", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const limit = parseInt(req.query.limit) || 50;
         const logs = await alertManager.getAlertLogs(limit);
@@ -1572,7 +1594,7 @@ app.get("/admin/alerts/logs", async (req, res) => {
     }
 });
 
-app.get("/admin/alerts/status", async (req, res) => {
+app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const activeAlerts = await alertManager.getActiveAlerts();
         const hasCritical = activeAlerts.some(a => a.level === 'critical');
@@ -1598,7 +1620,7 @@ app.get("/admin/alerts/status", async (req, res) => {
 });
 
 // Client-side error reporting endpoint
-app.post("/client-error-report", async (req, res) => {
+app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const { type, message, stack, url, line, column, userAgent } = req.body;
 
@@ -1641,37 +1663,57 @@ app.post("/client-error-report", async (req, res) => {
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const username = sanitizeString(req.body.username || '');
     const password = req.body.password || '';
-    const ip = req.ip;
+    const captchaToken = req.body.captchaToken;
+    const deviceId = req.cookies.__device_id || req.ip;
+
     await randomDelay(800, 1200);
+
     if (!req.headers["user-agent"]) {
         return res.status(403).end();
     }
-    if (await isIPLocked(ip)) {
+
+    if (!(await verifyCaptcha(captchaToken))) {
+        return res.status(403).json({ error: "Captcha verification failed" });
+    }
+
+    if (await isDeviceLocked(deviceId)) {
         return res.status(403).json({ error: "Locked" });
     }
+
     const isValidUser = username === process.env.ADMIN_USER;
     let isValidPass = false;
+
     if (isValidUser && process.env.ADMIN_HASH) {
         isValidPass = await bcrypt.compare(password, process.env.ADMIN_HASH);
     }
+
     if (!isValidUser || !isValidPass) {
-        await recordFailedAttempt(ip);
+        await recordDeviceAttempt(deviceId);
+        const ip = req.ip;
         await createAlert(
             "bruteforce",
             "major",
             "⚠️ Brute Force Detected",
-            "Multiple failed admin login attempts, can you verify if someone is having trouble to access the voting panel?.",
+            "Multiple failed admin login attempts detected.",
             { ip }
         );
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { username: username ? "***" : null, reason: "Invalid credentials" });
+
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
+            username: username ? "***" : null
+        });
+
         return res.status(401).json({ error: "Invalid credentials" });
     }
-    await clearBruteForce(ip);
+
+    await clearBruteForce(deviceId);
+
     const token = jwt.sign({
         uid: "admin",
         role: "admin",
         iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "1h" });
+
+    // 🔥 SET COOKIE ONLY AFTER EVERYTHING PASSED
     res.cookie("__session", token, {
         httpOnly: true,
         secure: true,
@@ -1679,7 +1721,9 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         path: "/",
         maxAge: 60 * 60 * 1000
     });
+
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
+
     res.json({ success: true });
 });
 
@@ -1833,6 +1877,9 @@ app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, re
 });
 
 app.post("/verify", loginLimiter, async (req, res) => {
+    if (!(await verifyCaptcha(req.body.captchaToken))) {
+        return res.status(403).json({ error: "Captcha verification failed" });
+    }
     try {
         const lvn = sanitizeString(req.body.lvn || '');
         const code = sanitizeString(req.body.code || '');
@@ -1843,7 +1890,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
         const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
         const deviceFingerprint = crypto.createHash("sha256")
-            .update(`${req.ip}|${ua}`)
+            .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
             .digest("hex");
         const deviceRef = db.collection("device_tracking").doc(deviceFingerprint);
         const deviceSnap = await deviceRef.get();
