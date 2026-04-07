@@ -45,8 +45,22 @@ console.log("FIREBASE_CLIENT_EMAIL exists:", !!process.env.FIREBASE_CLIENT_EMAIL
 console.log("FIREBASE_PRIVATE_KEY exists:", !!process.env.FIREBASE_PRIVATE_KEY);
 console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
 console.log("ADMIN_KEY exists:", !!process.env.ADMIN_KEY);
+console.log("GITHUB_REPO exists:", !!process.env.GITHUB_REPO);
+console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
 const app = express();
+let activeUsers = 0;
+
+app.use((req, res, next) => {
+    activeUsers++;
+
+    res.on("finish", () => {
+        activeUsers--;
+    });
+
+    next();
+});
+
 const db = admin.firestore();
 
 // --- CONSTANTS ---
@@ -77,26 +91,99 @@ async function createElectionBackup(db) {
 }
 
 async function uploadToGitHub(json, hash) {
-    const path = `archives/election-${Date.now()}.json`;
+    try {
+        const path = `archives/election-${Date.now()}.json`;
+        const content = Buffer.from(json).toString("base64");
 
-    const content = Buffer.from(json).toString("base64");
-
-    const res = await axios.put(
-        `https://api.github.com/repos/${process.env.GITHUB_REPO}/contents/${path}`,
-        {
-            message: `Election backup | ${new Date().toISOString()} | Hash: ${hash}`,
-            content: content
-        },
-        {
-            headers: {
-                Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                "Content-Type": "application/json"
+        const res = await axios.put(
+            `https://api.github.com/repos/${process.env.GITHUB_REPO}/contents/${path}`,
+            {
+                message: `Election backup | ${new Date().toISOString()} | Hash: ${hash}`,
+                content: content
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                    "Content-Type": "application/json"
+                }
             }
-        }
-    );
+        );
 
-    return res.data.content.html_url;
+        return res.data.content.html_url;
+
+    } catch (e) {
+        console.error("GITHUB UPLOAD ERROR:", e.response?.data || e.message);
+        throw e;
+    }
 }
+
+async function restoreElectionFromBackup(jsonData) {
+    const data = JSON.parse(jsonData);
+
+    const batch = db.batch();
+
+    // Restore voters
+    for (const v of data.voters || []) {
+        const ref = db.collection("voters").doc(hashLVN(v.lvn));
+        batch.set(ref, v);
+    }
+
+    // Restore candidates
+    for (const c of data.candidates || []) {
+        const ref = db.collection("candidates").doc(c.position);
+        batch.set(ref, { options: c.options || [] });
+    }
+
+    // Restore votes
+    for (const vote of data.votes || []) {
+        const ref = db.collection("votes").doc();
+        batch.set(ref, vote);
+    }
+
+    await batch.commit();
+
+    return {
+        voters: data.voters?.length || 0,
+        votes: data.votes?.length || 0,
+        candidates: data.candidates?.length || 0
+    };
+}
+
+// -- ALERTS
+async function createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
+    try {
+        const alert = {
+            type,
+            level,
+            title,
+            message,
+            meta,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            active: true
+        };
+
+        if (expiresInMs) {
+            alert.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
+        }
+
+        await db.collection("system_alerts").add(alert);
+    } catch (e) {
+        console.error("ALERT ERROR:", e);
+    }
+}
+
+setInterval(async () => {
+    if (activeUsers >= 500) {
+        await createAlert(
+            "high_load",
+            "major",
+            "⚠️ High Traffic",
+            `Concurrent users: ${activeUsers}`,
+            { activeUsers },
+            5 * 60 * 1000
+        );
+    }
+}, 10000);
 
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
@@ -831,6 +918,13 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     }
     if (!isValidUser || !isValidPass) {
         await recordFailedAttempt(ip);
+        await createAlert(
+            "bruteforce",
+            "major",
+            "⚠️ Brute Force Detected",
+            "Multiple failed admin login attempts, can you verify if someone is having trouble to access the voting panel?.",
+            { ip }
+        );
         await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { username: username ? "***" : null, reason: "Invalid credentials" });
         return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -974,6 +1068,21 @@ async function verifyHashChain() {
         return { valid: false, message: "Verification error: " + e.message };
     }
 }
+
+async function monitorIntegrity() {
+    const result = await verifyHashChain();
+
+    if (!result.valid) {
+        await createAlert(
+            "tamper",
+            "critical",
+            "🚨 Tamper Detected",
+            "Vote hash chain is broken.",
+            result
+        );
+    }
+}
+setInterval(monitorIntegrity, 60000);
 
 app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, res) => {
     try {
@@ -1621,6 +1730,14 @@ app.post("/admin/purge", async (req, res) => {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
+        await createAlert(
+            "backup",
+            "minor",
+            "💾 Backup Created",
+            "Election backup saved. Ask the developer for the archive link of the previous election results.",
+            { url },
+            24 * 60 * 60 * 1000
+        );
         if (!hash || !url) {
             throw new Error("Backup failed. Purge aborted.");
         }
@@ -1642,6 +1759,30 @@ app.post("/admin/purge", async (req, res) => {
     } catch (e) {
         console.error("PURGE ERROR:", e);
         res.status(500).json({ error: "Purge failed: " + e.message });
+    }
+});
+
+app.post("/admin/restore", async (req, res) => {
+    try {
+        const { backupUrl } = req.body;
+
+        if (!backupUrl) {
+            return res.status(400).json({ error: "Backup URL required" });
+        }
+
+        const response = await axios.get(backupUrl);
+        const jsonData = JSON.stringify(response.data);
+
+        const result = await restoreElectionFromBackup(jsonData);
+
+        res.json({
+            success: true,
+            restored: result
+        });
+
+    } catch (e) {
+        console.error("RESTORE ERROR:", e);
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -1814,6 +1955,14 @@ app.post("/admin/add-party", async (req, res) => {
         await logAdminAction(req, "ADD_PARTY", { success: true });
         await logSuccessEvent("ADMIN_ADD_PARTY", req, { success: true });
         res.json({ success: true });
+        await createAlert(
+            "candidate_sync",
+            "minor",
+            "📢 Candidate Update Needed",
+            "New candidates added but not published.",
+            {},
+            24 * 60 * 60 * 1000
+        );
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
