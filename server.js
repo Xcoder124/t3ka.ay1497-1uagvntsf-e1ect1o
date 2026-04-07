@@ -149,41 +149,661 @@ async function restoreElectionFromBackup(jsonData) {
     };
 }
 
-// -- ALERTS
-async function createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
-    try {
-        const alert = {
-            type,
-            level,
-            title,
-            message,
-            meta,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            active: true
-        };
+// ============================================
+// COMPREHENSIVE ALERT SYSTEM
+// ============================================
 
-        if (expiresInMs) {
-            alert.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
+const ALERT_TYPES = {
+    // System-level alerts
+    HIGH_LOAD: { type: 'high_load', level: 'major', autoExpire: 5 * 60 * 1000 },
+    BACKUP_CREATED: { type: 'backup', level: 'minor', autoExpire: 24 * 60 * 60 * 1000 },
+
+    // Candidate-related alerts
+    CANDIDATE_SYNC_NEEDED: { type: 'candidate_sync', level: 'minor', autoExpire: null },
+    CANDIDATES_EMPTY: { type: 'candidates_empty', level: 'critical', autoExpire: null },
+    CANDIDATE_PUBLISH_FAILED: { type: 'candidate_publish_failed', level: 'major', autoExpire: null },
+
+    // Security alerts
+    BRUTE_FORCE: { type: 'bruteforce', level: 'major', autoExpire: null },
+    TAMPER_DETECTED: { type: 'tamper', level: 'critical', autoExpire: null },
+    UNAUTHORIZED_ACCESS: { type: 'unauthorized', level: 'major', autoExpire: null },
+
+    // Data integrity alerts
+    HASH_CHAIN_BROKEN: { type: 'hash_chain', level: 'critical', autoExpire: null },
+    INVALID_VOTES_DETECTED: { type: 'invalid_votes', level: 'major', autoExpire: null },
+    VOTE_INTEGRITY_FAIL: { type: 'vote_integrity', level: 'critical', autoExpire: null },
+
+    // API/Backend errors
+    API_ERROR: { type: 'api_error', level: 'major', autoExpire: 30 * 60 * 1000 },
+    DATABASE_ERROR: { type: 'database_error', level: 'critical', autoExpire: null },
+    FIREBASE_ERROR: { type: 'firebase_error', level: 'critical', autoExpire: null },
+
+    // Frontend/Script errors (reported from client)
+    SCRIPT_ERROR: { type: 'script_error', level: 'major', autoExpire: 60 * 60 * 1000 },
+    CLIENT_API_ERROR: { type: 'client_api_error', level: 'minor', autoExpire: 30 * 60 * 1000 },
+    RENDER_ERROR: { type: 'render_error', level: 'major', autoExpire: null },
+
+    // Configuration alerts
+    CONFIG_MISSING: { type: 'config_missing', level: 'critical', autoExpire: null },
+    ENV_ERROR: { type: 'env_error', level: 'critical', autoExpire: null },
+
+    // Election status alerts
+    ELECTION_PAUSED: { type: 'election_paused', level: 'normal', autoExpire: null },
+    SESSION_TIMEOUT: { type: 'session_timeout', level: 'minor', autoExpire: null }
+};
+
+// Fix instructions for each alert type
+const ALERT_FIX_INSTRUCTIONS = {
+    candidate_sync: {
+        fixSteps: [
+            "Navigate to Settings tab",
+            "Click 'Publish Candidates' button",
+            "Verify candidates appear on voting page"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    candidates_empty: {
+        fixSteps: [
+            "Add candidates through Candidates Entry tab",
+            "Ensure all positions have at least one candidate",
+            "Publish candidates after adding"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: No candidates available for voting. Contact developer immediately if candidates were previously added."
+    },
+    candidate_publish_failed: {
+        fixSteps: [
+            "Check internet connection",
+            "Try publishing again",
+            "Check server logs for errors"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    bruteforce: {
+        fixSteps: [
+            "Verify if authorized user is having login issues",
+            "Check security logs for IP address",
+            "Consider blocking suspicious IPs"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    tamper: {
+        fixSteps: [
+            "DO NOT proceed with election",
+            "Document the issue",
+            "Contact developer immediately"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL SECURITY ALERT: Potential vote tampering detected. STOP all election activities and contact developer IMMEDIATELY."
+    },
+    hash_chain: {
+        fixSteps: [
+            "Run 'Re-Tally Votes' from Settings",
+            "Verify vote integrity",
+            "Contact developer if issue persists"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Vote hash chain integrity compromised. Contact developer immediately before proceeding."
+    },
+    invalid_votes: {
+        fixSteps: [
+            "Run 'Re-Tally Votes' from Settings",
+            "Review invalid voter records",
+            "Reset invalid voters if needed"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    vote_integrity: {
+        fixSteps: [
+            "STOP election immediately",
+            "Run 'Re-Tally Votes'",
+            "Contact developer if issue persists"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Vote integrity check failed. Contact developer immediately."
+    },
+    api_error: {
+        fixSteps: [
+            "Check server status",
+            "Verify network connectivity",
+            "Check API endpoint configuration"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    database_error: {
+        fixSteps: [
+            "Check Firebase connection",
+            "Verify database permissions",
+            "Restart server if needed"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Database connection failed. Contact developer immediately."
+    },
+    firebase_error: {
+        fixSteps: [
+            "Check Firebase console for outages",
+            "Verify service account credentials",
+            "Check Firebase project status"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Firebase service error. Contact developer immediately."
+    },
+    script_error: {
+        fixSteps: [
+            "Refresh the page",
+            "Clear browser cache",
+            "Try a different browser"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    client_api_error: {
+        fixSteps: [
+            "Check internet connection",
+            "Refresh the page",
+            "Try again in a few minutes"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    render_error: {
+        fixSteps: [
+            "Refresh the page",
+            "Check browser console for errors",
+            "Clear browser cache"
+        ],
+        developerFix: true,
+        contactMessage: "Frontend rendering error detected. Contact developer if issue persists."
+    },
+    config_missing: {
+        fixSteps: [
+            "Check environment variables",
+            "Verify configuration files",
+            "Restart server after fixing"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Required configuration missing. Contact developer immediately."
+    },
+    env_error: {
+        fixSteps: [
+            "Check .env file or environment variables",
+            "Verify all required variables are set",
+            "Restart server after fixing"
+        ],
+        developerFix: true,
+        contactMessage: "CRITICAL: Environment configuration error. Contact developer immediately."
+    },
+    high_load: {
+        fixSteps: [
+            "Monitor server performance",
+            "Consider enabling rate limiting",
+            "Scale resources if necessary"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    backup: {
+        fixSteps: [
+            "Verify backup was created successfully",
+            "Check backup archive link",
+            "No action needed - informational only"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    election_paused: {
+        fixSteps: [
+            "Toggle election status to LIVE when ready",
+            "Verify voters can access the system"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    session_timeout: {
+        fixSteps: [
+            "Login again to continue",
+            "Check session timer settings"
+        ],
+        developerFix: false,
+        contactMessage: null
+    },
+    unauthorized: {
+        fixSteps: [
+            "Verify user permissions",
+            "Check admin credentials",
+            "Review access logs"
+        ],
+        developerFix: false,
+        contactMessage: null
+    }
+};
+
+class AlertManager {
+    constructor() {
+        this.activeAlerts = new Map();
+        this.alertLogs = [];
+        this.maxLogEntries = 100;
+    }
+
+    async createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
+        try {
+            // Check if similar alert already exists (prevent duplicates)
+            const existingAlert = await this.findSimilarAlert(type, message);
+            if (existingAlert) {
+                // Update existing alert timestamp instead of creating duplicate
+                await db.collection("system_alerts").doc(existingAlert.id).update({
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    occurrenceCount: admin.firestore.FieldValue.increment(1)
+                });
+                return existingAlert.id;
+            }
+
+            const alertData = {
+                type,
+                level,
+                title,
+                message,
+                meta: meta || {},
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                active: true,
+                dismissed: false,
+                dismissedAt: null,
+                dismissedBy: null,
+                occurrenceCount: 1,
+                acknowledged: false,
+                fixInstructions: ALERT_FIX_INSTRUCTIONS[type] || null
+            };
+
+            if (expiresInMs) {
+                alertData.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
+            }
+
+            const docRef = await db.collection("system_alerts").add(alertData);
+
+            // Cache the alert
+            this.activeAlerts.set(docRef.id, { ...alertData, id: docRef.id });
+
+            console.log(`[ALERT] Created: ${type} - ${title}`);
+            return docRef.id;
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to create alert:", e);
+            return null;
         }
+    }
 
-        await db.collection("system_alerts").add(alert);
-    } catch (e) {
-        console.error("ALERT ERROR:", e);
+    async findSimilarAlert(type, message) {
+        try {
+            const fiveMinutesAgo = admin.firestore.Timestamp.fromMillis(Date.now() - 5 * 60 * 1000);
+            const snapshot = await db.collection("system_alerts")
+                .where("type", "==", type)
+                .where("active", "==", true)
+                .where("createdAt", ">", fiveMinutesAgo)
+                .limit(1)
+                .get();
+
+            if (!snapshot.empty) {
+                return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+            }
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async dismissAlert(alertId, adminId = 'system') {
+        try {
+            const alertRef = db.collection("system_alerts").doc(alertId);
+            const alertDoc = await alertRef.get();
+
+            if (!alertDoc.exists) {
+                return { success: false, error: 'Alert not found' };
+            }
+
+            const alertData = alertDoc.data();
+
+            // Move to alert logs
+            const logEntry = {
+                ...alertData,
+                originalAlertId: alertId,
+                dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+                dismissedBy: adminId,
+                loggedAt: admin.firestore.FieldValue.serverTimestamp()
+            };
+
+            await db.collection("alert_logs").add(logEntry);
+
+            // Mark as dismissed (but keep for tracking)
+            await alertRef.update({
+                active: false,
+                dismissed: true,
+                dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+                dismissedBy: adminId
+            });
+
+            // Remove from cache
+            this.activeAlerts.delete(alertId);
+
+            console.log(`[ALERT] Dismissed: ${alertId} by ${adminId}`);
+            return { success: true };
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to dismiss alert:", e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    async acknowledgeAlert(alertId) {
+        try {
+            await db.collection("system_alerts").doc(alertId).update({
+                acknowledged: true,
+                acknowledgedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return { success: true };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+
+    async clearResolvedAlerts(type) {
+        // Clear alerts of a specific type when the issue is resolved
+        try {
+            const snapshot = await db.collection("system_alerts")
+                .where("type", "==", type)
+                .where("active", "==", true)
+                .get();
+
+            const batch = db.batch();
+            snapshot.docs.forEach(doc => {
+                batch.update(doc.ref, {
+                    active: false,
+                    resolved: true,
+                    resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    resolutionType: 'auto'
+                });
+            });
+
+            if (snapshot.size > 0) {
+                await batch.commit();
+                console.log(`[ALERT] Cleared ${snapshot.size} resolved alerts of type: ${type}`);
+            }
+
+            return { success: true, cleared: snapshot.size };
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to clear resolved alerts:", e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    async getActiveAlerts() {
+        try {
+            const now = admin.firestore.Timestamp.now();
+            const snapshot = await db.collection("system_alerts")
+                .where("active", "==", true)
+                .orderBy("createdAt", "desc")
+                .get();
+
+            const alerts = [];
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                // Check if alert has expired
+                if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
+                    // Auto-expire this alert
+                    this.expireAlert(doc.id);
+                    return;
+                }
+                alerts.push({ id: doc.id, ...data });
+            });
+
+            return alerts;
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to get active alerts:", e);
+            return [];
+        }
+    }
+
+    async getAlertLogs(limit = 50) {
+        try {
+            const snapshot = await db.collection("alert_logs")
+                .orderBy("loggedAt", "desc")
+                .limit(limit)
+                .get();
+
+            return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to get alert logs:", e);
+            return [];
+        }
+    }
+
+    async expireAlert(alertId) {
+        try {
+            await db.collection("system_alerts").doc(alertId).update({
+                active: false,
+                expired: true,
+                expiredAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            this.activeAlerts.delete(alertId);
+        } catch (e) {
+            console.error("[ALERT ERROR] Failed to expire alert:", e);
+        }
+    }
+
+    async hasUnacknowledgedIgnoredAlerts() {
+        // Check if there are alerts that were dismissed but not fixed
+        try {
+            const snapshot = await db.collection("alert_logs")
+                .where("fixInstructions.developerFix", "==", true)
+                .where("fixInstructions.contacted", "!=", true)
+                .limit(1)
+                .get();
+
+            return !snapshot.empty;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Comprehensive error detection methods
+    async detectCandidatesStatus() {
+        try {
+            const candidatesSnap = await db.collection("candidates").get();
+            let totalCandidates = 0;
+            candidatesSnap.forEach(doc => {
+                const opts = doc.data().options || [];
+                totalCandidates += opts.length;
+            });
+
+            if (totalCandidates === 0) {
+                await this.createAlert(
+                    'candidates_empty',
+                    'critical',
+                    'No Candidates Found',
+                    'The candidates database is empty. Voting cannot proceed.',
+                    { totalCandidates },
+                    null
+                );
+            }
+
+            // Check if candidates need publishing
+            const staticDoc = await db.collection("app_config").doc("candidates_static").get();
+            if (staticDoc.exists) {
+                const staticData = staticDoc.data();
+                const lastUpdated = staticData.lastUpdated;
+
+                // Check if source candidates were updated after last publish
+                let sourceUpdated = false;
+                candidatesSnap.forEach(doc => {
+                    const opts = doc.data().options || [];
+                    opts.forEach(c => {
+                        if (c.addedAt && lastUpdated) {
+                            const addedTime = c.addedAt.toMillis ? c.addedAt.toMillis() : new Date(c.addedAt).getTime();
+                            const publishTime = lastUpdated.toMillis ? lastUpdated.toMillis() : new Date(lastUpdated).getTime();
+                            if (addedTime > publishTime) {
+                                sourceUpdated = true;
+                            }
+                        }
+                    });
+                });
+
+                if (sourceUpdated) {
+                    await this.createAlert(
+                        'candidate_sync',
+                        'minor',
+                        'Candidates Update Needed',
+                        'New candidates have been added but not yet published to the voting system.',
+                        {},
+                        null
+                    );
+                } else {
+                    // Clear the sync needed alert if candidates are now synced
+                    await this.clearResolvedAlerts('candidate_sync');
+                }
+            }
+
+            return { success: true, totalCandidates };
+        } catch (e) {
+            console.error("[ALERT] Candidate detection error:", e);
+            await this.createAlert(
+                'database_error',
+                'critical',
+                'Database Error',
+                `Failed to check candidates status: ${e.message}`,
+                { error: e.message },
+                null
+            );
+            return { success: false, error: e.message };
+        }
+    }
+
+    async detectVoteIntegrity() {
+        try {
+            const chainInfo = await verifyHashChain();
+
+            if (!chainInfo.valid) {
+                await this.createAlert(
+                    'hash_chain',
+                    'critical',
+                    'Vote Integrity Compromised',
+                    `Hash chain verification failed. ${chainInfo.invalidCount} invalid vote(s) detected.`,
+                    chainInfo,
+                    null
+                );
+            } else {
+                // Clear hash chain alerts if now valid
+                await this.clearResolvedAlerts('hash_chain');
+            }
+
+            // Check for orphaned votes
+            const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
+            const votesSnap = await db.collection("votes").get();
+
+            const validReceipts = new Set();
+            votersSnap.forEach(doc => {
+                const v = doc.data();
+                if (v.receipt) validReceipts.add(v.receipt);
+            });
+
+            let orphanedCount = 0;
+            votesSnap.forEach(doc => {
+                const vote = doc.data();
+                if (!validReceipts.has(vote.receipt)) {
+                    orphanedCount++;
+                }
+            });
+
+            if (orphanedCount > 0) {
+                await this.createAlert(
+                    'invalid_votes',
+                    'major',
+                    'Invalid Votes Detected',
+                    `${orphanedCount} vote(s) found without matching voter records.`,
+                    { orphanedCount },
+                    null
+                );
+            } else {
+                await this.clearResolvedAlerts('invalid_votes');
+            }
+
+            return { success: true, chainValid: chainInfo.valid, orphanedCount };
+        } catch (e) {
+            console.error("[ALERT] Vote integrity detection error:", e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    async detectSystemHealth() {
+        try {
+            // Check Firebase connection
+            await db.collection("settings").doc("config").get();
+
+            // Check if environment variables are set
+            const requiredEnv = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'JWT_SECRET', 'ADMIN_KEY'];
+            const missingEnv = requiredEnv.filter(key => !process.env[key]);
+
+            if (missingEnv.length > 0) {
+                await this.createAlert(
+                    'env_error',
+                    'critical',
+                    'Environment Configuration Error',
+                    `Missing required environment variables: ${missingEnv.join(', ')}`,
+                    { missingEnv },
+                    null
+                );
+            }
+
+            return { success: true };
+        } catch (e) {
+            await this.createAlert(
+                'firebase_error',
+                'critical',
+                'Firebase Connection Failed',
+                `Unable to connect to Firebase: ${e.message}`,
+                { error: e.message },
+                null
+            );
+            return { success: false, error: e.message };
+        }
     }
 }
 
+const alertManager = new AlertManager();
+
+// Legacy function for backward compatibility
+async function createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
+    return alertManager.createAlert(type, level, title, message, meta, expiresInMs);
+}
+
+// Scheduled monitoring
 setInterval(async () => {
     if (activeUsers >= 500) {
-        await createAlert(
+        await alertManager.createAlert(
             "high_load",
             "major",
-            "⚠️ High Traffic",
-            `Concurrent users: ${activeUsers}`,
+            "High Traffic",
+            `Concurrent users: ${activeUsers}. Monitor server performance.`,
             { activeUsers },
             5 * 60 * 1000
         );
     }
 }, 10000);
+
+// Run comprehensive checks every 30 seconds
+setInterval(async () => {
+    await alertManager.detectCandidatesStatus();
+    await alertManager.detectVoteIntegrity();
+}, 30000);
+
+// Initial system health check
+setTimeout(async () => {
+    await alertManager.detectSystemHealth();
+    await alertManager.detectCandidatesStatus();
+    await alertManager.detectVoteIntegrity();
+}, 5000);
 
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
@@ -902,23 +1522,118 @@ app.use(async (req, res, next) => {
 // -- ALERTS
 app.get("/admin/alerts", async (req, res) => {
     try {
-        const snap = await db.collection("system_alerts")
-            .where("active", "==", true)
-            .get();
-
-        const alerts = [];
-
-        snap.forEach(doc => {
-            alerts.push({
-                id: doc.id,
-                ...doc.data()
-            });
-        });
-
+        const alerts = await alertManager.getActiveAlerts();
         res.json(alerts);
-
     } catch (e) {
+        console.error("[ALERT API] Failed to fetch alerts:", e);
         res.status(500).json({ error: "Failed to fetch alerts" });
+    }
+});
+
+app.post("/admin/alerts/:id/dismiss", async (req, res) => {
+    try {
+        const alertId = req.params.id;
+        const adminId = req.user?.uid || req.user?.email || 'unknown';
+        const result = await alertManager.dismissAlert(alertId, adminId);
+        if (result.success) {
+            res.json({ success: true, message: "Alert dismissed and logged" });
+        } else {
+            res.status(400).json({ error: result.error });
+        }
+    } catch (e) {
+        console.error("[ALERT API] Failed to dismiss alert:", e);
+        res.status(500).json({ error: "Failed to dismiss alert" });
+    }
+});
+
+app.post("/admin/alerts/:id/acknowledge", async (req, res) => {
+    try {
+        const alertId = req.params.id;
+        const result = await alertManager.acknowledgeAlert(alertId);
+        if (result.success) {
+            res.json({ success: true, message: "Alert acknowledged" });
+        } else {
+            res.status(400).json({ error: result.error });
+        }
+    } catch (e) {
+        console.error("[ALERT API] Failed to acknowledge alert:", e);
+        res.status(500).json({ error: "Failed to acknowledge alert" });
+    }
+});
+
+app.get("/admin/alerts/logs", async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        const logs = await alertManager.getAlertLogs(limit);
+        res.json(logs);
+    } catch (e) {
+        console.error("[ALERT API] Failed to fetch alert logs:", e);
+        res.status(500).json({ error: "Failed to fetch alert logs" });
+    }
+});
+
+app.get("/admin/alerts/status", async (req, res) => {
+    try {
+        const activeAlerts = await alertManager.getActiveAlerts();
+        const hasCritical = activeAlerts.some(a => a.level === 'critical');
+        const hasMajor = activeAlerts.some(a => a.level === 'major');
+        const hasUnacknowledged = activeAlerts.some(a => !a.acknowledged);
+
+        res.json({
+            totalActive: activeAlerts.length,
+            hasCritical,
+            hasMajor,
+            hasUnacknowledged,
+            alertsByLevel: {
+                critical: activeAlerts.filter(a => a.level === 'critical').length,
+                major: activeAlerts.filter(a => a.level === 'major').length,
+                minor: activeAlerts.filter(a => a.level === 'minor').length,
+                normal: activeAlerts.filter(a => a.level === 'normal').length
+            }
+        });
+    } catch (e) {
+        console.error("[ALERT API] Failed to fetch alert status:", e);
+        res.status(500).json({ error: "Failed to fetch alert status" });
+    }
+});
+
+// Client-side error reporting endpoint
+app.post("/client-error-report", async (req, res) => {
+    try {
+        const { type, message, stack, url, line, column, userAgent } = req.body;
+
+        // Determine alert level based on error type
+        let level = 'minor';
+        let alertType = 'script_error';
+
+        if (type === 'API_ERROR' || message?.includes('fetch') || message?.includes('network')) {
+            level = 'major';
+            alertType = 'client_api_error';
+        } else if (type === 'RENDER_ERROR' || message?.includes('render') || message?.includes('React')) {
+            level = 'major';
+            alertType = 'render_error';
+        }
+
+        await alertManager.createAlert(
+            alertType,
+            level,
+            `Client ${type || 'Error'}`,
+            message || 'Unknown client-side error',
+            {
+                stack: stack?.substring(0, 1000),
+                url,
+                line,
+                column,
+                userAgent: userAgent?.substring(0, 500),
+                ip: req.ip
+            },
+            60 * 60 * 1000 // 1 hour expiration
+        );
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error("[CLIENT ERROR REPORT] Failed to process:", e);
+        res.status(500).json({ error: "Failed to process error report" });
     }
 });
 
@@ -1757,7 +2472,7 @@ app.post("/admin/purge", async (req, res) => {
             "backup",
             "minor",
             "💾 Backup Created",
-            "Election backup saved. Ask the developer for the archive link of the previous election results.",
+            "Election backup saved. Click the archive link below to view all archived election results.",
             { url },
             24 * 60 * 60 * 1000
         );
