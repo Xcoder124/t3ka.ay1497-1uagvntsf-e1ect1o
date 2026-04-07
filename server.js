@@ -11,7 +11,7 @@ const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
 
-// --- ADD dotenv for local development ---
+// --- ADD dotenv for local developent ---
 if (process.env.NODE_ENV !== 'production') {
     require('dotenv').config();
 }
