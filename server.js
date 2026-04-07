@@ -644,12 +644,16 @@ function verifySubmitToken(token) {
 
 // --- AUTH MIDDLEWARE ---
 function verifyCSRF(req, res, next) {
-    const csrfCookie = req.cookies.csrfToken;
     const csrfHeader = req.headers["x-csrf-token"] || req.headers["X-CSRF-Token"];
-    if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
-        logSecurityEvent("CSRF_FAILED", req, { cookie: !!csrfCookie, header: !!csrfHeader });
+
+    if (!csrfHeader) {
+        return res.status(403).json({ error: "Missing CSRF token" });
+    }
+
+    if (!req.user || csrfHeader !== req.user.csrfToken) {
         return res.status(403).json({ error: "Invalid CSRF token" });
     }
+
     next();
 }
 
@@ -1019,7 +1023,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         });
         await clearVoterBruteForce(hashedLVN);
         const sessionToken = jwt.sign(
-            { uid: hashedLVN, grade: d.grade, role: "voter", iat: Math.floor(Date.now() / 1000) },
+            { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, iat: Math.floor(Date.now() / 1000) },
             SECRET,
             { expiresIn: "60m" }
         );
@@ -1031,19 +1035,13 @@ app.post("/verify", loginLimiter, async (req, res) => {
             maxAge: 60 * 60 * 1000
         });
         const csrfToken = crypto.randomBytes(32).toString('hex');
-        res.cookie("csrfToken", csrfToken, {
-            httpOnly: false,
-            secure: true,
-            sameSite: "strict",
-            path: "/"
-        });
         return res.json({ success: true, name: d.name, grade: d.grade, token: sessionToken, csrfToken });
     } catch (e) {
         return res.status(500).json({ error: "Server error during verification." });
     }
 });
 
-app.post("/vote", voteLimiter, verifyCSRF, requireAuth, requireRole("voter"), async (req, res) => {
+app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
     const hashedLVN = req.user.uid;
     const grade = req.user.grade;
     const { selections } = req.body;
