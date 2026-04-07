@@ -952,8 +952,8 @@ app.post("/verify", loginLimiter, async (req, res) => {
         if (deviceSnap.exists) {
             const usedLvns = deviceSnap.data().lvns || [];
             if (!usedLvns.includes(hashedLVN)) {
-                if (usedLvns.length >= 3) { 
-                    return res.status(403).json({ error: "Device Limit Reached: Maximum 3 voters allowed per device." });
+                if (usedLvns.length >= 10) { 
+                    return res.status(403).json({ error: "Device Limit Reached: Maximum 10 voters allowed per device." });
                 }
             }
         }
@@ -1262,6 +1262,7 @@ app.get("/admin/voters", async (req, res) => {
                 lvn: v.lvn || "***",
                 name: v.name,
                 grade: v.grade,
+                code: v.code,
                 section: v.section,
                 hasVoted: v.hasVoted,
                 isMissed: v.isMissed,
