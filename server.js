@@ -1026,7 +1026,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         res.cookie("__session", sessionToken, {
             httpOnly: true,
             secure: true,
-            sameSite: "strict",
+            sameSite: "none",
             path: "/",
             maxAge: 60 * 60 * 1000
         });
