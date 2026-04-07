@@ -1059,14 +1059,14 @@ app.use(cookieParser());
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
 // Single helmet() call with all security headers
 app.use(helmet({
-    referrerPolicy: { policy: 'no-referrer' },
-    crossOriginOpenerPolicy: { policy: 'same-origin' },
-    hsts: {
-        maxAge: 31536000,
-        includeSubDomains: true,
-        preload: true
+    contentSecurityPolicy: {
+        directives: {
+            ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+            "script-src": ["'self'", "'unsafe-inline'", "https://challenges.cloudflare.com"],
+            "frame-src": ["'self'", "https://challenges.cloudflare.com"],
+        },
     },
-    contentSecurityPolicy: false // Disable default CSP, we'll set it manually below
+    crossOriginEmbedderPolicy: false, // Allows the Turnstile iframe to load properly
 }));
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
