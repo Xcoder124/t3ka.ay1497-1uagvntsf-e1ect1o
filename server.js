@@ -943,6 +943,12 @@ setTimeout(async () => {
     await alertManager.detectVoteIntegrity();
 }, 5000);
 
+app.get("/test-load", async (req, res) => {
+    setTimeout(() => {
+        res.json({ ok: true });
+    }, 100000); // 10 seconds delay
+});
+
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) {
