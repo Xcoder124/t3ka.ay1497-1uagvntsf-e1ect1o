@@ -108,8 +108,12 @@ async function uploadToGitHub(json, hash) {
                 }
             }
         );
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
+        await alertManager.detectSystemHealth();
 
         return res.data.content.html_url;
+
 
     } catch (e) {
         console.error("GITHUB UPLOAD ERROR:", e.response?.data || e.message);
@@ -550,13 +554,27 @@ class AlertManager {
             const alerts = [];
             snapshot.forEach(doc => {
                 const data = doc.data();
-                // Check if alert has expired
+
                 if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
-                    // Auto-expire this alert
                     this.expireAlert(doc.id);
                     return;
                 }
+
                 alerts.push({ id: doc.id, ...data });
+            });
+
+            const priority = {
+                critical: 4,
+                major: 3,
+                minor: 2,
+                normal: 1
+            };
+
+            alerts.sort((a, b) => {
+                if (priority[b.level] !== priority[a.level]) {
+                    return priority[b.level] - priority[a.level];
+                }
+                return (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0);
             });
 
             return alerts;
@@ -637,15 +655,33 @@ class AlertManager {
 
                 // Check if source candidates were updated after last publish
                 let sourceUpdated = false;
+
                 candidatesSnap.forEach(doc => {
                     const opts = doc.data().options || [];
+
                     opts.forEach(c => {
-                        if (c.addedAt && lastUpdated) {
-                            const addedTime = c.addedAt.toMillis ? c.addedAt.toMillis() : new Date(c.addedAt).getTime();
-                            const publishTime = lastUpdated.toMillis ? lastUpdated.toMillis() : new Date(lastUpdated).getTime();
+                        // 🔥 If never published
+                        if (!lastUpdated) {
+                            sourceUpdated = true;
+                            return;
+                        }
+
+                        // 🔥 If candidate has timestamp
+                        if (c.addedAt) {
+                            const addedTime = c.addedAt.toMillis
+                                ? c.addedAt.toMillis()
+                                : new Date(c.addedAt).getTime();
+
+                            const publishTime = lastUpdated.toMillis
+                                ? lastUpdated.toMillis()
+                                : new Date(lastUpdated).getTime();
+
                             if (addedTime > publishTime) {
                                 sourceUpdated = true;
                             }
+                        } else {
+                            // 🔥 fallback: no timestamp = assume update needed
+                            sourceUpdated = true;
                         }
                     });
                 });
@@ -665,6 +701,8 @@ class AlertManager {
                 }
             }
 
+            console.log("Running candidate detection...");
+
             return { success: true, totalCandidates };
         } catch (e) {
             console.error("[ALERT] Candidate detection error:", e);
@@ -681,6 +719,18 @@ class AlertManager {
     }
 
     async detectVoteIntegrity() {
+        const votesSnap = await db.collection("votes").get();
+
+        if (votesSnap.size === 0) {
+            await this.createAlert(
+                'vote_integrity',
+                'major',
+                'No Votes Found',
+                'No votes recorded in the system.',
+                {},
+                null
+            );
+        }
         try {
             const chainInfo = await verifyHashChain();
 
@@ -693,14 +743,13 @@ class AlertManager {
                     chainInfo,
                     null
                 );
+
             } else {
-                // Clear hash chain alerts if now valid
                 await this.clearResolvedAlerts('hash_chain');
             }
 
             // Check for orphaned votes
             const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
-            const votesSnap = await db.collection("votes").get();
 
             const validReceipts = new Set();
             votersSnap.forEach(doc => {
@@ -709,9 +758,11 @@ class AlertManager {
             });
 
             let orphanedCount = 0;
+
             votesSnap.forEach(doc => {
                 const vote = doc.data();
-                if (!validReceipts.has(vote.receipt)) {
+
+                if (!vote.receipt || !validReceipts.has(vote.receipt)) {
                     orphanedCount++;
                 }
             });
@@ -721,7 +772,7 @@ class AlertManager {
                     'invalid_votes',
                     'major',
                     'Invalid Votes Detected',
-                    `${orphanedCount} vote(s) found without matching voter records.`,
+                    `${orphanedCount} vote(s) without valid voter.`,
                     { orphanedCount },
                     null
                 );
@@ -729,6 +780,23 @@ class AlertManager {
                 await this.clearResolvedAlerts('invalid_votes');
             }
 
+            if (votesSnap.size > votersSnap.size) {
+                await this.createAlert(
+                    'vote_integrity',
+                    'critical',
+                    'Vote Count Mismatch',
+                    'Votes exceed number of voters. Consider re-tallying the election results.',
+                    {
+                        votes: votesSnap.size,
+                        voters: votersSnap.size
+                    },
+                    null
+                );
+            }
+            else {
+                await this.clearResolvedAlerts('vote_integrity');
+            }
+            console.log("Running chain detection...");
             return { success: true, chainValid: chainInfo.valid, orphanedCount };
         } catch (e) {
             console.error("[ALERT] Vote integrity detection error:", e);
@@ -738,23 +806,60 @@ class AlertManager {
 
     async detectSystemHealth() {
         try {
-            // Check Firebase connection
+            const start = Date.now();
             await db.collection("settings").doc("config").get();
+            const latency = Date.now() - start;
 
-            // Check if environment variables are set
-            const requiredEnv = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'JWT_SECRET', 'ADMIN_KEY'];
+            if (latency > 1000) {
+                await this.createAlert(
+                    'api_error',
+                    'major',
+                    'Slow Database Response',
+                    `Database response time is ${latency}ms... This might be a cause of too much requests due to large amount of students accessing the site at the same time.`,
+                    { latency },
+                    10 * 60 * 1000
+                );
+            } else {
+                await this.clearResolvedAlerts('api_error');
+            }
+
+            const testSnap = await db.collection("candidates").limit(1).get();
+
+            if (testSnap.empty) {
+                await this.createAlert(
+                    'database_error',
+                    'critical',
+                    'Database Read Failure',
+                    'Unable to read from candidates collection. Contact the developer to fix this issue.',
+                    {},
+                    null
+                );
+            }
+
+            const requiredEnv = [
+                'FIREBASE_PROJECT_ID',
+                'FIREBASE_CLIENT_EMAIL',
+                'FIREBASE_PRIVATE_KEY',
+                'JWT_SECRET',
+                'ADMIN_KEY'
+            ];
+
             const missingEnv = requiredEnv.filter(key => !process.env[key]);
-
             if (missingEnv.length > 0) {
                 await this.createAlert(
                     'env_error',
                     'critical',
                     'Environment Configuration Error',
-                    `Missing required environment variables: ${missingEnv.join(', ')}`,
+                    `Missing: ${missingEnv.join(', ')} contact the developer for re-check of environment rules.`,
                     { missingEnv },
                     null
                 );
+            } else {
+                await this.clearResolvedAlerts('env_error');
             }
+
+            await this.clearResolvedAlerts('firebase_error');
+            await this.clearResolvedAlerts('database_error');
 
             return { success: true };
         } catch (e) {
@@ -1076,14 +1181,14 @@ app.use((req, res, next) => {
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com",  "https://challenges.cloudflare.com"],
-            frameSrc: ["'self'", "https://challenges.cloudflare.com" ],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com"],
+            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
             connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
             imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
             frameAncestors: ["'none'"],
-            
+
         },
     })(req, res, next);
 });
@@ -1551,6 +1656,19 @@ app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => 
         console.error("[ALERT API] Failed to fetch alerts:", e);
         res.status(500).json({ error: "Failed to fetch alerts" });
     }
+});
+
+app.get("/admin/test-alert", async (req, res) => {
+    await alertManager.createAlert(
+        'api_error',
+        'major',
+        'Test Alert',
+        'If you see this, alerts are working.',
+        {},
+        null
+    );
+
+    res.json({ ok: true });
 });
 
 app.post("/admin/alerts/:id/dismiss", requireAuth, requireRole("admin"), async (req, res) => {
@@ -2128,6 +2246,10 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                     validSelections[position].push(candidateId);
                 }
 
+                await alertManager.detectCandidatesStatus();
+                await alertManager.detectVoteIntegrity();
+                await alertManager.detectSystemHealth();
+
             } else {
                 const key = normalizeName(userSelection);
                 const candidateId = candidateMap[position][key];
@@ -2451,6 +2573,8 @@ app.post("/admin/voters/delete", async (req, res) => {
         await voterRef.delete();
         await logAdminAction(req, "VOTER_DELETE", { lvn: "***" });
         await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "hard" });
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Delete failed" });
@@ -2505,6 +2629,9 @@ app.post("/admin/settings/session", async (req, res) => {
             voterTime: voterTime !== undefined ? voterTime : null,
         });
         await logSuccessEvent("ADMIN_SET_SESSION", req, { isLive: typeof isLive === 'boolean' ? isLive : null, activeGrade: activeGrade !== undefined ? activeGrade : null });
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
+        await alertManager.detectSystemHealth();
         res.json({ success: true, isLive, activeGrade });
     } catch (e) {
         res.status(500).json({ error: "Failed to update election status" });
@@ -2531,18 +2658,33 @@ app.post("/admin/purge", async (req, res) => {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
-        await createAlert(
-            "backup",
-            "minor",
-            "💾 Backup Created",
-            "Election backup saved. Click the archive link below to view all archived election results.",
-            { url },
+
+        await alertManager.createAlert(
+            'backup',
+            'minor',
+            '💾 Archived Created',
+            'Election backup saved. Click the archive link below to view all archived election results.',
+            {},
             24 * 60 * 60 * 1000
         );
+
         if (!hash || !url) {
             throw new Error("Backup failed. Purge aborted.");
         }
+
         await purgeElectionData();
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
+        await alertManager.detectSystemHealth();
+
+        await alertManager.createAlert(
+            'database_error',
+            'major',
+            'Election Data Deleted',
+            'All election data has been cleared.',
+            {},
+            null
+        );
 
         await logSuccessEvent("ADMIN_PURGE_DATA", req, {
             success: true,
@@ -2575,6 +2717,9 @@ app.post("/admin/restore", async (req, res) => {
         const jsonData = JSON.stringify(response.data);
 
         const result = await restoreElectionFromBackup(jsonData);
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
+        await alertManager.detectSystemHealth();
 
         res.json({
             success: true,
@@ -2659,6 +2804,18 @@ app.post("/admin/publish/candidates", async (req, res) => {
             GlobalCache.timestamps.candidates = new Date().toISOString();
             await logAdminAction(req, "PUBLISH_CANDIDATES", { success: true });
             await logSuccessEvent("ADMIN_PUBLISH_CANDIDATES", req, { success: true });
+            await alertManager.createAlert(
+                'candidate_sync',
+                'minor',
+                'Candidates Published',
+                'Candidates successfully synced.',
+                {},
+                10 * 60 * 1000
+            );
+
+            await alertManager.detectCandidatesStatus();
+            await alertManager.detectVoteIntegrity();
+            await alertManager.detectSystemHealth();
             res.json({ success: true, message: "Candidates published successfully." });
         } else {
             throw new Error("No data returned from source collections.");
@@ -2764,6 +2921,8 @@ app.post("/admin/add-party", async (req, res) => {
             {},
             24 * 60 * 60 * 1000
         );
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -2789,6 +2948,8 @@ app.post("/admin/delete", async (req, res) => {
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_PARTY", { partyName });
             await logSuccessEvent("ADMIN_DELETE_PARTY", req, { partyName });
+            await alertManager.detectCandidatesStatus();
+            await alertManager.detectVoteIntegrity();
             return res.json({ success: true });
         }
         if (position && candidateId) {
@@ -2805,6 +2966,9 @@ app.post("/admin/delete", async (req, res) => {
             await logSuccessEvent("ADMIN_DELETE_CANDIDATE", req, { position, candidateId });
             return res.json({ success: true });
         }
+        await alertManager.detectCandidatesStatus();
+        await alertManager.detectVoteIntegrity();
+        await alertManager.detectSystemHealth();
         res.status(400).json({ error: "Bad Params" });
     } catch (e) {
         res.status(500).json({ error: e.message });
