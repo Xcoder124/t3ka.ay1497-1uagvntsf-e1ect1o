@@ -181,6 +181,7 @@ const ALERT_TYPES = {
     API_ERROR: { type: 'api_error', level: 'major', autoExpire: 30 * 60 * 1000 },
     DATABASE_ERROR: { type: 'database_error', level: 'critical', autoExpire: null },
     FIREBASE_ERROR: { type: 'firebase_error', level: 'critical', autoExpire: null },
+    ELECTION_DATA_DELETED: { type: 'election_deleted', level: 'major', autoExpire: null },
 
     // Frontend/Script errors (reported from client)
     SCRIPT_ERROR: { type: 'script_error', level: 'major', autoExpire: 60 * 60 * 1000 },
@@ -344,12 +345,13 @@ const ALERT_FIX_INSTRUCTIONS = {
     },
     high_load: {
         fixSteps: [
-            "Monitor server performance",
-            "Consider enabling rate limiting",
-            "Scale resources if necessary"
+            "Monitor active users in real-time",
+            "If users exceed 300, prepare queue system",
+            "Activate Queue System to control traffic"
         ],
         developerFix: false,
-        contactMessage: null
+        contactMessage: null,
+        action: "activate_queue"
     },
     backup: {
         fixSteps: [
@@ -384,6 +386,15 @@ const ALERT_FIX_INSTRUCTIONS = {
         ],
         developerFix: false,
         contactMessage: null
+    },
+    election_deleted: {
+        fixSteps: [
+            "Access the backup archive using the provided link",
+            "Navigate to System Log panel",
+            "Enter restore command: /restore {archive_link}"
+        ],
+        developerFix: false,
+        contactMessage: null
     }
 };
 
@@ -397,14 +408,21 @@ class AlertManager {
     async createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
         try {
             // Check if similar alert already exists (prevent duplicates)
-            const existingAlert = await this.findSimilarAlert(type, message);
-            if (existingAlert) {
-                // Update existing alert timestamp instead of creating duplicate
-                await db.collection("system_alerts").doc(existingAlert.id).update({
+            const existingSnapshot = await db.collection("system_alerts")
+                .where("type", "==", type)
+                .where("active", "==", true)
+                .limit(1)
+                .get();
+
+            if (!existingSnapshot.empty) {
+                const existingDoc = existingSnapshot.docs[0];
+
+                await existingDoc.ref.update({
                     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                     occurrenceCount: admin.firestore.FieldValue.increment(1)
                 });
-                return existingAlert.id;
+
+                return existingDoc.id;
             }
 
             const alertData = {
@@ -885,16 +903,31 @@ async function createAlert(type, level, title, message, meta = {}, expiresInMs =
 
 // Scheduled monitoring
 setInterval(async () => {
-    if (activeUsers >= 500) {
+    if (activeUsers >= 2) { // TESTING
         await alertManager.createAlert(
             "high_load",
-            "major",
-            "High Traffic",
-            `Concurrent users: ${activeUsers}. Monitor server performance.`,
+            "critical",
+            "Voting Session Critical Load",
+            `Total of ${activeUsers} students are currently voting. System is under heavy stress and may slow down.`,
             { activeUsers },
             5 * 60 * 1000
         );
     }
+    else if (activeUsers >= 1) {
+        await alertManager.createAlert(
+            'high_load',
+            'major',
+            'Voting Session High Traffic',
+            `Total of ${activeUsers} students are on voting session. Exceeding 500 may affect connectivity. Consider activating Queue System.`,
+            { activeUsers },
+            5 * 60 * 1000
+        );
+    }
+
+    else {
+        await alertManager.clearResolvedAlerts('high_load');
+    }
+
 }, 10000);
 
 // Run comprehensive checks every 30 seconds
@@ -2678,7 +2711,7 @@ app.post("/admin/purge", async (req, res) => {
         await alertManager.detectSystemHealth();
 
         await alertManager.createAlert(
-            'database_error',
+            'election_deleted',
             'major',
             'Election Data Deleted',
             'All election data has been cleared.',
