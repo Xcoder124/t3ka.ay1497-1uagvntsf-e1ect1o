@@ -2170,7 +2170,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
     const hashedLVN = req.user.uid;
     const grade = req.user.grade;
-    const { selections } = req.body;
+    const selections = req.body.selections;
 
     if (!selections || typeof selections !== 'object') {
         return res.status(400).json({ error: "Invalid ballot format." });
