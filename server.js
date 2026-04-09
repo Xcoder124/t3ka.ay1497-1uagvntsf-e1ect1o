@@ -403,26 +403,23 @@ class AlertManager {
         this.activeAlerts = new Map();
         this.alertLogs = [];
         this.maxLogEntries = 100;
+        this.activeTypes = new Set();
+        this.lastCandidateCheck = 0;
     }
 
     async createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
+        if (!this.lastAlertTime) this.lastAlertTime = {};
+
+        const now = Date.now();
+        if (this.lastAlertTime[type] && now - this.lastAlertTime[type] < 10000) {
+            return null;
+        }
+        this.lastAlertTime[type] = now;
         try {
             // Check if similar alert already exists (prevent duplicates)
-            const existingSnapshot = await db.collection("system_alerts")
-                .where("type", "==", type)
-                .where("active", "==", true)
-                .limit(1)
-                .get();
-
-            if (!existingSnapshot.empty) {
-                const existingDoc = existingSnapshot.docs[0];
-
-                await existingDoc.ref.update({
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    occurrenceCount: admin.firestore.FieldValue.increment(1)
-                });
-
-                return existingDoc.id;
+            const alertRef = db.collection("system_alerts").doc(type);
+            if (this.activeTypes.has(type)) {
+                return null;
             }
 
             const alertData = {
@@ -446,7 +443,9 @@ class AlertManager {
                 alertData.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
             }
 
-            const docRef = await db.collection("system_alerts").add(alertData);
+            await alertRef.set(alertData);
+            this.activeTypes.add(type);
+            const docRef = alertRef;
 
             // Cache the alert
             this.activeAlerts.set(docRef.id, { ...alertData, id: docRef.id });
@@ -551,6 +550,7 @@ class AlertManager {
 
             if (snapshot.size > 0) {
                 await batch.commit();
+                this.activeTypes.delete(type);
                 console.log(`[ALERT] Cleared ${snapshot.size} resolved alerts of type: ${type}`);
             }
 
@@ -570,6 +570,9 @@ class AlertManager {
                 .get();
 
             const alerts = [];
+            if (alerts.length > 20) {
+                return alerts.slice(0, 20);
+            }
             snapshot.forEach(doc => {
                 const data = doc.data();
 
@@ -646,6 +649,10 @@ class AlertManager {
 
     // Comprehensive error detection methods
     async detectCandidatesStatus() {
+        if (this.lastCandidateCheck && Date.now() - this.lastCandidateCheck < 60000) {
+            return;
+        }
+        this.lastCandidateCheck = Date.now();
         try {
             const candidatesSnap = await db.collection("candidates").get();
             let totalCandidates = 0;
@@ -705,14 +712,18 @@ class AlertManager {
                 });
 
                 if (sourceUpdated) {
-                    await this.createAlert(
-                        'candidate_sync',
-                        'minor',
-                        'Candidates Update Needed',
-                        'New candidates have been added but not yet published to the voting system.',
-                        {},
-                        null
-                    );
+                    const existing = await db.collection("system_alerts").doc("candidate_sync").get();
+
+                    if (!existing.exists || !existing.data().active) {
+                        await this.createAlert(
+                            'candidate_sync',
+                            'minor',
+                            'Candidates Update Needed',
+                            'New candidates have been added but not yet published to the voting system.',
+                            {},
+                            null
+                        );
+                    }
                 } else {
                     // Clear the sync needed alert if candidates are now synced
                     await this.clearResolvedAlerts('candidate_sync');
@@ -928,13 +939,13 @@ setInterval(async () => {
         await alertManager.clearResolvedAlerts('high_load');
     }
 
-}, 10000);
+}, 30000);
 
 // Run comprehensive checks every 30 seconds
 setInterval(async () => {
     await alertManager.detectCandidatesStatus();
     await alertManager.detectVoteIntegrity();
-}, 30000);
+}, 120000);
 
 // Initial system health check
 setTimeout(async () => {
@@ -943,10 +954,9 @@ setTimeout(async () => {
     await alertManager.detectVoteIntegrity();
 }, 5000);
 
-app.get("/test-load", async (req, res) => {
-    setTimeout(() => {
-        res.json({ ok: true });
-    }, 100000); // 10 seconds delay
+app.get("/debug/set-users/:num", (req, res) => {
+    activeUsers = parseInt(req.params.num) || 0;
+    res.json({ activeUsers });
 });
 
 // --- SECURITY: JWT SECRET ---
@@ -1872,13 +1882,12 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "1h" });
 
-    // 🔥 SET COOKIE ONLY AFTER EVERYTHING PASSED
     res.cookie("__session", token, {
         httpOnly: true,
         secure: true,
         sameSite: "none",
         path: "/",
-        maxAge: 60 * 60 * 1000
+        maxAge: 2 * 60 * 60 * 1000
     });
 
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
