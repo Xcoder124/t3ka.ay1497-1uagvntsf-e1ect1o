@@ -1207,7 +1207,7 @@ function requireMobile(req, res, next) {
 
 // --- MIDDLEWARE & APP CONFIG ---
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '110kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
