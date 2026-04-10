@@ -81,51 +81,66 @@ async function validateSelections(selections) {
         const position = doc.id;
         const options = doc.data().options || [];
 
-        if (selections[position]) {
-            const selected = selections[position];
+        if (!selections[position]) return;
 
-            if (Array.isArray(selected)) {
-                if (!MULTI_POSITIONS.includes(position)) {
-                    throw new Error(`Multiple selections not allowed for ${position}`);
-                }
+        const selected = selections[position];
 
-                if (selected.length > options.length) {
-                    throw new Error(`Too many selections for ${position}`);
-                }
-            }
+        const selectedArray = (Array.isArray(selected) ? selected : [selected])
+            .map(s => String(s).trim());
 
-            if (Array.isArray(selected)) {
-                const validIds = [];
-
-                for (const sel of selected) {
-                    const match = options.find(c => c.hash === sel);
-
-                    if (!match) {
-                        throw new Error(`Invalid candidate for ${position}`);
-                    }
-
-                    if (!match.hash) {
-                        throw new Error(`Candidate missing hash for ${position}`);
-                    }
-
-                    validIds.push(match.hash);
-                }
-
-                validated[position] = validIds;
-
-            } else {
-                const match = options.find(c => c.hash === selected);
-
-                if (!match) {
-                    throw new Error(`Invalid candidate for ${position}`);
-                }
-
-                validated[position] = match.hash;
-            }
+        // ❗ Prevent multiple selections on single-select positions
+        if (!MULTI_POSITIONS.includes(position) && selectedArray.length > 1) {
+            throw new Error(`Multiple selections not allowed for ${position}`);
         }
+
+        // ❗ Prevent over-selection
+        if (selectedArray.length > options.length) {
+            throw new Error(`Too many selections for ${position}`);
+        }
+
+        // ❗ Prevent duplicates
+        if (new Set(selectedArray).size !== selectedArray.length) {
+            throw new Error(`Duplicate selections for ${position}`);
+        }
+
+        const resolved = selectedArray.map(sel => {
+
+            // 🔐 FIXED: validate HERE
+            if (!/^[a-f0-9]{64}$/.test(sel)) {
+                throw new Error(`Tampered selection detected for ${position}`);
+            }
+
+            const match = options.find(c => {
+                if (!c.id) {
+                    console.error("Missing candidate ID:", c);
+                    return false;
+                }
+                return hashCandidateId(c.id) === sel;
+            });
+
+            if (!match) {
+                throw new Error(`Invalid candidate for ${position}`);
+            }
+
+            return match.id;
+        });
+
+        validated[position] = MULTI_POSITIONS.includes(position)
+            ? resolved
+            : resolved[0];
     });
 
-    return validated; // ✅ MOVED OUTSIDE LOOP
+    return validated;
+}
+
+function hashCandidateId(id) {
+    if (!process.env.CANDIDATE_SECRET) {
+        throw new Error("A Candidate Secret is missing.");
+    }
+
+    return crypto.createHmac("sha256", process.env.CANDIDATE_SECRET)
+        .update(id)
+        .digest("hex");
 }
 
 function generateVoteSignature(selections, timestamp, nonce) {
@@ -2077,8 +2092,8 @@ app.get("/candidates", async (req, res) => {
                 options: options.map(c => ({
                     name: c.name,
                     party: c.party,
-                    image: c.image,
-                    hash: c.hash
+                    image: c.img,
+                    hash: hashCandidateId(c.id)
                 }))
             });
         });
