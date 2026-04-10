@@ -15,11 +15,6 @@ if (!VOTE_SIGN_SECRET) {
     throw new Error("VOTE_SIGN_SECRET is required");
 }
 
-function hashCandidateId(id) {
-    return crypto.createHmac("sha256", CANDIDATE_SECRET)
-        .update(id)
-        .digest("hex");
-}
 const axios = require("axios");
 const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
@@ -87,19 +82,50 @@ async function validateSelections(selections) {
         const options = doc.data().options || [];
 
         if (selections[position]) {
-            const match = options.find(c =>
-                hashCandidateId(c.id) === selections[position]
-            );
+            const selected = selections[position];
 
-            if (!match) {
-                throw new Error(`Invalid candidate for ${position}`);
+            if (Array.isArray(selected)) {
+                if (!MULTI_POSITIONS.includes(position)) {
+                    throw new Error(`Multiple selections not allowed for ${position}`);
+                }
+
+                if (selected.length > options.length) {
+                    throw new Error(`Too many selections for ${position}`);
+                }
             }
 
-            validated[position] = match.id; // restore REAL ID
+            if (Array.isArray(selected)) {
+                const validIds = [];
+
+                for (const sel of selected) {
+                    const match = options.find(c => c.hash === sel);
+
+                    if (!match) {
+                        throw new Error(`Invalid candidate for ${position}`);
+                    }
+
+                    if (!match.hash) {
+                        throw new Error(`Candidate missing hash for ${position}`);
+                    }
+
+                    validIds.push(match.hash);
+                }
+
+                validated[position] = validIds;
+
+            } else {
+                const match = options.find(c => c.hash === selected);
+
+                if (!match) {
+                    throw new Error(`Invalid candidate for ${position}`);
+                }
+
+                validated[position] = match.hash;
+            }
         }
     });
 
-    return validated;
+    return validated; // ✅ MOVED OUTSIDE LOOP
 }
 
 function generateVoteSignature(selections, timestamp, nonce) {
@@ -774,7 +800,7 @@ class AlertManager {
                         }
                     });
                 });
-                
+
                 if (sourceUpdated) {
                     const existing = await db.collection("system_alerts").doc("candidate_sync").get();
 
@@ -1568,7 +1594,7 @@ async function refreshLocalResults() {
         for (const pos of Object.keys(GlobalCache.candidates)) {
             tallies[pos] = {};
             for (const c of (GlobalCache.candidates[pos] || [])) {
-                tallies[pos][String(c.id)] = { votes: 0, breakdown: {} };
+                tallies[pos][String(c.hash)] = { votes: 0, breakdown: {} };
             }
         }
         votesSnap.forEach((doc) => {
@@ -1594,7 +1620,7 @@ async function refreshLocalResults() {
         for (const pos of Object.keys(GlobalCache.candidates)) {
             const list = [];
             for (const c of (GlobalCache.candidates[pos] || [])) {
-                const cidStr = String(c.id);
+                const cidStr = String(c.hash);
                 const t = tallies[pos][cidStr] || { votes: 0, breakdown: {} };
                 list.push({ ...c, votes: t.votes, breakdown: t.breakdown });
             }
@@ -2052,7 +2078,7 @@ app.get("/candidates", async (req, res) => {
                     name: c.name,
                     party: c.party,
                     image: c.image,
-                    hash: hashCandidateId(c.id)
+                    hash: c.hash
                 }))
             });
         });
@@ -2887,7 +2913,7 @@ app.post("/admin/retally", async (req, res) => {
         candidatesSnap.forEach(doc => {
             const options = doc.data().options || [];
             options.forEach(c => {
-                newResults[String(c.id)] = { votes: 0 };
+                newResults[String(c.hash)] = { votes: 0 };
             });
         });
         let validVotesCount = 0;
@@ -2989,7 +3015,7 @@ app.post("/admin/add-party", async (req, res) => {
     const rawCandidates = req.body.candidates || [];
     const candidates = rawCandidates.map(c => ({
         position: sanitizeString(c.position || ''),
-        id: sanitizeString(c.id || ''),
+        id: sanitizeString(c.hash || ''),
         name: sanitizeString(c.name || ''),
         party: sanitizeString(c.party || ''),
         img: c.img || "none"
@@ -3012,7 +3038,7 @@ app.post("/admin/add-party", async (req, res) => {
                 list.forEach(c => {
                     const name = c && c.name ? String(c.name).toUpperCase().trim() : "";
                     const party = c && c.party ? String(c.party).toUpperCase().trim() : "";
-                    const id = c && c.id ? String(c.id) : "";
+                    const id = c && c.hash ? String(c.hash) : "";
                     if (name) globalNames.add(name);
                     if (party) partyCounts[posId][party] = (partyCounts[posId][party] || 0) + 1;
                     if (id) idByPosition[posId].add(id);
@@ -3020,9 +3046,9 @@ app.post("/admin/add-party", async (req, res) => {
             });
             const groupedData = {};
             for (const c of candidates) {
-                if (!c || !c.position || !c.id || !c.name) continue;
+                if (!c || !c.position || !c.hash || !c.name) continue;
                 const pos = String(c.position).trim();
-                const idStr = String(c.id).trim();
+                const idStr = String(c.hash).trim();
                 const nameUpper = String(c.name).toUpperCase().trim();
                 const partyUpper = String(c.party || "").toUpperCase().trim();
                 if (!ALL_POSITIONS.includes(pos)) throw new Error(`Invalid position '${pos}'.`);
@@ -3099,7 +3125,7 @@ app.post("/admin/delete", async (req, res) => {
                 const s = await t.get(docRef);
                 if (!s.exists) throw new Error("No doc");
                 const opts = s.data().options || [];
-                const newOpts = opts.filter(c => String(c.id) !== String(candidateId));
+                const newOpts = opts.filter(c => String(c.hash) !== String(candidateId));
                 t.update(docRef, { options: newOpts });
             });
             await refreshLocalCandidates();
