@@ -1609,7 +1609,7 @@ async function refreshLocalResults() {
         for (const pos of Object.keys(GlobalCache.candidates)) {
             tallies[pos] = {};
             for (const c of (GlobalCache.candidates[pos] || [])) {
-                tallies[pos][String(c.hash)] = { votes: 0, breakdown: {} };
+                tallies[pos][String(c.id)] = { votes: 0, breakdown: {} };
             }
         }
         votesSnap.forEach((doc) => {
@@ -1635,9 +1635,15 @@ async function refreshLocalResults() {
         for (const pos of Object.keys(GlobalCache.candidates)) {
             const list = [];
             for (const c of (GlobalCache.candidates[pos] || [])) {
-                const cidStr = String(c.hash);
+                const cidStr = String(c.id);
                 const t = tallies[pos][cidStr] || { votes: 0, breakdown: {} };
-                list.push({ ...c, votes: t.votes, breakdown: t.breakdown });
+                list.push({
+                    name: c.name,
+                    party: c.party,
+                    hash: c.hash,
+                    votes: t.votes,
+                    breakdown: t.breakdown
+                });
             }
             list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
             finalResults[pos] = list;
