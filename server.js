@@ -6,6 +6,20 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const crypto = require("crypto");
+const CANDIDATE_SECRET = process.env.CANDIDATE_SECRET;
+if (!process.env.CANDIDATE_SECRET) {
+    throw new Error("CANDIDATE_SECRET is required.");
+}
+const VOTE_SIGN_SECRET = process.env.VOTE_SIGN_SECRET;
+if (!VOTE_SIGN_SECRET) {
+    throw new Error("VOTE_SIGN_SECRET is required");
+}
+
+function hashCandidateId(id) {
+    return crypto.createHmac("sha256", CANDIDATE_SECRET)
+        .update(id)
+        .digest("hex");
+}
 const axios = require("axios");
 const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
@@ -63,6 +77,49 @@ app.use((req, res, next) => {
 
 const db = admin.firestore();
 
+// GLOBAL VARIABLES
+async function validateSelections(selections) {
+    const snapshot = await db.collection("candidates").get();
+    const validated = {};
+
+    snapshot.forEach(doc => {
+        const position = doc.id;
+        const options = doc.data().options || [];
+
+        if (selections[position]) {
+            const match = options.find(c =>
+                hashCandidateId(c.id) === selections[position]
+            );
+
+            if (!match) {
+                throw new Error(`Invalid candidate for ${position}`);
+            }
+
+            validated[position] = match.id; // restore REAL ID
+        }
+    });
+
+    return validated;
+}
+
+function generateVoteSignature(selections, timestamp, nonce) {
+    const payload = JSON.stringify({ selections, timestamp, nonce });
+    return crypto.createHmac("sha256", VOTE_SIGN_SECRET)
+        .update(payload)
+        .digest("hex");
+}
+
+async function isNonceUsed(nonce) {
+    const doc = await db.collection("used_nonces").doc(nonce).get();
+    return doc.exists;
+}
+
+async function markNonceUsed(nonce) {
+    await db.collection("used_nonces").doc(nonce).set({
+        usedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+}
+
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
 
@@ -80,7 +137,16 @@ async function createElectionBackup(db) {
         candidates: candidatesSnap.docs.map(d => d.data())
     };
 
-    const json = JSON.stringify(backup, null, 2);
+    const raw = JSON.stringify(backup, null, 2);
+
+    const key = crypto.createHash('sha256').update(process.env.BACKUP_SECRET).digest();
+    const iv = crypto.randomBytes(16);
+
+    const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+    let encrypted = cipher.update(raw, "utf8", "hex");
+    encrypted += cipher.final("hex");
+
+    const json = iv.toString("hex") + ":" + encrypted;
 
     const hash = crypto
         .createHash("sha256")
@@ -1787,6 +1853,47 @@ app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, r
     }
 });
 
+async function detectVotingAnomalies(req, voterId) {
+    try {
+        const recentVotes = await db.collection("votes")
+            .where("ip", "==", req.ip)
+            .where("createdAt", ">", admin.firestore.Timestamp.fromMillis(Date.now() - 60000))
+            .get();
+
+        // 🚨 Too many votes from same IP
+        if (recentVotes.size > 10) {
+            await createAlert(
+                "tamper",
+                "major",
+                "⚠️ Suspicious Voting Pattern",
+                "Multiple votes from same IP in short time. If the voting session was done in school, kindly dismiss this alert.",
+                { ip: req.ip, count: recentVotes.size }
+            );
+        }
+
+        const deviceId = req.headers["user-agent"] || "unknown";
+        const deviceVotes = await db.collection("votes")
+            .where("device", "==", deviceId)
+            .get();
+
+        const uniqueVoters = new Set();
+        deviceVotes.forEach(doc => uniqueVoters.add(doc.data().voterId));
+
+        if (uniqueVoters.size > 5) {
+            await createAlert(
+                "tamper",
+                "major",
+                "⚠️ Device Abuse Detected",
+                "Too many voters using same device",
+                { deviceId, voters: uniqueVoters.size }
+            );
+        }
+
+    } catch (e) {
+        console.error("Anomaly detection error:", e);
+    }
+}
+
 // Client-side error reporting endpoint
 app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, res) => {
     res.sendStatus(200);
@@ -1930,7 +2037,33 @@ function normalizeName(name) {
         .toUpperCase()
         .replace(/\s+/g, " ");
 }
-app.get("/candidates", (req, res) => res.json(GlobalCache.candidates));
+
+app.get("/candidates", async (req, res) => {
+    try {
+        const snapshot = await db.collection("candidates").get();
+
+        const safeCandidates = [];
+
+        snapshot.forEach(doc => {
+            const position = doc.id;
+            const options = doc.data().options || [];
+
+            safeCandidates.push({
+                position,
+                options: options.map(c => ({
+                    name: c.name,
+                    party: c.party,
+                    image: c.image,
+                    hash: hashCandidateId(c.id)
+                }))
+            });
+        });
+
+        res.json(safeCandidates);
+    } catch (e) {
+        res.status(500).json({ error: "Failed to load candidates" });
+    }
+});
 
 app.get("/dashboard", async (req, res) => {
     await refreshLocalResults();
@@ -2167,16 +2300,94 @@ app.post("/verify", loginLimiter, async (req, res) => {
     }
 });
 
+async function useNonce(nonce) {
+    const ref = db.collection("used_nonces").doc(nonce);
+
+    return db.runTransaction(async (tx) => {
+        const doc = await tx.get(ref);
+
+        if (doc.exists) {
+            return false;
+        }
+
+        tx.set(ref, {
+            usedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return true;
+    });
+}
+
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
-    const hashedLVN = req.user.uid;
-    const grade = req.user.grade;
-    const selections = req.body.selections;
-
-    if (!selections || typeof selections !== 'object') {
-        return res.status(400).json({ error: "Invalid ballot format." });
-    }
-
     try {
+        const hashedLVN = req.user.uid;
+        const grade = req.user.grade;
+
+        const { selections, timestamp, nonce } = req.body;
+
+        // ✅ BASIC VALIDATION
+        if (!selections || typeof selections !== "object") {
+            return res.status(400).json({ error: "Invalid ballot format." });
+        }
+
+        if (typeof timestamp !== "number") {
+            return res.status(400).json({ error: "Invalid timestamp" });
+        }
+
+        if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
+            return res.status(400).json({ error: "Invalid nonce" });
+        }
+
+        // ✅ TIMESTAMP CHECK (ANTI-REPLAY WINDOW)
+        const now = Date.now();
+        if (Math.abs(now - timestamp) > 60000) {
+            return res.status(400).json({ error: "Request expired" });
+        }
+
+        // ✅ REPLAY PROTECTION (ATOMIC NONCE)
+        const nonceRef = db.collection("used_nonces").doc(nonce);
+
+        const nonceUsed = await db.runTransaction(async (tx) => {
+            const doc = await tx.get(nonceRef);
+
+            if (doc.exists) return true;
+
+            tx.set(nonceRef, {
+                usedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return false;
+        });
+
+        if (nonceUsed) {
+            await createAlert(
+                "tamper",
+                "critical",
+                "🚨 Replay Attack Detected",
+                "Duplicate vote request detected.",
+                { nonce }
+            );
+
+            return res.status(400).json({ error: "Duplicate request detected" });
+        }
+
+        // ✅ VALIDATE SELECTIONS (HASH → REAL ID)
+        let validatedSelections;
+        try {
+            validatedSelections = await validateSelections(selections);
+        } catch (e) {
+            await createAlert(
+                "tamper",
+                "critical",
+                "🚨 Tampered Vote Detected",
+                e.message,
+                { selections }
+            );
+
+            return res.status(400).json({ error: e.message });
+        }
+
+        // ✅ CHECK ELECTION STATUS
         const settings = await db.collection("settings").doc("electionStatus").get();
 
         if (!settings.exists || !settings.data().isLive) {
@@ -2187,6 +2398,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Voting period ended." });
         }
 
+        // ✅ CHECK VOTER
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
 
@@ -2201,115 +2413,8 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Already voted." });
         }
 
-        // 🔥 Ensure candidates are loaded
-        if (Object.keys(GlobalCache.candidates).length === 0) {
-            await refreshLocalCandidates();
-        }
-
-        if (Object.keys(GlobalCache.candidates).length === 0) {
-            return res.status(500).json({
-                error: "Candidates not loaded. Please contact administrator."
-            });
-        }
-
-        // 🚨 OPTIONAL HARDENING: ensure no empty positions
-        for (const pos of Object.keys(GlobalCache.candidates)) {
-            if ((GlobalCache.candidates[pos] || []).length === 0) {
-                return res.status(500).json({
-                    error: `No candidates available for ${pos}. Voting cannot proceed.`
-                });
-            }
-        }
-
-        // 1. Map valid candidate IDs directly from the cache
-        const validCandidateIds = {};
-
-        for (const pos in GlobalCache.candidates) {
-            validCandidateIds[pos] = new Set();
-            for (const c of GlobalCache.candidates[pos]) {
-                validCandidateIds[pos].add(String(c.id));
-            }
-        }
-
-        const validSelections = {};
-        const { allowedRep, isAllowed } = buildAllowedPositionsForGrade(grade);
-        const allowedPositions = Object.keys(GlobalCache.candidates).filter(isAllowed);
-        const repLabel = allowedRep
-            ? `Grade ${String(allowedRep).replace('rep', '')} Representative`
-            : "no grade-level representatives";
-
-        // 2. Prevent voting on restricted reps
-        for (const repId of MULTI_POSITIONS) {
-            if (!allowedRep || repId !== allowedRep) {
-                if (Object.prototype.hasOwnProperty.call(selections, repId)) {
-                    return res.status(403).json({
-                        error: `Not allowed: Your grade can only vote for ${repLabel}.`
-                    });
-                }
-            }
-        }
-
-        // 3. Validate selections directly against IDs (Matching frontend payload)
-        for (const position of allowedPositions) {
-            let userSelection = selections[position];
-
-            if (!userSelection) {
-                return res.status(400).json({
-                    error: `Missing selection for ${position}.`
-                });
-            }
-
-            if (MULTI_POSITIONS.includes(position)) {
-                if (!Array.isArray(userSelection)) {
-                    userSelection = [userSelection];
-                }
-
-                const unique = new Set(userSelection);
-                if (unique.size !== userSelection.length) {
-                    return res.status(400).json({
-                        error: `${position}: Duplicate selections not allowed.`
-                    });
-                }
-
-                validSelections[position] = [];
-
-                for (const candId of userSelection) {
-                    const idStr = String(candId);
-
-                    if (!validCandidateIds[position].has(idStr)) {
-                        return res.status(400).json({
-                            error: `Invalid candidate for ${position}`
-                        });
-                    }
-
-                    validSelections[position].push(idStr);
-                }
-
-            } else {
-                const idStr = String(userSelection);
-
-                if (!validCandidateIds[position].has(idStr)) {
-                    return res.status(400).json({
-                        error: `Invalid candidate for ${position}`
-                    });
-                }
-
-                validSelections[position] = idStr;
-            }
-        }
-        
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
-
-        // 🔐 TRANSACTION (unchanged, already solid)
+        // ✅ HASH CHAIN + TRANSACTION
         const voteResult = await db.runTransaction(async (t) => {
-            const settingsRef = db.collection("settings").doc("electionStatus");
-            const settingsSnap = await t.get(settingsRef);
-
-            if (!settingsSnap.exists || !settingsSnap.data().isLive) {
-                throw new Error("PAUSED");
-            }
 
             const voterDoc = await t.get(voterRef);
 
@@ -2326,12 +2431,11 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 : latestVoteQuery.docs[0].data().hash;
 
             const randomSalt = crypto.randomBytes(32).toString('hex');
-            const timestampMs = Date.now();
 
             const payload = JSON.stringify({
                 voter_hash: hashedLVN,
-                selected_candidates: validSelections,
-                timestamp: timestampMs
+                selections: validatedSelections,
+                timestamp: Date.now()
             });
 
             const receipt = crypto.createHash("sha256")
@@ -2345,7 +2449,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             const voteRef = db.collection("votes").doc();
 
             t.set(voteRef, {
-                selections: validSelections,
+                selections: validatedSelections,
                 grade: String(grade),
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 receipt,
@@ -2363,17 +2467,22 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return { receipt, currentHash, prevHash };
         });
 
+        // ✅ LOG SUCCESS
         await logSuccessEvent("VOTE_CAST", req, {
             receipt: voteResult.receipt.substring(0, 16) + '...',
             grade
         });
 
+        // ✅ RESPONSE
         res.json({
             success: true,
             receipt: voteResult.receipt,
             hash: voteResult.currentHash,
             prevHash: voteResult.prevHash
         });
+
+        // ✅ ANOMALY DETECTION (FIXED VARIABLE)
+        await detectVotingAnomalies(req, hashedLVN);
 
     } catch (e) {
         if (e.message === "ALREADY_VOTED") {
@@ -2382,9 +2491,9 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             });
         }
 
-        if (e.message === "PAUSED") {
+        if (e.message === "VOTER_NOT_FOUND") {
             return res.status(403).json({
-                error: "The election is currently paused by the administrator."
+                error: "Voter not found."
             });
         }
 
