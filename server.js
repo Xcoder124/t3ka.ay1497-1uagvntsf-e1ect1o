@@ -748,16 +748,15 @@ class AlertManager {
                 let sourceUpdated = false;
 
                 candidatesSnap.forEach(doc => {
-                    const opts = doc.data().options || [];
+                    const rawOptions = doc.data().options;
+                    const opts = Array.isArray(rawOptions) ? rawOptions : [];
 
                     opts.forEach(c => {
-                        // 🔥 If never published
                         if (!lastUpdated) {
                             sourceUpdated = true;
                             return;
                         }
 
-                        // 🔥 If candidate has timestamp
                         if (c.addedAt) {
                             const addedTime = c.addedAt.toMillis
                                 ? c.addedAt.toMillis()
@@ -771,12 +770,11 @@ class AlertManager {
                                 sourceUpdated = true;
                             }
                         } else {
-                            // 🔥 fallback: no timestamp = assume update needed
                             sourceUpdated = true;
                         }
                     });
                 });
-
+                
                 if (sourceUpdated) {
                     const existing = await db.collection("system_alerts").doc("candidate_sync").get();
 
