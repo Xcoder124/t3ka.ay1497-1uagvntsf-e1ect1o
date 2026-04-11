@@ -1373,6 +1373,18 @@ app.use(express.json({ limit: '110kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
+    exposedHeaders: ["set-cookie"]
+}));
+app.options('*', cors());
+
 // Single helmet() call with all security headers
 app.use(helmet({
     contentSecurityPolicy: {
@@ -1416,18 +1428,6 @@ const allowedOrigins = [
     "https://tsf-g-digital-election.web.app",
     "https://tanauanschooloffisheries.web.app"
 ];
-
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error("CORS Policy: Origin not allowed"), false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
-    exposedHeaders: ["set-cookie"]
-}));
-app.options('/*splat', cors());
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
