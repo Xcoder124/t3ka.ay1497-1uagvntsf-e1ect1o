@@ -1,26 +1,18 @@
-const admin = require("firebase-admin");
-const express = require("express");
-const cors = require("cors");
-const jwt = require("jsonwebtoken");
-const rateLimit = require("express-rate-limit");
-const cookieParser = require("cookie-parser");
-const helmet = require("helmet");
-const crypto = require("crypto");
-const CANDIDATE_SECRET = process.env.CANDIDATE_SECRET;
-if (!process.env.CANDIDATE_SECRET) {
-    throw new Error("CANDIDATE_SECRET is required.");
-}
-const VOTE_SIGN_SECRET = process.env.VOTE_SIGN_SECRET;
-if (!VOTE_SIGN_SECRET) {
-    throw new Error("VOTE_SIGN_SECRET is required");
-}
+import admin from "firebase-admin";
+import express from "express";
+import cors  from "cors";
+import jwt  from "jsonwebtoken";
+import rateLimit  from "express-rate-limit";
+import cookieParser  from "cookie-parser";
+import helmet  from "helmet";
+import crypto  from "crypto";
+import axios  from "axios";
+import bcrypt  from "bcrypt";
+import createDOMPurify  from 'dompurify';
+import { JSDOM }  from 'jsdom';
+import 'dotenv/config';
 
-const axios = require("axios");
-const bcrypt = require("bcrypt");
-const createDOMPurify = require('dompurify');
-const { JSDOM } = require('jsdom');
-
-// --- ADD dotenv for local developent ---
+// --- ADD dotenv for local development ---
 if (process.env.NODE_ENV !== 'production') {
     require('dotenv').config();
 }
@@ -72,143 +64,6 @@ app.use((req, res, next) => {
 
 const db = admin.firestore();
 
-// GLOBAL VARIABLES
-const MAX_ATTEMPTS = 3;
-const LOCK_TIME = 30 * 1000; // 30 sec
-
-async function checkLoginAttempts(deviceId) {
-    const ref = db.collection("login_attempts").doc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) return { allowed: true };
-
-    const data = snap.data();
-
-    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
-        return {
-            allowed: false,
-            message: "Too many attempts. Try again in 30 seconds."
-        };
-    }
-
-    return { allowed: true, attempts: data.attempts || 0 };
-}
-
-async function recordLoginAttempt(deviceId, success) {
-    const ref = db.collection("login_attempts").doc(deviceId);
-    const snap = await ref.get();
-
-    if (success) {
-        await ref.delete();
-        return;
-    }
-
-    let attempts = 1;
-
-    if (snap.exists) {
-        attempts = (snap.data().attempts || 0) + 1;
-    }
-
-    const data = {
-        attempts,
-        lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-    };
-
-    if (attempts >= MAX_ATTEMPTS) {
-        data.lockUntil = admin.firestore.Timestamp.fromMillis(Date.now() + LOCK_TIME);
-    }
-
-    await ref.set(data, { merge: true });
-}
-
-async function validateSelections(selections) {
-    const snapshot = await db.collection("candidates").get();
-    const validated = {};
-
-    snapshot.forEach(doc => {
-        const position = doc.id;
-        const options = doc.data().options || [];
-
-        if (!selections[position]) return;
-
-        const selected = selections[position];
-
-        const selectedArray = (Array.isArray(selected) ? selected : [selected])
-            .map(s => String(s).trim());
-
-        // ❗ Prevent multiple selections on single-select positions
-        if (!MULTI_POSITIONS.includes(position) && selectedArray.length > 1) {
-            throw new Error(`Multiple selections not allowed for ${position}`);
-        }
-
-        // ❗ Prevent over-selection
-        if (selectedArray.length > options.length) {
-            throw new Error(`Too many selections for ${position}`);
-        }
-
-        // ❗ Prevent duplicates
-        if (new Set(selectedArray).size !== selectedArray.length) {
-            throw new Error(`Duplicate selections for ${position}`);
-        }
-
-        const resolved = selectedArray.map(sel => {
-
-            // 🔐 FIXED: validate HERE
-            if (!/^[a-f0-9]{64}$/.test(sel)) {
-                throw new Error(`Tampered selection detected for ${position}`);
-            }
-
-            const match = options.find(c => {
-                if (!c.id) {
-                    console.error("Missing candidate ID:", c);
-                    return false;
-                }
-                return hashCandidateId(c.id) === sel;
-            });
-
-            if (!match) {
-                throw new Error(`Invalid candidate for ${position}`);
-            }
-
-            return match.id;
-        });
-
-        validated[position] = MULTI_POSITIONS.includes(position)
-            ? resolved
-            : resolved[0];
-    });
-
-    return validated;
-}
-
-function hashCandidateId(id) {
-    if (!process.env.CANDIDATE_SECRET) {
-        throw new Error("A Candidate Secret is missing.");
-    }
-
-    return crypto.createHmac("sha256", process.env.CANDIDATE_SECRET)
-        .update(id)
-        .digest("hex");
-}
-
-function generateVoteSignature(selections, timestamp, nonce) {
-    const payload = JSON.stringify({ selections, timestamp, nonce });
-    return crypto.createHmac("sha256", VOTE_SIGN_SECRET)
-        .update(payload)
-        .digest("hex");
-}
-
-async function isNonceUsed(nonce) {
-    const doc = await db.collection("used_nonces").doc(nonce).get();
-    return doc.exists;
-}
-
-async function markNonceUsed(nonce) {
-    await db.collection("used_nonces").doc(nonce).set({
-        usedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-}
-
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
 
@@ -226,16 +81,7 @@ async function createElectionBackup(db) {
         candidates: candidatesSnap.docs.map(d => d.data())
     };
 
-    const raw = JSON.stringify(backup, null, 2);
-
-    const key = crypto.createHash('sha256').update(process.env.BACKUP_SECRET).digest();
-    const iv = crypto.randomBytes(16);
-
-    const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-    let encrypted = cipher.update(raw, "utf8", "hex");
-    encrypted += cipher.final("hex");
-
-    const json = iv.toString("hex") + ":" + encrypted;
+    const json = JSON.stringify(backup, null, 2);
 
     const hash = crypto
         .createHash("sha256")
@@ -263,12 +109,8 @@ async function uploadToGitHub(json, hash) {
                 }
             }
         );
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
 
         return res.data.content.html_url;
-
 
     } catch (e) {
         console.error("GITHUB UPLOAD ERROR:", e.response?.data || e.message);
@@ -308,818 +150,41 @@ async function restoreElectionFromBackup(jsonData) {
     };
 }
 
-// ============================================
-// COMPREHENSIVE ALERT SYSTEM
-// ============================================
-
-const ALERT_TYPES = {
-    // System-level alerts
-    HIGH_LOAD: { type: 'high_load', level: 'major', autoExpire: 5 * 60 * 1000 },
-    BACKUP_CREATED: { type: 'backup', level: 'minor', autoExpire: 24 * 60 * 60 * 1000 },
-
-    // Candidate-related alerts
-    CANDIDATE_SYNC_NEEDED: { type: 'candidate_sync', level: 'minor', autoExpire: null },
-    CANDIDATES_EMPTY: { type: 'candidates_empty', level: 'critical', autoExpire: null },
-    CANDIDATE_PUBLISH_FAILED: { type: 'candidate_publish_failed', level: 'major', autoExpire: null },
-
-    // Security alerts
-    BRUTE_FORCE: { type: 'bruteforce', level: 'major', autoExpire: null },
-    TAMPER_DETECTED: { type: 'tamper', level: 'critical', autoExpire: null },
-    UNAUTHORIZED_ACCESS: { type: 'unauthorized', level: 'major', autoExpire: null },
-
-    // Data integrity alerts
-    HASH_CHAIN_BROKEN: { type: 'hash_chain', level: 'critical', autoExpire: null },
-    INVALID_VOTES_DETECTED: { type: 'invalid_votes', level: 'major', autoExpire: null },
-    VOTE_INTEGRITY_FAIL: { type: 'vote_integrity', level: 'critical', autoExpire: null },
-
-    // API/Backend errors
-    API_ERROR: { type: 'api_error', level: 'major', autoExpire: 30 * 60 * 1000 },
-    DATABASE_ERROR: { type: 'database_error', level: 'critical', autoExpire: null },
-    FIREBASE_ERROR: { type: 'firebase_error', level: 'critical', autoExpire: null },
-    ELECTION_DATA_DELETED: { type: 'election_deleted', level: 'major', autoExpire: null },
-
-    // Frontend/Script errors (reported from client)
-    SCRIPT_ERROR: { type: 'script_error', level: 'major', autoExpire: 60 * 60 * 1000 },
-    CLIENT_API_ERROR: { type: 'client_api_error', level: 'minor', autoExpire: 30 * 60 * 1000 },
-    RENDER_ERROR: { type: 'render_error', level: 'major', autoExpire: null },
-
-    // Configuration alerts
-    CONFIG_MISSING: { type: 'config_missing', level: 'critical', autoExpire: null },
-    ENV_ERROR: { type: 'env_error', level: 'critical', autoExpire: null },
-
-    // Election status alerts
-    ELECTION_PAUSED: { type: 'election_paused', level: 'normal', autoExpire: null },
-    SESSION_TIMEOUT: { type: 'session_timeout', level: 'minor', autoExpire: null }
-};
-
-// Fix instructions for each alert type
-const ALERT_FIX_INSTRUCTIONS = {
-    candidate_sync: {
-        fixSteps: [
-            "Navigate to Settings tab",
-            "Click 'Publish Candidates' button",
-            "Verify candidates appear on voting page"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    candidates_empty: {
-        fixSteps: [
-            "Add candidates through Candidates Entry tab",
-            "Ensure all positions have at least one candidate",
-            "Publish candidates after adding"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: No candidates available for voting. Contact developer immediately if candidates were previously added."
-    },
-    candidate_publish_failed: {
-        fixSteps: [
-            "Check internet connection",
-            "Try publishing again",
-            "Check server logs for errors"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    bruteforce: {
-        fixSteps: [
-            "Verify if authorized user is having login issues",
-            "Check security logs for IP address",
-            "Consider blocking suspicious IPs"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    tamper: {
-        fixSteps: [
-            "DO NOT proceed with election",
-            "Document the issue",
-            "Contact developer immediately"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL SECURITY ALERT: Potential vote tampering detected. STOP all election activities and contact developer IMMEDIATELY."
-    },
-    hash_chain: {
-        fixSteps: [
-            "Run 'Re-Tally Votes' from Settings",
-            "Verify vote integrity",
-            "Contact developer if issue persists"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Vote hash chain integrity compromised. Contact developer immediately before proceeding."
-    },
-    invalid_votes: {
-        fixSteps: [
-            "Run 'Re-Tally Votes' from Settings",
-            "Review invalid voter records",
-            "Reset invalid voters if needed"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    vote_integrity: {
-        fixSteps: [
-            "STOP election immediately",
-            "Run 'Re-Tally Votes'",
-            "Contact developer if issue persists"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Vote integrity check failed. Contact developer immediately."
-    },
-    api_error: {
-        fixSteps: [
-            "Check server status",
-            "Verify network connectivity",
-            "Check API endpoint configuration"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    database_error: {
-        fixSteps: [
-            "Check Firebase connection",
-            "Verify database permissions",
-            "Restart server if needed"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Database connection failed. Contact developer immediately."
-    },
-    firebase_error: {
-        fixSteps: [
-            "Check Firebase console for outages",
-            "Verify service account credentials",
-            "Check Firebase project status"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Firebase service error. Contact developer immediately."
-    },
-    script_error: {
-        fixSteps: [
-            "Refresh the page",
-            "Clear browser cache",
-            "Try a different browser"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    client_api_error: {
-        fixSteps: [
-            "Check internet connection",
-            "Refresh the page",
-            "Try again in a few minutes"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    render_error: {
-        fixSteps: [
-            "Refresh the page",
-            "Check browser console for errors",
-            "Clear browser cache"
-        ],
-        developerFix: true,
-        contactMessage: "Frontend rendering error detected. Contact developer if issue persists."
-    },
-    config_missing: {
-        fixSteps: [
-            "Check environment variables",
-            "Verify configuration files",
-            "Restart server after fixing"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Required configuration missing. Contact developer immediately."
-    },
-    env_error: {
-        fixSteps: [
-            "Check .env file or environment variables",
-            "Verify all required variables are set",
-            "Restart server after fixing"
-        ],
-        developerFix: true,
-        contactMessage: "CRITICAL: Environment configuration error. Contact developer immediately."
-    },
-    high_load: {
-        fixSteps: [
-            "Monitor active users in real-time",
-            "If users exceed 300, prepare queue system",
-            "Activate Queue System to control traffic"
-        ],
-        developerFix: false,
-        contactMessage: null,
-        action: "activate_queue"
-    },
-    backup: {
-        fixSteps: [
-            "Verify backup was created successfully",
-            "Check backup archive link",
-            "No action needed - informational only"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    election_paused: {
-        fixSteps: [
-            "Toggle election status to LIVE when ready",
-            "Verify voters can access the system"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    session_timeout: {
-        fixSteps: [
-            "Login again to continue",
-            "Check session timer settings"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    unauthorized: {
-        fixSteps: [
-            "Verify user permissions",
-            "Check admin credentials",
-            "Review access logs"
-        ],
-        developerFix: false,
-        contactMessage: null
-    },
-    election_deleted: {
-        fixSteps: [
-            "Access the backup archive using the provided link",
-            "Navigate to System Log panel",
-            "Enter restore command: /restore {archive_link}"
-        ],
-        developerFix: false,
-        contactMessage: null
-    }
-};
-
-class AlertManager {
-    constructor() {
-        this.activeAlerts = new Map();
-        this.alertLogs = [];
-        this.maxLogEntries = 100;
-        this.activeTypes = new Set();
-        this.lastCandidateCheck = 0;
-    }
-
-    async createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
-        if (!this.lastAlertTime) this.lastAlertTime = {};
-
-        const now = Date.now();
-        if (this.lastAlertTime[type] && now - this.lastAlertTime[type] < 10000) {
-            return null;
-        }
-        this.lastAlertTime[type] = now;
-        try {
-            // Check if similar alert already exists (prevent duplicates)
-            const alertRef = db.collection("system_alerts").doc(type);
-            if (this.activeTypes.has(type)) {
-                return null;
-            }
-
-            const alertData = {
-                type,
-                level,
-                title,
-                message,
-                meta: meta || {},
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                active: true,
-                dismissed: false,
-                dismissedAt: null,
-                dismissedBy: null,
-                occurrenceCount: 1,
-                acknowledged: false,
-                fixInstructions: ALERT_FIX_INSTRUCTIONS[type] || null
-            };
-
-            if (expiresInMs) {
-                alertData.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
-            }
-
-            await alertRef.set(alertData);
-            this.activeTypes.add(type);
-            const docRef = alertRef;
-
-            // Cache the alert
-            this.activeAlerts.set(docRef.id, { ...alertData, id: docRef.id });
-
-            console.log(`[ALERT] Created: ${type} - ${title}`);
-            return docRef.id;
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to create alert:", e);
-            return null;
-        }
-    }
-
-    async findSimilarAlert(type, message) {
-        try {
-            const fiveMinutesAgo = admin.firestore.Timestamp.fromMillis(Date.now() - 5 * 60 * 1000);
-            const snapshot = await db.collection("system_alerts")
-                .where("type", "==", type)
-                .where("active", "==", true)
-                .where("createdAt", ">", fiveMinutesAgo)
-                .limit(1)
-                .get();
-
-            if (!snapshot.empty) {
-                return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
-            }
-            return null;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    async dismissAlert(alertId, adminId = 'system') {
-        try {
-            const alertRef = db.collection("system_alerts").doc(alertId);
-            const alertDoc = await alertRef.get();
-
-            if (!alertDoc.exists) {
-                return { success: false, error: 'Alert not found' };
-            }
-
-            const alertData = alertDoc.data();
-
-            // Move to alert logs
-            const logEntry = {
-                ...alertData,
-                originalAlertId: alertId,
-                dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
-                dismissedBy: adminId,
-                loggedAt: admin.firestore.FieldValue.serverTimestamp()
-            };
-
-            await db.collection("alert_logs").add(logEntry);
-
-            // Mark as dismissed (but keep for tracking)
-            await alertRef.update({
-                active: false,
-                dismissed: true,
-                dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
-                dismissedBy: adminId
-            });
-
-            // Remove from cache
-            this.activeAlerts.delete(alertId);
-
-            console.log(`[ALERT] Dismissed: ${alertId} by ${adminId}`);
-            this.activeTypes.delete(alertData.type);
-            return { success: true };
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to dismiss alert:", e);
-            return { success: false, error: e.message };
-        }
-    }
-
-    async acknowledgeAlert(alertId) {
-        try {
-            await db.collection("system_alerts").doc(alertId).update({
-                acknowledged: true,
-                acknowledgedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            return { success: true };
-        } catch (e) {
-            return { success: false, error: e.message };
-        }
-    }
-
-    async clearResolvedAlerts(type) {
-        // Clear alerts of a specific type when the issue is resolved
-        try {
-            const snapshot = await db.collection("system_alerts")
-                .where("type", "==", type)
-                .where("active", "==", true)
-                .get();
-
-            const batch = db.batch();
-            snapshot.docs.forEach(doc => {
-                batch.update(doc.ref, {
-                    active: false,
-                    resolved: true,
-                    resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    resolutionType: 'auto'
-                });
-            });
-
-            if (snapshot.size > 0) {
-                await batch.commit();
-                this.activeTypes.delete(type);
-                console.log(`[ALERT] Cleared ${snapshot.size} resolved alerts of type: ${type}`);
-            }
-
-            return { success: true, cleared: snapshot.size };
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to clear resolved alerts:", e);
-            return { success: false, error: e.message };
-        }
-    }
-
-    async getActiveAlerts() {
-        try {
-            const now = admin.firestore.Timestamp.now();
-            const snapshot = await db.collection("system_alerts")
-                .where("active", "==", true)
-                .orderBy("createdAt", "desc")
-                .get();
-
-            const alerts = [];
-            if (alerts.length > 20) {
-                return alerts.slice(0, 20);
-            }
-            snapshot.forEach(doc => {
-                const data = doc.data();
-
-                setInterval(async () => {
-                    const snapshot = await db.collection("system_alerts")
-                        .where("active", "==", true)
-                        .get();
-
-                    snapshot.forEach(async (doc) => {
-                        const data = doc.data();
-                        if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
-                            await alertManager.expireAlert(doc.id);
-                        }
-                    });
-                }, 30000);
-
-                alerts.push({ id: doc.id, ...data });
-            });
-
-            const priority = {
-                critical: 4,
-                major: 3,
-                minor: 2,
-                normal: 1
-            };
-
-            alerts.sort((a, b) => {
-                if (priority[b.level] !== priority[a.level]) {
-                    return priority[b.level] - priority[a.level];
-                }
-                return (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0);
-            });
-
-            return alerts;
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to get active alerts:", e);
-            return [];
-        }
-    }
-
-    async getAlertLogs(limit = 50) {
-        try {
-            const snapshot = await db.collection("alert_logs")
-                .orderBy("loggedAt", "desc")
-                .limit(limit)
-                .get();
-
-            return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to get alert logs:", e);
-            return [];
-        }
-    }
-
-    async expireAlert(alertId) {
-        try {
-            await db.collection("system_alerts").doc(alertId).update({
-                active: false,
-                expired: true,
-                expiredAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            this.activeAlerts.delete(alertId);
-        } catch (e) {
-            console.error("[ALERT ERROR] Failed to expire alert:", e);
-        }
-    }
-
-    async hasUnacknowledgedIgnoredAlerts() {
-        // Check if there are alerts that were dismissed but not fixed
-        try {
-            const snapshot = await db.collection("alert_logs")
-                .where("fixInstructions.developerFix", "==", true)
-                .where("fixInstructions.contacted", "!=", true)
-                .limit(1)
-                .get();
-
-            return !snapshot.empty;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    // Comprehensive error detection methods
-    async detectCandidatesStatus() {
-        if (this.lastCandidateCheck && Date.now() - this.lastCandidateCheck < 60000) {
-            return;
-        }
-        this.lastCandidateCheck = Date.now();
-        try {
-            const candidatesSnap = await db.collection("candidates").get();
-            let totalCandidates = 0;
-            candidatesSnap.forEach(doc => {
-                const opts = doc.data().options || [];
-                totalCandidates += opts.length;
-            });
-
-            if (totalCandidates === 0) {
-                await this.createAlert(
-                    'candidates_empty',
-                    'critical',
-                    'No Candidates Found',
-                    'The candidates database is empty. Voting cannot proceed.',
-                    { totalCandidates },
-                    null
-                );
-            }
-
-            // Check if candidates need publishing
-            const staticDoc = await db.collection("app_config").doc("candidates_static").get();
-            if (staticDoc.exists) {
-                const staticData = staticDoc.data();
-                const lastUpdated = staticData.lastUpdated;
-
-                // Check if source candidates were updated after last publish
-                let sourceUpdated = false;
-
-                candidatesSnap.forEach(doc => {
-                    const rawOptions = doc.data().options;
-                    const opts = Array.isArray(rawOptions) ? rawOptions : [];
-
-                    opts.forEach(c => {
-                        if (!lastUpdated) {
-                            sourceUpdated = true;
-                            return;
-                        }
-
-                        if (c.addedAt) {
-                            const addedTime = c.addedAt.toMillis
-                                ? c.addedAt.toMillis()
-                                : new Date(c.addedAt).getTime();
-
-                            const publishTime = lastUpdated.toMillis
-                                ? lastUpdated.toMillis()
-                                : new Date(lastUpdated).getTime();
-
-                            if (addedTime > publishTime) {
-                                sourceUpdated = true;
-                            }
-                        } else {
-                            sourceUpdated = true;
-                        }
-                    });
-                });
-
-                if (sourceUpdated) {
-                    const existing = await db.collection("system_alerts").doc("candidate_sync").get();
-
-                    if (!existing.exists || !existing.data().active) {
-                        await this.createAlert(
-                            'candidate_sync',
-                            'minor',
-                            'Candidates Update Needed',
-                            'New candidates have been added but not yet published to the voting system.',
-                            {},
-                            null
-                        );
-                    }
-                } else {
-                    // Clear the sync needed alert if candidates are now synced
-                    await this.clearResolvedAlerts('candidate_sync');
-                }
-            }
-
-            console.log("Running candidate detection...");
-
-            return { success: true, totalCandidates };
-        } catch (e) {
-            console.error("[ALERT] Candidate detection error:", e);
-            await this.createAlert(
-                'database_error',
-                'critical',
-                'Database Error',
-                `Failed to check candidates status: ${e.message}`,
-                { error: e.message },
-                null
-            );
-            return { success: false, error: e.message };
-        }
-    }
-
-    async detectVoteIntegrity() {
-        const votesSnap = await db.collection("votes").get();
-
-        if (votesSnap.size === 0) {
-            await this.createAlert(
-                'vote_integrity',
-                'major',
-                'No Votes Found',
-                'No votes recorded in the system.',
-                {},
-                null
-            );
-        }
-        try {
-            const chainInfo = await verifyHashChain();
-
-            if (!chainInfo.valid) {
-                await this.createAlert(
-                    'hash_chain',
-                    'critical',
-                    'Vote Integrity Compromised',
-                    `Hash chain verification failed. ${chainInfo.invalidCount} invalid vote(s) detected.`,
-                    chainInfo,
-                    null
-                );
-
-            } else {
-                await this.clearResolvedAlerts('hash_chain');
-            }
-
-            // Check for orphaned votes
-            const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
-
-            const validReceipts = new Set();
-            votersSnap.forEach(doc => {
-                const v = doc.data();
-                if (v.receipt) validReceipts.add(v.receipt);
-            });
-
-            let orphanedCount = 0;
-
-            votesSnap.forEach(doc => {
-                const vote = doc.data();
-
-                if (!vote.receipt || !validReceipts.has(vote.receipt)) {
-                    orphanedCount++;
-                }
-            });
-
-            if (orphanedCount > 0) {
-                await this.createAlert(
-                    'invalid_votes',
-                    'major',
-                    'Invalid Votes Detected',
-                    `${orphanedCount} vote(s) without valid voter.`,
-                    { orphanedCount },
-                    null
-                );
-            } else {
-                await this.clearResolvedAlerts('invalid_votes');
-            }
-
-            if (votesSnap.size > votersSnap.size) {
-                await this.createAlert(
-                    'vote_integrity',
-                    'critical',
-                    'Vote Count Mismatch',
-                    'Votes exceed number of voters. Consider re-tallying the election results.',
-                    {
-                        votes: votesSnap.size,
-                        voters: votersSnap.size
-                    },
-                    null
-                );
-            }
-            else {
-                await this.clearResolvedAlerts('vote_integrity');
-            }
-            console.log("Running chain detection...");
-            return { success: true, chainValid: chainInfo.valid, orphanedCount };
-        } catch (e) {
-            console.error("[ALERT] Vote integrity detection error:", e);
-            return { success: false, error: e.message };
-        }
-    }
-
-    async detectSystemHealth() {
-        try {
-            const start = Date.now();
-            await db.collection("settings").doc("config").get();
-            const latency = Date.now() - start;
-
-            if (latency > 1000) {
-                await this.createAlert(
-                    'api_error',
-                    'major',
-                    'Slow Database Response',
-                    `Database response time is ${latency}ms... This might be a cause of too much requests due to large amount of students accessing the site at the same time.`,
-                    { latency },
-                    10 * 60 * 1000
-                );
-            } else {
-                await this.clearResolvedAlerts('api_error');
-            }
-
-            const testSnap = await db.collection("candidates").limit(1).get();
-
-            if (testSnap.empty) {
-                await this.createAlert(
-                    'database_error',
-                    'critical',
-                    'Database Read Failure',
-                    'Unable to read from candidates collection. Contact the developer to fix this issue.',
-                    {},
-                    null
-                );
-            }
-
-            const requiredEnv = [
-                'FIREBASE_PROJECT_ID',
-                'FIREBASE_CLIENT_EMAIL',
-                'FIREBASE_PRIVATE_KEY',
-                'JWT_SECRET',
-                'ADMIN_KEY'
-            ];
-
-            const missingEnv = requiredEnv.filter(key => !process.env[key]);
-            if (missingEnv.length > 0) {
-                await this.createAlert(
-                    'env_error',
-                    'critical',
-                    'Environment Configuration Error',
-                    `Missing: ${missingEnv.join(', ')} contact the developer for re-check of environment rules.`,
-                    { missingEnv },
-                    null
-                );
-            } else {
-                await this.clearResolvedAlerts('env_error');
-            }
-
-            await this.clearResolvedAlerts('firebase_error');
-            await this.clearResolvedAlerts('database_error');
-
-            return { success: true };
-        } catch (e) {
-            await this.createAlert(
-                'firebase_error',
-                'critical',
-                'Firebase Connection Failed',
-                `Unable to connect to Firebase: ${e.message}`,
-                { error: e.message },
-                null
-            );
-            return { success: false, error: e.message };
-        }
-    }
-}
-
-const alertManager = new AlertManager();
-
-// Legacy function for backward compatibility
+// -- ALERTS
 async function createAlert(type, level, title, message, meta = {}, expiresInMs = null) {
-    return alertManager.createAlert(type, level, title, message, meta, expiresInMs);
+    try {
+        const alert = {
+            type,
+            level,
+            title,
+            message,
+            meta,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            active: true
+        };
+
+        if (expiresInMs) {
+            alert.expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + expiresInMs);
+        }
+
+        await db.collection("system_alerts").add(alert);
+    } catch (e) {
+        console.error("ALERT ERROR:", e);
+    }
 }
 
-// Scheduled monitoring
 setInterval(async () => {
-    if (activeUsers >= 2) { // TESTING
-        await alertManager.createAlert(
+    if (activeUsers >= 500) {
+        await createAlert(
             "high_load",
-            "critical",
-            "Voting Session Critical Load",
-            `Total of ${activeUsers} students are currently voting. System is under heavy stress and may slow down.`,
+            "major",
+            "⚠️ High Traffic",
+            `Concurrent users: ${activeUsers}`,
             { activeUsers },
             5 * 60 * 1000
         );
     }
-    else if (activeUsers >= 1) {
-        await alertManager.createAlert(
-            'high_load',
-            'major',
-            'Voting Session High Traffic',
-            `Total of ${activeUsers} students are on voting session. Exceeding 500 may affect connectivity. Consider activating Queue System.`,
-            { activeUsers },
-            5 * 60 * 1000
-        );
-    }
-
-    else {
-        await alertManager.clearResolvedAlerts('high_load');
-    }
-
-}, 30000);
-
-// Run comprehensive checks every 30 seconds
-setInterval(async () => {
-    await alertManager.detectCandidatesStatus();
-    await alertManager.detectVoteIntegrity();
-}, 120000);
-
-// Initial system health check
-setTimeout(async () => {
-    await alertManager.detectSystemHealth();
-    await alertManager.detectCandidatesStatus();
-    await alertManager.detectVoteIntegrity();
-}, 5000);
-
-app.get("/debug/set-users/:num", (req, res) => {
-    activeUsers = parseInt(req.params.num) || 0;
-    res.json({ activeUsers });
-});
+}, 10000);
 
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
@@ -1219,51 +284,41 @@ async function randomDelay(minMs = 800, maxMs = 1200) {
 const BRUTE_FORCE_WINDOW_MS = 15 * 60 * 1000;
 const BRUTE_FORCE_MAX = 5;
 
-function getDeviceBruteForceDoc(deviceId) {
-    return db.collection("device_brute_force").doc(deviceId);
+async function getBruteForceDoc(ip) {
+    return db.collection("brute_force").doc(ip.replace(/[:.]/g, "_"));
 }
 
-async function recordDeviceAttempt(deviceId) {
-    const ref = getDeviceBruteForceDoc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) {
-        await ref.set({
-            attempts: 1,
-            lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-        });
-    } else {
-        const attempts = (snap.data().attempts || 0) + 1;
-
-        if (attempts >= 5) {
-            await ref.update({
-                attempts,
-                lockUntil: admin.firestore.Timestamp.fromMillis(Date.now() + 30 * 60 * 1000)
-            });
-        } else {
-            await ref.update({ attempts });
-        }
-    }
-}
-
-async function isDeviceLocked(deviceId) {
-    const ref = getDeviceBruteForceDoc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) return false;
-
-    const data = snap.data();
-
-    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
-        return true;
-    }
-
-    return false;
-}
-
-async function clearBruteForce(deviceId) {
+async function isIPLocked(ip) {
     try {
-        const ref = await getDeviceBruteForceDoc(deviceId);
+        const ref = await getBruteForceDoc(ip);
+        const snap = await ref.get();
+        if (!snap.exists) return false;
+        const d = snap.data();
+        const windowStart = Date.now() - BRUTE_FORCE_WINDOW_MS;
+        if (d.windowStart && d.windowStart.toMillis() < windowStart) {
+            await ref.delete();
+            return false;
+        }
+        return (d.count || 0) >= BRUTE_FORCE_MAX;
+    } catch { return false; }
+}
+
+async function recordFailedAttempt(ip) {
+    try {
+        const ref = await getBruteForceDoc(ip);
+        const snap = await ref.get();
+        const windowStart = Date.now() - BRUTE_FORCE_WINDOW_MS;
+        if (!snap.exists || (snap.data().windowStart && snap.data().windowStart.toMillis() < windowStart)) {
+            await ref.set({ count: 1, windowStart: admin.firestore.FieldValue.serverTimestamp() });
+        } else {
+            await ref.update({ count: admin.firestore.FieldValue.increment(1) });
+        }
+    } catch { }
+}
+
+async function clearBruteForce(ip) {
+    try {
+        const ref = await getBruteForceDoc(ip);
         await ref.delete();
     } catch { }
 }
@@ -1369,20 +424,20 @@ function requireMobile(req, res, next) {
 
 // --- MIDDLEWARE & APP CONFIG ---
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '110kb' }));
+app.use(express.json({ limit: '10kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
 // Single helmet() call with all security headers
 app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-            "script-src": ["'self'", "'unsafe-inline'", "https://challenges.cloudflare.com"],
-            "frame-src": ["'self'", "https://challenges.cloudflare.com"],
-        },
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
     },
-    crossOriginEmbedderPolicy: false, // Allows the Turnstile iframe to load properly
+    contentSecurityPolicy: false // Disable default CSP, we'll set it manually below
 }));
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
@@ -1392,14 +447,13 @@ app.use((req, res, next) => {
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com"],
-            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com"],
             frameAncestors: ["'none'"],
-
+            // FIX: Remove empty upgradeInsecureRequests or set to null
         },
     })(req, res, next);
 });
@@ -1694,13 +748,7 @@ async function refreshLocalResults() {
             for (const c of (GlobalCache.candidates[pos] || [])) {
                 const cidStr = String(c.id);
                 const t = tallies[pos][cidStr] || { votes: 0, breakdown: {} };
-                list.push({
-                    name: c.name,
-                    party: c.party,
-                    hash: c.hash,
-                    votes: t.votes,
-                    breakdown: t.breakdown
-                });
+                list.push({ ...c, votes: t.votes, breakdown: t.breakdown });
             }
             list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
             finalResults[pos] = list;
@@ -1852,188 +900,26 @@ app.use(async (req, res, next) => {
 
 // --- ROUTES ---
 
-// -- VERIFY CLOUDFLARE
-async function verifyCaptcha(token) {
-    const res = await axios.post(
-        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-        new URLSearchParams({
-            secret: process.env.TURNSTILE_SECRET,
-            response: token
-        })
-    );
-    return res.data.success;
-}
-
 // -- ALERTS
-app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => {
+app.get("/admin/alerts", async (req, res) => {
     try {
-        const alerts = await alertManager.getActiveAlerts();
-        res.json(alerts);
-    } catch (e) {
-        console.error("[ALERT API] Failed to fetch alerts:", e);
-        res.status(500).json({ error: "Failed to fetch alerts" });
-    }
-});
+        const snap = await db.collection("system_alerts")
+            .where("active", "==", true)
+            .get();
 
-app.get("/admin/test-alert", async (req, res) => {
-    await alertManager.createAlert(
-        'api_error',
-        'major',
-        'Test Alert',
-        'If you see this, alerts are working.',
-        {},
-        null
-    );
+        const alerts = [];
 
-    res.json({ ok: true });
-});
-
-app.post("/admin/alerts/:id/dismiss", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const alertId = req.params.id;
-        const adminId = req.user?.uid || req.user?.email || 'unknown';
-        const result = await alertManager.dismissAlert(alertId, adminId);
-        if (result.success) {
-            res.json({ success: true, message: "Alert dismissed and logged" });
-        } else {
-            res.status(400).json({ error: result.error });
-        }
-    } catch (e) {
-        console.error("[ALERT API] Failed to dismiss alert:", e);
-        res.status(500).json({ error: "Failed to dismiss alert" });
-    }
-});
-
-app.post("/admin/alerts/:id/acknowledge", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const alertId = req.params.id;
-        const result = await alertManager.acknowledgeAlert(alertId);
-        if (result.success) {
-            res.json({ success: true, message: "Alert acknowledged" });
-        } else {
-            res.status(400).json({ error: result.error });
-        }
-    } catch (e) {
-        console.error("[ALERT API] Failed to acknowledge alert:", e);
-        res.status(500).json({ error: "Failed to acknowledge alert" });
-    }
-});
-
-app.get("/admin/alerts/logs", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const limit = parseInt(req.query.limit) || 50;
-        const logs = await alertManager.getAlertLogs(limit);
-        res.json(logs);
-    } catch (e) {
-        console.error("[ALERT API] Failed to fetch alert logs:", e);
-        res.status(500).json({ error: "Failed to fetch alert logs" });
-    }
-});
-
-app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const activeAlerts = await alertManager.getActiveAlerts();
-        const hasCritical = activeAlerts.some(a => a.level === 'critical');
-        const hasMajor = activeAlerts.some(a => a.level === 'major');
-        const hasUnacknowledged = activeAlerts.some(a => !a.acknowledged);
-
-        res.json({
-            totalActive: activeAlerts.length,
-            hasCritical,
-            hasMajor,
-            hasUnacknowledged,
-            alertsByLevel: {
-                critical: activeAlerts.filter(a => a.level === 'critical').length,
-                major: activeAlerts.filter(a => a.level === 'major').length,
-                minor: activeAlerts.filter(a => a.level === 'minor').length,
-                normal: activeAlerts.filter(a => a.level === 'normal').length
-            }
+        snap.forEach(doc => {
+            alerts.push({
+                id: doc.id,
+                ...doc.data()
+            });
         });
-    } catch (e) {
-        console.error("[ALERT API] Failed to fetch alert status:", e);
-        res.status(500).json({ error: "Failed to fetch alert status" });
-    }
-});
 
-async function detectVotingAnomalies(req, voterId) {
-    try {
-        const recentVotes = await db.collection("votes")
-            .where("ip", "==", req.ip)
-            .where("createdAt", ">", admin.firestore.Timestamp.fromMillis(Date.now() - 60000))
-            .get();
-
-        // 🚨 Too many votes from same IP
-        if (recentVotes.size > 10) {
-            await createAlert(
-                "tamper",
-                "major",
-                "⚠️ Suspicious Voting Pattern",
-                "Multiple votes from same IP in short time. If the voting session was done in school, kindly dismiss this alert.",
-                { ip: req.ip, count: recentVotes.size }
-            );
-        }
-
-        const deviceId = req.headers["user-agent"] || "unknown";
-        const deviceVotes = await db.collection("votes")
-            .where("device", "==", deviceId)
-            .get();
-
-        const uniqueVoters = new Set();
-        deviceVotes.forEach(doc => uniqueVoters.add(doc.data().voterId));
-
-        if (uniqueVoters.size > 5) {
-            await createAlert(
-                "tamper",
-                "major",
-                "⚠️ Device Abuse Detected",
-                "Too many voters using same device",
-                { deviceId, voters: uniqueVoters.size }
-            );
-        }
+        res.json(alerts);
 
     } catch (e) {
-        console.error("Anomaly detection error:", e);
-    }
-}
-
-// Client-side error reporting endpoint
-app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, res) => {
-    res.sendStatus(200);
-    try {
-        const { type, message, stack, url, line, column, userAgent } = req.body;
-
-        // Determine alert level based on error type
-        let level = 'minor';
-        let alertType = 'script_error';
-
-        if (type === 'API_ERROR' || message?.includes('fetch') || message?.includes('network')) {
-            level = 'major';
-            alertType = 'client_api_error';
-        } else if (type === 'RENDER_ERROR' || message?.includes('render') || message?.includes('React')) {
-            level = 'major';
-            alertType = 'render_error';
-        }
-
-        await alertManager.createAlert(
-            alertType,
-            level,
-            `Client ${type || 'Error'}`,
-            message || 'Unknown client-side error',
-            {
-                stack: stack?.substring(0, 1000),
-                url,
-                line,
-                column,
-                userAgent: userAgent?.substring(0, 500),
-                ip: req.ip
-            },
-            60 * 60 * 1000 // 1 hour expiration
-        );
-
-        res.json({ success: true });
-    } catch (e) {
-        console.error("[CLIENT ERROR REPORT] Failed to process:", e);
-        res.status(500).json({ error: "Failed to process error report" });
+        res.status(500).json({ error: "Failed to fetch alerts" });
     }
 });
 
@@ -2041,90 +927,45 @@ app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, 
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const username = sanitizeString(req.body.username || '');
     const password = req.body.password || '';
-    const captchaToken = req.body.captchaToken;
-    const deviceId = req.cookies.__device_id || req.ip;
-
+    const ip = req.ip;
     await randomDelay(800, 1200);
-
     if (!req.headers["user-agent"]) {
         return res.status(403).end();
     }
-
-    if (!captchaToken) {
-        return res.status(400).json({
-            error: "Complete Captcha Verification First"
-        });
-    }
-
-    const check = await checkLoginAttempts(deviceId);
-    if (!check.allowed) {
-        return res.status(429).json({ error: check.message });
-    }
-
-    if (!(await verifyCaptcha(captchaToken))) {
-        return res.status(403).json({ error: "Captcha verification failed" });
-    }
-
-    if (await isDeviceLocked(deviceId)) {
+    if (await isIPLocked(ip)) {
         return res.status(403).json({ error: "Locked" });
     }
-
     const isValidUser = username === process.env.ADMIN_USER;
     let isValidPass = false;
-
     if (isValidUser && process.env.ADMIN_HASH) {
         isValidPass = await bcrypt.compare(password, process.env.ADMIN_HASH);
     }
-
     if (!isValidUser || !isValidPass) {
-        await recordDeviceAttempt(deviceId);
-        const ip = req.ip;
+        await recordFailedAttempt(ip);
         await createAlert(
             "bruteforce",
             "major",
             "⚠️ Brute Force Detected",
-            "Multiple failed admin login attempts detected.",
+            "Multiple failed admin login attempts, can you verify if someone is having trouble to access the voting panel?.",
             { ip }
         );
-
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
-            username: username ? "***" : null
-        });
-        await recordLoginAttempt(deviceId, isValidPass);
-
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { username: username ? "***" : null, reason: "Invalid credentials" });
         return res.status(401).json({ error: "Invalid credentials" });
     }
-
-    await clearBruteForce(deviceId);
-
+    await clearBruteForce(ip);
     const token = jwt.sign({
         uid: "admin",
         role: "admin",
         iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "1h" });
-
     res.cookie("__session", token, {
         httpOnly: true,
         secure: true,
         sameSite: "none",
         path: "/",
-        maxAge: 2 * 60 * 60 * 1000
+        maxAge: 60 * 60 * 1000
     });
-
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
-    await recordLoginAttempt(deviceId, isValidPass);
-
-    res.json({ success: true });
-});
-
-app.post("/admin/logout", (req, res) => {
-    res.clearCookie("__session", {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        path: "/"
-    });
-
     res.json({ success: true });
 });
 
@@ -2146,39 +987,7 @@ app.get("/settings", async (req, res) => {
     }
 });
 
-function normalizeName(name) {
-    return String(name)
-        .trim()
-        .toUpperCase()
-        .replace(/\s+/g, " ");
-}
-
-app.get("/candidates", async (req, res) => {
-    try {
-        const snapshot = await db.collection("candidates").get();
-
-        const safeCandidates = [];
-
-        snapshot.forEach(doc => {
-            const position = doc.id;
-            const options = doc.data().options || [];
-
-            safeCandidates.push({
-                position,
-                options: options.map(c => ({
-                    name: c.name,
-                    party: c.party,
-                    image: c.img,
-                    hash: hashCandidateId(c.id)
-                }))
-            });
-        });
-
-        res.json(safeCandidates);
-    } catch (e) {
-        res.status(500).json({ error: "Failed to load candidates" });
-    }
-});
+app.get("/candidates", (req, res) => res.json(GlobalCache.candidates));
 
 app.get("/dashboard", async (req, res) => {
     await refreshLocalResults();
@@ -2310,9 +1119,6 @@ app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, re
 });
 
 app.post("/verify", loginLimiter, async (req, res) => {
-    if (!(await verifyCaptcha(req.body.captchaToken))) {
-        return res.status(403).json({ error: "Captcha verification failed" });
-    }
     try {
         const lvn = sanitizeString(req.body.lvn || '');
         const code = sanitizeString(req.body.code || '');
@@ -2323,7 +1129,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
         const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
         const deviceFingerprint = crypto.createHash("sha256")
-            .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
+            .update(`${req.ip}|${ua}`)
             .digest("hex");
         const deviceRef = db.collection("device_tracking").doc(deviceFingerprint);
         const deviceSnap = await deviceRef.get();
@@ -2415,94 +1221,16 @@ app.post("/verify", loginLimiter, async (req, res) => {
     }
 });
 
-async function useNonce(nonce) {
-    const ref = db.collection("used_nonces").doc(nonce);
-
-    return db.runTransaction(async (tx) => {
-        const doc = await tx.get(ref);
-
-        if (doc.exists) {
-            return false;
-        }
-
-        tx.set(ref, {
-            usedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        return true;
-    });
-}
-
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
+    const hashedLVN = req.user.uid;
+    const grade = req.user.grade;
+    const { selections } = req.body;
+
+    if (!selections || typeof selections !== 'object') {
+        return res.status(400).json({ error: "Invalid ballot format." });
+    }
+
     try {
-        const hashedLVN = req.user.uid;
-        const grade = req.user.grade;
-
-        const { selections, timestamp, nonce } = req.body;
-
-        // ✅ BASIC VALIDATION
-        if (!selections || typeof selections !== "object") {
-            return res.status(400).json({ error: "Invalid ballot format." });
-        }
-
-        if (typeof timestamp !== "number") {
-            return res.status(400).json({ error: "Invalid timestamp" });
-        }
-
-        if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
-            return res.status(400).json({ error: "Invalid nonce" });
-        }
-
-        // ✅ TIMESTAMP CHECK (ANTI-REPLAY WINDOW)
-        const now = Date.now();
-        if (Math.abs(now - timestamp) > 60000) {
-            return res.status(400).json({ error: "Request expired" });
-        }
-
-        // ✅ REPLAY PROTECTION (ATOMIC NONCE)
-        const nonceRef = db.collection("used_nonces").doc(nonce);
-
-        const nonceUsed = await db.runTransaction(async (tx) => {
-            const doc = await tx.get(nonceRef);
-
-            if (doc.exists) return true;
-
-            tx.set(nonceRef, {
-                usedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            return false;
-        });
-
-        if (nonceUsed) {
-            await createAlert(
-                "tamper",
-                "critical",
-                "🚨 Replay Attack Detected",
-                "Duplicate vote request detected.",
-                { nonce }
-            );
-
-            return res.status(400).json({ error: "Duplicate request detected" });
-        }
-
-        // ✅ VALIDATE SELECTIONS (HASH → REAL ID)
-        let validatedSelections;
-        try {
-            validatedSelections = await validateSelections(selections);
-        } catch (e) {
-            await createAlert(
-                "tamper",
-                "critical",
-                "🚨 Tampered Vote Detected",
-                e.message,
-                { selections }
-            );
-
-            return res.status(400).json({ error: e.message });
-        }
-
-        // ✅ CHECK ELECTION STATUS
         const settings = await db.collection("settings").doc("electionStatus").get();
 
         if (!settings.exists || !settings.data().isLive) {
@@ -2513,7 +1241,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Voting period ended." });
         }
 
-        // ✅ CHECK VOTER
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
 
@@ -2528,8 +1255,128 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Already voted." });
         }
 
-        // ✅ HASH CHAIN + TRANSACTION
+        // 🔥 Ensure candidates are loaded
+        if (Object.keys(GlobalCache.candidates).length === 0) {
+            await refreshLocalCandidates();
+        }
+
+        // 🚨 CRITICAL FIX: Block voting if still empty
+        if (Object.keys(GlobalCache.candidates).length === 0) {
+            return res.status(500).json({
+                error: "Candidates not loaded. Please contact administrator."
+            });
+        }
+
+        // 🚨 OPTIONAL HARDENING: ensure no empty positions
+        for (const pos of Object.keys(GlobalCache.candidates)) {
+            if ((GlobalCache.candidates[pos] || []).length === 0) {
+                return res.status(500).json({
+                    error: `No candidates available for ${pos}. Voting cannot proceed.`
+                });
+            }
+        }
+
+        const validSelections = {};
+        const { allowedRep, isAllowed } = buildAllowedPositionsForGrade(grade);
+        const allowedPositions = Object.keys(GlobalCache.candidates).filter(isAllowed);
+        const repLabel = allowedRep
+            ? `Grade ${String(allowedRep).replace('rep', '')} Representative`
+            : "no grade-level representatives";
+
+        // 🔒 Prevent voting on restricted reps
+        for (const repId of MULTI_POSITIONS) {
+            if (!allowedRep || repId !== allowedRep) {
+                if (Object.prototype.hasOwnProperty.call(selections, repId)) {
+                    return res.status(403).json({
+                        error: `Not allowed: Your grade can only vote for ${repLabel}.`
+                    });
+                }
+            }
+        }
+
+        // 🔒 Validate selections strictly
+        for (const position of allowedPositions) {
+            let userSelection = selections[position];
+            const availableCandidates = GlobalCache.candidates[position] || [];
+            const availCount = availableCandidates.length;
+
+            if (availCount === 0) continue;
+
+            if (MULTI_POSITIONS.includes(position)) {
+                if (!Array.isArray(userSelection)) {
+                    userSelection = userSelection ? [userSelection] : [];
+                }
+
+                const uniqueSelections = new Set(userSelection);
+                if (uniqueSelections.size !== userSelection.length) {
+                    return res.status(400).json({
+                        error: `${position}: Duplicate selections are not allowed.`
+                    });
+                }
+
+                for (const selId of userSelection) {
+                    const exists = availableCandidates.some(
+                        c => String(c.id) === String(selId)
+                    );
+                    if (!exists) {
+                        return res.status(400).json({
+                            error: `Invalid candidate selected for ${position}.`
+                        });
+                    }
+                }
+
+                if (availCount >= 2 && userSelection.length !== 2) {
+                    return res.status(400).json({
+                        error: `${position}: You must select exactly 2 candidates.`
+                    });
+                }
+
+                if (availCount === 1 && userSelection.length !== 1) {
+                    return res.status(400).json({
+                        error: `${position}: You must select the candidate.`
+                    });
+                }
+
+                validSelections[position] = userSelection;
+            } else {
+                if (Array.isArray(userSelection)) {
+                    return res.status(400).json({
+                        error: `Multiple selections not allowed for ${position}.`
+                    });
+                }
+
+                if (!userSelection) {
+                    return res.status(400).json({
+                        error: `Missing selection for ${position}.`
+                    });
+                }
+
+                const exists = availableCandidates.some(
+                    c => String(c.id) === String(userSelection)
+                );
+
+                if (!exists) {
+                    return res.status(400).json({
+                        error: `Invalid candidate selected for ${position}.`
+                    });
+                }
+
+                validSelections[position] = String(userSelection);
+            }
+        }
+
+        if (Object.keys(validSelections).length === 0) {
+            return res.status(400).json({ error: "No valid selections provided." });
+        }
+
+        // 🔐 TRANSACTION (unchanged, already solid)
         const voteResult = await db.runTransaction(async (t) => {
+            const settingsRef = db.collection("settings").doc("electionStatus");
+            const settingsSnap = await t.get(settingsRef);
+
+            if (!settingsSnap.exists || !settingsSnap.data().isLive) {
+                throw new Error("PAUSED");
+            }
 
             const voterDoc = await t.get(voterRef);
 
@@ -2546,11 +1393,12 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 : latestVoteQuery.docs[0].data().hash;
 
             const randomSalt = crypto.randomBytes(32).toString('hex');
+            const timestampMs = Date.now();
 
             const payload = JSON.stringify({
                 voter_hash: hashedLVN,
-                selections: validatedSelections,
-                timestamp: Date.now()
+                selected_candidates: validSelections,
+                timestamp: timestampMs
             });
 
             const receipt = crypto.createHash("sha256")
@@ -2564,7 +1412,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             const voteRef = db.collection("votes").doc();
 
             t.set(voteRef, {
-                selections: validatedSelections,
+                selections: validSelections,
                 grade: String(grade),
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 receipt,
@@ -2582,22 +1430,17 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return { receipt, currentHash, prevHash };
         });
 
-        // ✅ LOG SUCCESS
         await logSuccessEvent("VOTE_CAST", req, {
             receipt: voteResult.receipt.substring(0, 16) + '...',
             grade
         });
 
-        // ✅ RESPONSE
         res.json({
             success: true,
             receipt: voteResult.receipt,
             hash: voteResult.currentHash,
             prevHash: voteResult.prevHash
         });
-
-        // ✅ ANOMALY DETECTION (FIXED VARIABLE)
-        await detectVotingAnomalies(req, hashedLVN);
 
     } catch (e) {
         if (e.message === "ALREADY_VOTED") {
@@ -2606,9 +1449,9 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             });
         }
 
-        if (e.message === "VOTER_NOT_FOUND") {
+        if (e.message === "PAUSED") {
             return res.status(403).json({
-                error: "Voter not found."
+                error: "The election is currently paused by the administrator."
             });
         }
 
@@ -2831,8 +1674,6 @@ app.post("/admin/voters/delete", async (req, res) => {
         await voterRef.delete();
         await logAdminAction(req, "VOTER_DELETE", { lvn: "***" });
         await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "hard" });
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Delete failed" });
@@ -2887,9 +1728,6 @@ app.post("/admin/settings/session", async (req, res) => {
             voterTime: voterTime !== undefined ? voterTime : null,
         });
         await logSuccessEvent("ADMIN_SET_SESSION", req, { isLive: typeof isLive === 'boolean' ? isLive : null, activeGrade: activeGrade !== undefined ? activeGrade : null });
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
         res.json({ success: true, isLive, activeGrade });
     } catch (e) {
         res.status(500).json({ error: "Failed to update election status" });
@@ -2916,35 +1754,18 @@ app.post("/admin/purge", async (req, res) => {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
-
-        await alertManager.createAlert(
-            'backup',
-            'minor',
-            '💾 Archived Created',
-            'Election backup saved. Click the archive link below to view all archived election results.',
-            {
-                archiveUrl: url
-            },
+        await createAlert(
+            "backup",
+            "minor",
+            "💾 Backup Created",
+            "Election backup saved. Click the archive link below to view all archived election results.",
+            { url },
             24 * 60 * 60 * 1000
         );
-
         if (!hash || !url) {
             throw new Error("Backup failed. Purge aborted.");
         }
-
         await purgeElectionData();
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
-
-        await alertManager.createAlert(
-            'election_deleted',
-            'major',
-            'Election Data Deleted',
-            'All election data has been cleared.',
-            {},
-            null
-        );
 
         await logSuccessEvent("ADMIN_PURGE_DATA", req, {
             success: true,
@@ -2977,9 +1798,6 @@ app.post("/admin/restore", async (req, res) => {
         const jsonData = JSON.stringify(response.data);
 
         const result = await restoreElectionFromBackup(jsonData);
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
 
         res.json({
             success: true,
@@ -3006,7 +1824,7 @@ app.post("/admin/retally", async (req, res) => {
         candidatesSnap.forEach(doc => {
             const options = doc.data().options || [];
             options.forEach(c => {
-                newResults[String(c.hash)] = { votes: 0 };
+                newResults[String(c.id)] = { votes: 0 };
             });
         });
         let validVotesCount = 0;
@@ -3046,19 +1864,10 @@ app.post("/admin/retally", async (req, res) => {
         await refreshLocalResults();
         await logSuccessEvent("ADMIN_RETALLY", req, { validVotes: validVotesCount, orphanedVotes: orphanedVotesCount });
         res.json({ success: true, message: `Re-tally complete. Database updated. Valid Votes: ${validVotesCount}, Invalid Votes: ${orphanedVotesCount}.` });
-        await alertManager.clearResolvedAlerts('invalid_votes');
-        await alertManager.clearResolvedAlerts('vote_integrity');
-        await alertManager.clearResolvedAlerts('hash_chain');
     } catch (e) {
         res.status(500).json({ error: "Re-tally failed." });
     }
 });
-
-const result = await alertManager.detectVoteIntegrity();
-
-if (result.chainValid && result.orphanedCount === 0) {
-    await alertManager.clearResolvedAlerts('invalid_votes');
-}
 
 app.post("/admin/publish/candidates", async (req, res) => {
     try {
@@ -3073,20 +1882,7 @@ app.post("/admin/publish/candidates", async (req, res) => {
             GlobalCache.timestamps.candidates = new Date().toISOString();
             await logAdminAction(req, "PUBLISH_CANDIDATES", { success: true });
             await logSuccessEvent("ADMIN_PUBLISH_CANDIDATES", req, { success: true });
-            await alertManager.createAlert(
-                'candidate_sync',
-                'minor',
-                'Candidates Published',
-                'Candidates successfully synced.',
-                {},
-                10 * 60 * 1000
-            );
-
-            await alertManager.detectCandidatesStatus();
-            await alertManager.detectVoteIntegrity();
-            await alertManager.detectSystemHealth();
             res.json({ success: true, message: "Candidates published successfully." });
-            await alertManager.clearResolvedAlerts('candidate_sync');
         } else {
             throw new Error("No data returned from source collections.");
         }
@@ -3118,7 +1914,7 @@ app.post("/admin/add-party", async (req, res) => {
     const rawCandidates = req.body.candidates || [];
     const candidates = rawCandidates.map(c => ({
         position: sanitizeString(c.position || ''),
-        id: sanitizeString(c.hash || ''),
+        id: sanitizeString(c.id || ''),
         name: sanitizeString(c.name || ''),
         party: sanitizeString(c.party || ''),
         img: c.img || "none"
@@ -3141,7 +1937,7 @@ app.post("/admin/add-party", async (req, res) => {
                 list.forEach(c => {
                     const name = c && c.name ? String(c.name).toUpperCase().trim() : "";
                     const party = c && c.party ? String(c.party).toUpperCase().trim() : "";
-                    const id = c && c.hash ? String(c.hash) : "";
+                    const id = c && c.id ? String(c.id) : "";
                     if (name) globalNames.add(name);
                     if (party) partyCounts[posId][party] = (partyCounts[posId][party] || 0) + 1;
                     if (id) idByPosition[posId].add(id);
@@ -3149,9 +1945,9 @@ app.post("/admin/add-party", async (req, res) => {
             });
             const groupedData = {};
             for (const c of candidates) {
-                if (!c || !c.position || !c.hash || !c.name) continue;
+                if (!c || !c.position || !c.id || !c.name) continue;
                 const pos = String(c.position).trim();
-                const idStr = String(c.hash).trim();
+                const idStr = String(c.id).trim();
                 const nameUpper = String(c.name).toUpperCase().trim();
                 const partyUpper = String(c.party || "").toUpperCase().trim();
                 if (!ALL_POSITIONS.includes(pos)) throw new Error(`Invalid position '${pos}'.`);
@@ -3191,8 +1987,6 @@ app.post("/admin/add-party", async (req, res) => {
             {},
             24 * 60 * 60 * 1000
         );
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -3218,8 +2012,6 @@ app.post("/admin/delete", async (req, res) => {
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_PARTY", { partyName });
             await logSuccessEvent("ADMIN_DELETE_PARTY", req, { partyName });
-            await alertManager.detectCandidatesStatus();
-            await alertManager.detectVoteIntegrity();
             return res.json({ success: true });
         }
         if (position && candidateId) {
@@ -3228,7 +2020,7 @@ app.post("/admin/delete", async (req, res) => {
                 const s = await t.get(docRef);
                 if (!s.exists) throw new Error("No doc");
                 const opts = s.data().options || [];
-                const newOpts = opts.filter(c => String(c.hash) !== String(candidateId));
+                const newOpts = opts.filter(c => String(c.id) !== String(candidateId));
                 t.update(docRef, { options: newOpts });
             });
             await refreshLocalCandidates();
@@ -3236,9 +2028,6 @@ app.post("/admin/delete", async (req, res) => {
             await logSuccessEvent("ADMIN_DELETE_CANDIDATE", req, { position, candidateId });
             return res.json({ success: true });
         }
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
-        await alertManager.detectSystemHealth();
         res.status(400).json({ error: "Bad Params" });
     } catch (e) {
         res.status(500).json({ error: e.message });
