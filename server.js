@@ -73,6 +73,54 @@ app.use((req, res, next) => {
 const db = admin.firestore();
 
 // GLOBAL VARIABLES
+const MAX_ATTEMPTS = 3;
+const LOCK_TIME = 30 * 1000; // 30 sec
+
+async function checkLoginAttempts(deviceId) {
+    const ref = db.collection("login_attempts").doc(deviceId);
+    const snap = await ref.get();
+
+    if (!snap.exists) return { allowed: true };
+
+    const data = snap.data();
+
+    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
+        return {
+            allowed: false,
+            message: "Too many attempts. Try again in 30 seconds."
+        };
+    }
+
+    return { allowed: true, attempts: data.attempts || 0 };
+}
+
+async function recordLoginAttempt(deviceId, success) {
+    const ref = db.collection("login_attempts").doc(deviceId);
+    const snap = await ref.get();
+
+    if (success) {
+        await ref.delete();
+        return;
+    }
+
+    let attempts = 1;
+
+    if (snap.exists) {
+        attempts = (snap.data().attempts || 0) + 1;
+    }
+
+    const data = {
+        attempts,
+        lastAttempt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (attempts >= MAX_ATTEMPTS) {
+        data.lockUntil = admin.firestore.Timestamp.fromMillis(Date.now() + LOCK_TIME);
+    }
+
+    await ref.set(data, { merge: true });
+}
+
 async function validateSelections(selections) {
     const snapshot = await db.collection("candidates").get();
     const validated = {};
@@ -618,6 +666,7 @@ class AlertManager {
             this.activeAlerts.delete(alertId);
 
             console.log(`[ALERT] Dismissed: ${alertId} by ${adminId}`);
+            this.activeTypes.delete(alertData.type);
             return { success: true };
         } catch (e) {
             console.error("[ALERT ERROR] Failed to dismiss alert:", e);
@@ -683,10 +732,18 @@ class AlertManager {
             snapshot.forEach(doc => {
                 const data = doc.data();
 
-                if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
-                    this.expireAlert(doc.id);
-                    return;
-                }
+                setInterval(async () => {
+                    const snapshot = await db.collection("system_alerts")
+                        .where("active", "==", true)
+                        .get();
+
+                    snapshot.forEach(async (doc) => {
+                        const data = doc.data();
+                        if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
+                            await alertManager.expireAlert(doc.id);
+                        }
+                    });
+                }, 30000);
 
                 alerts.push({ id: doc.id, ...data });
             });
@@ -1993,6 +2050,17 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         return res.status(403).end();
     }
 
+    if (!captchaToken) {
+        return res.status(400).json({
+            error: "Complete Captcha Verification First"
+        });
+    }
+
+    const check = await checkLoginAttempts(deviceId);
+    if (!check.allowed) {
+        return res.status(429).json({ error: check.message });
+    }
+
     if (!(await verifyCaptcha(captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
     }
@@ -2022,6 +2090,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
             username: username ? "***" : null
         });
+        await recordLoginAttempt(deviceId, isValidPassword);
 
         return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -2043,6 +2112,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     });
 
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
+    await recordLoginAttempt(deviceId, isValidPassword);
 
     res.json({ success: true });
 });
@@ -2852,7 +2922,9 @@ app.post("/admin/purge", async (req, res) => {
             'minor',
             '💾 Archived Created',
             'Election backup saved. Click the archive link below to view all archived election results.',
-            {},
+            {
+                archiveUrl: url
+            },
             24 * 60 * 60 * 1000
         );
 
@@ -2974,10 +3046,19 @@ app.post("/admin/retally", async (req, res) => {
         await refreshLocalResults();
         await logSuccessEvent("ADMIN_RETALLY", req, { validVotes: validVotesCount, orphanedVotes: orphanedVotesCount });
         res.json({ success: true, message: `Re-tally complete. Database updated. Valid Votes: ${validVotesCount}, Invalid Votes: ${orphanedVotesCount}.` });
+        await alertManager.clearResolvedAlerts('invalid_votes');
+        await alertManager.clearResolvedAlerts('vote_integrity');
+        await alertManager.clearResolvedAlerts('hash_chain');
     } catch (e) {
         res.status(500).json({ error: "Re-tally failed." });
     }
 });
+
+const result = await alertManager.detectVoteIntegrity();
+
+if (result.chainValid && result.orphanedCount === 0) {
+    await alertManager.clearResolvedAlerts('invalid_votes');
+}
 
 app.post("/admin/publish/candidates", async (req, res) => {
     try {
@@ -3005,6 +3086,7 @@ app.post("/admin/publish/candidates", async (req, res) => {
             await alertManager.detectVoteIntegrity();
             await alertManager.detectSystemHealth();
             res.json({ success: true, message: "Candidates published successfully." });
+            await alertManager.clearResolvedAlerts('candidate_sync');
         } else {
             throw new Error("No data returned from source collections.");
         }
