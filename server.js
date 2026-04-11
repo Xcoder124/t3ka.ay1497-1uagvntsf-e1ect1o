@@ -2090,7 +2090,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
             username: username ? "***" : null
         });
-        await recordLoginAttempt(deviceId, isValidPassword);
+        await recordLoginAttempt(deviceId, isValidPass);
 
         return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -2112,7 +2112,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     });
 
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
-    await recordLoginAttempt(deviceId, isValidPassword);
+    await recordLoginAttempt(deviceId, isValidPass);
 
     res.json({ success: true });
 });
