@@ -3054,11 +3054,12 @@ app.post("/admin/retally", async (req, res) => {
     }
 });
 
-const result = await alertManager.detectVoteIntegrity();
-
-if (result.chainValid && result.orphanedCount === 0) {
-    await alertManager.clearResolvedAlerts('invalid_votes');
-}
+(async () => {
+    const result = await alertManager.detectVoteIntegrity();
+    if (result.chainValid && result.orphanedCount === 0) {
+        await alertManager.clearResolvedAlerts('invalid_votes');
+    }
+})();
 
 app.post("/admin/publish/candidates", async (req, res) => {
     try {
