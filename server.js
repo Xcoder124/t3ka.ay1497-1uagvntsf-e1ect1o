@@ -15,6 +15,11 @@ if (!VOTE_SIGN_SECRET) {
     throw new Error("VOTE_SIGN_SECRET is required");
 }
 
+const BACKUP_SECRET = process.env.BACKUP_SECRET;
+if (!BACKUP_SECRET) {
+    throw new Error("BACKUP_SECRET is required");
+}
+
 const axios = require("axios");
 const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
@@ -62,11 +67,10 @@ let activeUsers = 0;
 
 app.use((req, res, next) => {
     activeUsers++;
-
-    res.on("finish", () => {
-        activeUsers--;
-    });
-
+    const decrement = () => { activeUsers = Math.max(0, activeUsers - 1); };
+    res.on("finish", decrement);
+    res.on("close", decrement);
+    res.on("error", decrement);
     next();
 });
 
@@ -209,6 +213,19 @@ async function markNonceUsed(nonce) {
     });
 }
 
+setInterval(async () => {
+    try {
+        const now = Date.now();
+        const snapshot = await db.collection("system_alerts").where("active", "==", true).get();
+        snapshot.forEach(async (doc) => {
+            const data = doc.data();
+            if (data.expiresAt && data.expiresAt.toMillis() < now) {
+                await alertManager.expireAlert(doc.id);
+            }
+        });
+    } catch (e) { console.error("Expiry check error:", e); }
+}, 30000);
+
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
 
@@ -221,9 +238,9 @@ async function createElectionBackup(db) {
     const backup = {
         timestamp: new Date().toISOString(),
         totalVotes: votesSnap.size,
-        votes: votesSnap.docs.map(d => d.data()),
-        voters: votersSnap.docs.map(d => d.data()),
-        candidates: candidatesSnap.docs.map(d => d.data())
+        votes: votesSnap.docs.map(d => ({ _docId: d.id, ...d.data() })),
+        voters: votersSnap.docs.map(d => ({ _docId: d.id, ...d.data() })),  // ← include doc ID
+        candidates: candidatesSnap.docs.map(d => ({ _docId: d.id, ...d.data() }))
     };
 
     const raw = JSON.stringify(backup, null, 2);
@@ -276,30 +293,57 @@ async function uploadToGitHub(json, hash) {
     }
 }
 
-async function restoreElectionFromBackup(jsonData) {
-    const data = JSON.parse(jsonData);
-
-    const batch = db.batch();
-
-    // Restore voters
-    for (const v of data.voters || []) {
-        const ref = db.collection("voters").doc(hashLVN(v.lvn));
-        batch.set(ref, v);
+async function restoreElectionFromBackup(jsonData, providedHash) {
+    const actualHash = crypto.createHash("sha256").update(jsonData).digest("hex");
+    if (!crypto.timingSafeEqual(Buffer.from(actualHash), Buffer.from(providedHash))) {
+        throw new Error("BACKUP_INTEGRITY_FAIL: Hash mismatch. Restore aborted.");
     }
 
-    // Restore candidates
-    for (const c of data.candidates || []) {
-        const ref = db.collection("candidates").doc(c.position);
-        batch.set(ref, { options: c.options || [] });
+    const key = crypto.createHash("sha256").update(process.env.BACKUP_SECRET).digest();
+    const [ivHex, encrypted] = jsonData.split(":");
+    const iv = Buffer.from(ivHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+    let decrypted = decipher.update(encrypted, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    const data = JSON.parse(decrypted);
+
+    // Helper: commit in chunks of 499
+    async function commitInChunks(operations) {
+        const CHUNK_SIZE = 499;
+        for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
+            const chunk = operations.slice(i, i + CHUNK_SIZE);
+            const batch = db.batch();
+            chunk.forEach(({ ref, doc }) => batch.set(ref, doc));
+            await batch.commit();
+        }
     }
 
-    // Restore votes
-    for (const vote of data.votes || []) {
-        const ref = db.collection("votes").doc();
-        batch.set(ref, vote);
-    }
+    await deleteCollectionInBatches(db.collection("votes"), 400);
+    await deleteCollectionInBatches(db.collection("voters"), 400);
+    await deleteCollectionInBatches(db.collection("candidates"), 400);
 
-    await batch.commit();
+
+    await db.collection("_meta").doc("chain_head").delete();
+
+    const voterOps = (data.voters || []).map(v => {
+        const docId = v._docId;                      // ← store _docId in backup
+        if (!docId) throw new Error("Voter backup is missing document ID. Restore aborted.");
+        return { ref: db.collection("voters").doc(docId), doc: v };
+    });
+
+
+    const candidateOps = (data.candidates || []).map(c => ({
+        ref: db.collection("candidates").doc(c.position),
+        doc: { options: c.options || [] }
+    }));
+    const voteOps = (data.votes || []).map(vote => ({
+        ref: db.collection("votes").doc(),
+        doc: vote
+    }));
+
+    await commitInChunks(voterOps);
+    await commitInChunks(candidateOps);
+    await commitInChunks(voteOps);
 
     return {
         voters: data.voters?.length || 0,
@@ -731,20 +775,6 @@ class AlertManager {
             }
             snapshot.forEach(doc => {
                 const data = doc.data();
-
-                setInterval(async () => {
-                    const snapshot = await db.collection("system_alerts")
-                        .where("active", "==", true)
-                        .get();
-
-                    snapshot.forEach(async (doc) => {
-                        const data = doc.data();
-                        if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
-                            await alertManager.expireAlert(doc.id);
-                        }
-                    });
-                }, 30000);
-
                 alerts.push({ id: doc.id, ...data });
             });
 
@@ -1116,11 +1146,6 @@ setTimeout(async () => {
     await alertManager.detectVoteIntegrity();
 }, 5000);
 
-app.get("/debug/set-users/:num", (req, res) => {
-    activeUsers = parseInt(req.params.num) || 0;
-    res.json({ activeUsers });
-});
-
 // --- SECURITY: JWT SECRET ---
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) {
@@ -1330,8 +1355,13 @@ async function clearVoterBruteForce(hashedLVN) {
 }
 
 // --- SECURITY: HASH FUNCTION FOR LVN ENCRYPTION ---
+const LVN_SECRET = process.env.LVN_SECRET;
+if (!LVN_SECRET) throw new Error("LVN_SECRET environment variable is required");
+
 function hashLVN(lvn) {
-    return crypto.createHash("sha256").update(String(lvn)).digest("hex");
+    return crypto.createHmac("sha256", LVN_SECRET)
+        .update(String(lvn).trim().toUpperCase())
+        .digest("hex");
 }
 
 // --- GRADE-LEVEL REP VOTING RULE ---
@@ -1373,6 +1403,18 @@ app.use(express.json({ limit: '110kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+const allowedOrigins = process.env.NODE_ENV === 'production'
+    ? [
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app"
+    ]
+    : [
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app"
+    ];
+
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
@@ -1382,19 +1424,6 @@ app.use(cors({
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
     exposedHeaders: ["set-cookie"]
-}));
-app.options('*', cors());
-
-// Single helmet() call with all security headers
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-            "script-src": ["'self'", "'unsafe-inline'", "https://challenges.cloudflare.com"],
-            "frame-src": ["'self'", "https://challenges.cloudflare.com"],
-        },
-    },
-    crossOriginEmbedderPolicy: false, // Allows the Turnstile iframe to load properly
 }));
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
@@ -1415,19 +1444,6 @@ app.use((req, res, next) => {
         },
     })(req, res, next);
 });
-
-// REMOVE THESE DUPLICATE CALLS (they were causing issues):
-// app.use(helmet.referrerPolicy({ policy: 'no-referrer' }));
-// app.use(helmet.crossOriginOpenerPolicy({ policy: 'same-origin' }));
-// app.use(helmet.hsts({...}));
-
-const allowedOrigins = [
-    "http://127.0.0.1:5500",
-    "http://localhost:3000",
-    "https://tsf-sslg-election-endpoint.onrender.com",
-    "https://tsf-g-digital-election.web.app",
-    "https://tanauanschooloffisheries.web.app"
-];
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
@@ -1550,6 +1566,46 @@ async function checkAbuse(ip) {
     }
 }
 
+async function getLatestAuditHash() {
+    const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
+    const doc = await AUDIT_CHAIN_DOC.get();
+    return doc.exists ? doc.data().hash : "GENESIS";
+}
+
+async function logImmutableAction(action, data, user) {
+    await db.runTransaction(async (t) => {
+        const chainDoc = await t.get(AUDIT_CHAIN_DOC);
+        const previousHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+
+        const logEntry = {
+            action,
+            data,
+            user: {
+                id: user?.uid || null,
+                email: user?.email || null
+            },
+            timestamp: Date.now(),
+            previousHash
+        };
+
+        const hash = crypto.createHash("sha256")
+            .update(JSON.stringify(logEntry))
+            .digest("hex");
+
+        logEntry.hash = hash;
+
+        const logRef = db.collection("audit_trail").doc();
+
+        t.set(logRef, logEntry);
+
+        // 🔗 update chain head
+        t.set(AUDIT_CHAIN_DOC, {
+            hash,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    });
+}
+
 async function logAdminAction(req, action, meta = {}) {
     try {
         const u = req.user || {};
@@ -1566,6 +1622,63 @@ async function logAdminAction(req, action, meta = {}) {
         });
     } catch (e) { }
 }
+
+app.get("/verify-audit-chain", async (req, res) => {
+    const logs = await db.collection("audit_trail")
+        .orderBy("timestamp")
+        .get();
+
+    let prevHash = "GENESIS";
+
+    for (const doc of logs.docs) {
+        const entry = doc.data();
+
+        const recalculated = crypto.createHash("sha256")
+            .update(JSON.stringify({
+                action: entry.action,
+                data: entry.data,
+                user: entry.user,
+                timestamp: entry.timestamp,
+                previousHash: prevHash
+            }))
+            .digest("hex");
+
+        if (recalculated !== entry.hash) {
+            return res.json({ valid: false });
+        }
+
+        prevHash = entry.hash;
+    }
+
+    res.json({ valid: true });
+});
+
+// 1. Log every admin data mutation with before/after state
+async function logDataMutation(req, collection, docId, before, after) {
+    await db.collection("admin_audit").add({
+        action: "DATA_MUTATION",
+        collection, docId,
+        before: JSON.stringify(before),   // snapshot before change
+        after: JSON.stringify(after),
+        adminEmail: req.user?.email,
+        ip: req.ip,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+}
+
+// 2. Periodic audit: vote count must equal voter.hasVoted count
+setInterval(async () => {
+    const [voteSnap, voterSnap] = await Promise.all([
+        db.collection("votes").count().get(),
+        db.collection("voters").where("hasVoted", "==", true).count().get()
+    ]);
+    const votes = voteSnap.data().count;
+    const voters = voterSnap.data().count;
+    if (votes !== voters) {
+        await createAlert("vote_integrity", "critical",
+            "Count mismatch", `votes=${votes} vs hasVoted=${voters}`);
+    }
+}, 60000);
 
 // --- CANDIDATE & RESULTS FUNCTIONS ---
 async function getOrGenerateCode(type, key) {
@@ -1713,48 +1826,82 @@ async function refreshLocalResults() {
     }
 }
 
-function generateSubmitToken() {
-    const payload = `submitreview:${Math.floor(Date.now() / (10 * 60 * 1000))}`;
-    return crypto.createHmac("sha256", SECRET).update(payload).digest("hex");
+function generateSubmitToken(jti) {
+    if (!jti) throw new Error("jti required for submit token");
+    const window = Math.floor(Date.now() / (10 * 60 * 1000));
+    return crypto.createHmac("sha256", SECRET).update(`${jti}:${window}`).digest("hex");
 }
 
-function verifySubmitToken(token) {
-    if (!token) return false;
+app.get("/voter/submit-token", requireAuth, requireRole("voter"), (req, res) => {
+    res.json({ submitToken: generateSubmitToken(req.user.jti) });
+});
+
+function verifySubmitToken(token, jti) {
+    if (!token || !jti) return false;
     const now = Math.floor(Date.now() / (10 * 60 * 1000));
-    const payloadCurrent = `submitreview:${now}`;
-    const payloadPrev = `submitreview:${now - 1}`;
-    const expected1 = crypto.createHmac("sha256", SECRET).update(payloadCurrent).digest("hex");
-    const expected2 = crypto.createHmac("sha256", SECRET).update(payloadPrev).digest("hex");
-    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected1)) ||
-        crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected2));
+    // Check current window and previous (handles clock edge cases)
+    for (const w of [now, now - 1]) {
+        const expected = crypto.createHmac("sha256", SECRET)
+            .update(`${jti}:${w}`)
+            .digest("hex");
+        try {
+            if (Buffer.from(token).length === Buffer.from(expected).length &&
+                crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected))) {
+                return true;
+            }
+        } catch { }
+    }
+    return false;
 }
 
 // --- AUTH MIDDLEWARE ---
 function verifyCSRF(req, res, next) {
-    const csrfHeader = req.headers["x-csrf-token"] || req.headers["X-CSRF-Token"];
+    const csrfHeader = req.headers["x-csrf-token"];
+    if (!csrfHeader || !req.user?.csrfToken) return res.status(403).json({ error: "Missing CSRF token" });
 
-    if (!csrfHeader) {
-        return res.status(403).json({ error: "Missing CSRF token" });
-    }
-
-    if (!req.user || csrfHeader !== req.user.csrfToken) {
+    try {
+        const a = Buffer.from(csrfHeader);
+        const b = Buffer.from(req.user.csrfToken);
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+            return res.status(403).json({ error: "Invalid CSRF token" });
+        }
+    } catch {
         return res.status(403).json({ error: "Invalid CSRF token" });
     }
-
     next();
 }
 
-function requireAuth(req, res, next) {
+async function revokeJti(jti) {
+    if (!jti) return;
+    await db.collection("revoked_jtis").doc(jti).set({
+        revokedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+}
+
+async function isJtiRevoked(jti) {
+    if (!jti) return false;
+    const doc = await db.collection("revoked_jtis").doc(jti).get();
+    return doc.exists;
+}
+
+// Make requireAuth async and use await properly:
+async function requireAuth(req, res, next) {
     try {
         let token = req.cookies.__session;
-        if (!token && req.headers.authorization?.startsWith("Bearer ")) {
+        if (!token && req.headers.authorization?.startsWith("Bearer "))
             token = req.headers.authorization.split(" ")[1];
-        }
         if (!token) return res.status(401).end();
+
         const decoded = jwt.verify(token, SECRET);
+        if (!decoded.jti) {
+            return res.status(401).json({ error: "Invalid token structure." });
+        }
+        const revoked = await isJtiRevoked(decoded.jti);
+        if (revoked) return res.status(401).json({ error: "Session revoked." });
+
         req.user = decoded;
         next();
-    } catch {
+    } catch (err) {
         return res.status(401).end();
     }
 }
@@ -1791,7 +1938,7 @@ const verifySecureSession = (req, res, next) => {
     jwt.verify(token, SECRET, (err, user) => {
         if (err) {
             logSecurityEvent("INVALID_TOKEN", req, { reason: err.message });
-            return res.status(403).json({ error: "Session expired." });
+            return res.status(403).json({ error: "Your session is invalid or expired. Please log in again." });
         }
         req.user = user;
         next();
@@ -1806,7 +1953,8 @@ async function verifyFirebaseAdmin(req, res, next) {
     const token = authHeader.split(" ")[1];
     try {
         const decodedToken = await admin.auth().verifyIdToken(token);
-        const allowedAdminEmail = process.env.ADMIN_EMAIL || "admin@tanauanschooloffisheries.web.app";
+        const allowedAdminEmail = process.env.ADMIN_EMAIL;
+        if (!allowedAdminEmail) throw new Error("ADMIN_EMAIL environment variable is required");
         if (decodedToken.email !== allowedAdminEmail) {
             logSecurityEvent("UNAUTHORIZED_ADMIN", req, { email: decodedToken.email });
             return res.status(403).json({ error: "Unauthorized: Email not recognized as admin" });
@@ -1875,7 +2023,7 @@ app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => 
     }
 });
 
-app.get("/admin/test-alert", async (req, res) => {
+app.get("/admin/test-alert", requireAuth, requireRole("admin"), async (req, res) => {
     await alertManager.createAlert(
         'api_error',
         'major',
@@ -2097,9 +2245,11 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
 
     await clearBruteForce(deviceId);
 
+    const adminJti = crypto.randomBytes(16).toString("hex");
     const token = jwt.sign({
-        uid: "admin",
+        uid: process.env.ADMIN_USER,
         role: "admin",
+        jti: adminJti,
         iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "1h" });
 
@@ -2117,15 +2267,25 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     res.json({ success: true });
 });
 
-app.post("/admin/logout", (req, res) => {
-    res.clearCookie("__session", {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        path: "/"
-    });
+app.post("/admin/logout", async (req, res) => {
+    try {
+        if (req.user?.jti) {
+            await revokeJti(req.user.jti);
+        }
 
-    res.json({ success: true });
+        res.clearCookie("__session", {
+            httpOnly: true,
+            secure: true,
+            sameSite: "none",
+            path: "/"
+        });
+
+        res.json({ success: true });
+
+    } catch (err) {
+        console.error("Logout error:", err);
+        res.status(500).json({ error: "Logout failed" });
+    }
 });
 
 app.get("/admin/verify", requireAuth, requireRole("admin"), (req, res) => {
@@ -2140,7 +2300,7 @@ app.get("/settings", async (req, res) => {
         const isLive = statusDoc.exists ? statusDoc.data().isLive : false;
         const statusData = statusDoc.exists ? statusDoc.data() : {};
         const config = doc.exists ? doc.data() : { voterTimeoutMinutes: 60 };
-        res.json({ ...config, ...statusData, isLive, submitToken: generateSubmitToken() });
+        res.json({ ...config, ...statusData, isLive });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -2318,6 +2478,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const code = sanitizeString(req.body.code || '');
         if (!lvn || !code) return res.status(400).json({ error: "Missing credentials." });
         const hashedLVN = hashLVN(lvn);
+
         if (await isVoterLocked(hashedLVN)) {
             return res.status(403).json({ error: "Account temporarily locked due to multiple failed attempts. Please try again later." });
         }
@@ -2340,17 +2501,15 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const voterSnap = await voterRef.get();
         if (!voterSnap.exists) {
             await recordVoterFailedAttempt(hashedLVN);
-            await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid LVN" });
-            await checkAbuse(req.ip);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
         const d = voterSnap.data();
         const inputCode = code.toUpperCase();
-        const storedCode = String(d.code || "").toUpperCase().trim();
-        if (storedCode !== inputCode) {
+
+        const isCodeValid = await bcrypt.compare(inputCode, d.code);
+        if (!isCodeValid) {
             await recordVoterFailedAttempt(hashedLVN);
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
-            await checkAbuse(req.ip);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
         if (d.isMissed === true) {
@@ -2397,11 +2556,8 @@ app.post("/verify", loginLimiter, async (req, res) => {
         });
         await clearVoterBruteForce(hashedLVN);
         const csrfToken = crypto.randomBytes(32).toString('hex');
-        const sessionToken = jwt.sign(
-            { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, iat: Math.floor(Date.now() / 1000) },
-            SECRET,
-            { expiresIn: "60m" }
-        );
+        const jti = crypto.randomBytes(16).toString("hex");
+        const sessionToken = jwt.sign({ uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, jti }, SECRET, { expiresIn: "60m" });
         res.cookie("__session", sessionToken, {
             httpOnly: true,
             secure: true,
@@ -2433,14 +2589,98 @@ async function useNonce(nonce) {
     });
 }
 
+function stableStringify(obj) {
+    return JSON.stringify(Object.keys(obj).sort().reduce((acc, key) => {
+        acc[key] = obj[key];
+        return acc;
+    }, {}));
+}
+
+app.post('/authenticate', async (req, res) => {
+    const { lvn, turnstileToken } = req.body;
+
+    try {
+        const voterHash = hashLVN(lvn);
+
+        const sessionToken = jwt.sign(
+            {
+                voterHash,
+                nonce: crypto.randomBytes(16).toString('hex')
+            },
+            SECRET,
+            { expiresIn: '30m' }
+        );
+
+        await db.collection('active_sessions').doc(sessionToken).set({
+            voterHash,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+            hasVoted: false,
+
+            ip: req.ip,
+            userAgent: req.headers["user-agent"] || null
+        });
+
+        res.json({ sessionToken, voterData });
+
+    } catch (e) {
+        console.error("Auth error:", e);
+        res.status(500).json({ error: "Authentication failed" });
+    }
+});
+
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
     try {
         const hashedLVN = req.user.uid;
         const grade = req.user.grade;
 
         const { selections, timestamp, nonce } = req.body;
+        const sessionToken = req.headers.authorization?.split(' ')[1];
 
-        // ✅ BASIC VALIDATION
+        if (!sessionToken) {
+            return res.status(403).json({ error: "Missing session token" });
+        }
+
+        // 🔐 VERIFY JWT
+        let decoded;
+        try {
+            decoded = jwt.verify(sessionToken, SECRET);
+        } catch {
+            return res.status(403).json({ error: "Invalid token" });
+        }
+
+        // 🔍 FETCH SESSION
+        const sessionDoc = await db.collection('active_sessions').doc(sessionToken).get();
+
+        if (!sessionDoc.exists) {
+            return res.status(403).json({ error: "Session not found" });
+        }
+
+        const sessionData = sessionDoc.data();
+
+        // ⏳ EXPIRATION CHECK
+        if (new Date() > sessionData.expiresAt.toDate()) {
+            return res.status(403).json({ error: "Session expired" });
+        }
+
+        // 🔐 SESSION BINDING CHECK
+        if (
+            sessionData.ip !== req.ip ||
+            sessionData.userAgent !== req.headers["user-agent"]
+        ) {
+            return res.status(403).json({ error: "Session mismatch" });
+        }
+
+        // 🔗 MATCH USER
+        if (sessionData.voterHash !== hashedLVN) {
+            return res.status(403).json({ error: "Session mismatch" });
+        }
+
+        // 🚫 ALREADY USED
+        if (sessionData.hasVoted) {
+            return res.status(403).json({ error: "Session already used" });
+        }
+
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
         }
@@ -2453,13 +2693,11 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: "Invalid nonce" });
         }
 
-        // ✅ TIMESTAMP CHECK (ANTI-REPLAY WINDOW)
         const now = Date.now();
         if (Math.abs(now - timestamp) > 60000) {
             return res.status(400).json({ error: "Request expired" });
         }
 
-        // ✅ REPLAY PROTECTION (ATOMIC NONCE)
         const nonceRef = db.collection("used_nonces").doc(nonce);
 
         const nonceUsed = await db.runTransaction(async (tx) => {
@@ -2475,34 +2713,18 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         });
 
         if (nonceUsed) {
-            await createAlert(
-                "tamper",
-                "critical",
-                "🚨 Replay Attack Detected",
-                "Duplicate vote request detected.",
-                { nonce }
-            );
-
+            await createAlert("tamper", "critical", "Replay Attack", "Duplicate vote", { nonce });
             return res.status(400).json({ error: "Duplicate request detected" });
         }
 
-        // ✅ VALIDATE SELECTIONS (HASH → REAL ID)
         let validatedSelections;
         try {
             validatedSelections = await validateSelections(selections);
         } catch (e) {
-            await createAlert(
-                "tamper",
-                "critical",
-                "🚨 Tampered Vote Detected",
-                e.message,
-                { selections }
-            );
-
+            await createAlert("tamper", "critical", "Tampered Vote", e.message, { selections });
             return res.status(400).json({ error: e.message });
         }
 
-        // ✅ CHECK ELECTION STATUS
         const settings = await db.collection("settings").doc("electionStatus").get();
 
         if (!settings.exists || !settings.data().isLive) {
@@ -2513,7 +2735,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Voting period ended." });
         }
 
-        // ✅ CHECK VOTER
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
 
@@ -2521,31 +2742,22 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Voter not found." });
         }
 
-        const voter = voterSnap.data();
-
-        if (voter.hasVoted) {
-            await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
+        if (voterSnap.data().hasVoted) {
             return res.status(403).json({ error: "Already voted." });
         }
 
-        // ✅ HASH CHAIN + TRANSACTION
+        const CHAIN_DOC = db.collection("_meta").doc("chain_head");
+
         const voteResult = await db.runTransaction(async (t) => {
-
             const voterDoc = await t.get(voterRef);
-
             if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
             if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
 
-            const latestVoteQuery = await db.collection("votes")
-                .orderBy("createdAt", "desc")
-                .limit(1)
-                .get();
+            const chainDoc = await t.get(CHAIN_DOC);
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
 
-            const prevHash = latestVoteQuery.empty
-                ? "GENESIS"
-                : latestVoteQuery.docs[0].data().hash;
-
-            const randomSalt = crypto.randomBytes(32).toString('hex');
+            const randomSalt = crypto.randomBytes(32).toString("hex");
 
             const payload = JSON.stringify({
                 voter_hash: hashedLVN,
@@ -2553,12 +2765,15 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 timestamp: Date.now()
             });
 
-            const receipt = crypto.createHash("sha256")
-                .update(payload + randomSalt)
-                .digest("hex");
+            const receipt = crypto.createHash("sha256").update(payload + randomSalt).digest("hex");
+
+            const verificationCode = crypto.createHash("sha256")
+                .update(receipt + stableStringify(validatedSelections))
+                .digest("hex")
+                .substring(0, 12);
 
             const currentHash = crypto.createHash("sha256")
-                .update(receipt + prevHash)
+                .update(receipt + prevHash + stableStringify(validatedSelections))
                 .digest("hex");
 
             const voteRef = db.collection("votes").doc();
@@ -2570,7 +2785,8 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 receipt,
                 hash: currentHash,
                 prevHash,
-                salt: randomSalt
+                salt: randomSalt,
+                sequence: prevCount + 1
             });
 
             t.update(voterRef, {
@@ -2579,51 +2795,75 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 receipt
             });
 
-            return { receipt, currentHash, prevHash };
+            t.set(CHAIN_DOC, { hash: currentHash, count: prevCount + 1 });
+
+            return { receipt, currentHash, prevHash, verificationCode };
         });
 
-        // ✅ LOG SUCCESS
-        await logSuccessEvent("VOTE_CAST", req, {
-            receipt: voteResult.receipt.substring(0, 16) + '...',
-            grade
-        });
-
-        // ✅ RESPONSE
         res.json({
             success: true,
             receipt: voteResult.receipt,
+            verificationCode: voteResult.verificationCode,
             hash: voteResult.currentHash,
             prevHash: voteResult.prevHash
         });
 
-        // ✅ ANOMALY DETECTION (FIXED VARIABLE)
-        await detectVotingAnomalies(req, hashedLVN);
+        await sessionDoc.ref.update({ hasVoted: true });
 
     } catch (e) {
-        if (e.message === "ALREADY_VOTED") {
-            return res.status(403).json({
-                error: "Our records show you have already cast your vote."
-            });
-        }
-
-        if (e.message === "VOTER_NOT_FOUND") {
-            return res.status(403).json({
-                error: "Voter not found."
-            });
-        }
-
         console.error("Vote error:", e);
-
         res.status(500).json({
             error: "System failed to record vote. Please notify a facilitator."
         });
     }
 });
 
-app.post("/submit-review", submitReviewLimiter, submissionLimiter, async (req, res) => {
+app.post("/verify-vote", rateLimit({
+    windowMs: 60 * 1000,
+    max: 20
+}), async (req, res) => {
+    const { receipt, verificationCode } = req.body;
+
+    if (!receipt || !verificationCode) {
+        return res.status(400).json({ error: "Missing data" });
+    }
+
+    const voteSnap = await db.collection("votes")
+        .where("receipt", "==", receipt)
+        .limit(1)
+        .get();
+
+    if (voteSnap.empty) {
+        return res.json({ found: false });
+    }
+
+    const vote = voteSnap.docs[0].data();
+
+    const expectedCode = crypto.createHash("sha256")
+        .update(receipt + stableStringify(vote.selections))
+        .digest("hex")
+        .substring(0, 12);
+
+    if (verificationCode.length !== expectedCode.length) {
+        return res.json({ found: true, contentMatches: false });
+    }
+
+    const cleanCode = verificationCode.trim().toLowerCase();
+
+    const contentMatches = crypto.timingSafeEqual(
+        Buffer.from(expectedCode),
+        Buffer.from(cleanCode)
+    );
+
+    res.json({
+        found: true,
+        contentMatches
+    });
+});
+
+app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, async (req, res) => {
     const submitToken = req.headers["x-submit-token"] || req.body._submitToken;
-    if (!verifySubmitToken(submitToken)) {
-        await logSecurityEvent("SUBMIT_REVIEW_UNAUTHORIZED", req, { reason: "Missing or invalid submit token" });
+    if (!verifySubmitToken(submitToken, req.user.jti)) {
         return res.status(403).json({ error: "Unauthorized: Invalid session token." });
     }
     const grade = sanitizeString(req.body.grade || '');
@@ -2711,7 +2951,6 @@ app.get("/admin/voters", async (req, res) => {
                 lvn: v.lvn || "***",
                 name: v.name,
                 grade: v.grade,
-                code: v.code,
                 section: v.section,
                 hasVoted: v.hasVoted,
                 isMissed: v.isMissed,
@@ -2764,11 +3003,12 @@ app.post("/admin/voters/add", async (req, res) => {
         for (const name of names) {
             if (!name || !name.trim()) continue;
             const cleanName = name.toUpperCase().trim();
+            const codeHashForUpdate = await bcrypt.hash(accessCode.toUpperCase(), 10);
             if (existingMap[cleanName]) {
                 batch.update(existingMap[cleanName], {
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: accessCode,
+                    code: codeHashForUpdate,
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
                 updatedCount++;
@@ -2776,6 +3016,7 @@ app.post("/admin/voters/add", async (req, res) => {
                 const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
                 const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
                 const hashedLVN = hashLVN(lvn);
+                const codeHash = await bcrypt.hash(accessCode.toUpperCase(), 10);
                 const existingLvnSnap = await db.collection("voters").doc(hashedLVN).get();
                 if (existingLvnSnap.exists) continue;
                 const voterRef = db.collection("voters").doc(hashedLVN);
@@ -2784,7 +3025,7 @@ app.post("/admin/voters/add", async (req, res) => {
                     name: cleanName,
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: accessCode,
+                    code: codeHash,
                     hasVoted: false,
                     addedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
@@ -2798,7 +3039,13 @@ app.post("/admin/voters/add", async (req, res) => {
             totalProvided: names.length,
             updated: updatedCount,
             added: addedCount,
-            accessCode: accessCode,
+        });
+        await logImmutableAction(req, "VOTERS_UPSERT", {
+            grade: targetGrade,
+            section: section.toUpperCase(),
+            totalProvided: names.length,
+            updated: updatedCount,
+            added: addedCount,
         });
         await logSuccessEvent("ADMIN_ADD_VOTERS", req, { grade: targetGrade, added: addedCount, updated: updatedCount });
         res.json({ success: true, message: `Processed ${names.length}. Promoted/Updated: ${updatedCount}, New: ${addedCount}`, accessCode: accessCode });
@@ -2825,11 +3072,13 @@ app.post("/admin/voters/delete", async (req, res) => {
                 code: admin.firestore.FieldValue.delete(),
             });
             await logAdminAction(req, "VOTER_SOFT_DELETE", { lvn: "***", reason: "Has voted — receipt preserved" });
+            await logImmutableAction(req, "VOTER_SOFT_DELETE", { lvn: "***", reason: "Has voted — receipt preserved" });
             await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "soft" });
             return res.json({ success: true, note: "Voter soft-deleted. Vote record remains intact for integrity." });
         }
         await voterRef.delete();
         await logAdminAction(req, "VOTER_DELETE", { lvn: "***" });
+        await logImmutableAction(req, "VOTER_DELETE", { lvn: "***" });
         await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "hard" });
         await alertManager.detectCandidatesStatus();
         await alertManager.detectVoteIntegrity();
@@ -2844,13 +3093,34 @@ app.post("/admin/voters/reset", async (req, res) => {
         const lvn = sanitizeString(req.body.lvn || '');
         if (!lvn) return res.status(400).json({ error: "LVN required" });
         const hashedLVN = hashLVN(lvn);
-        await db.collection("voters").doc(hashedLVN).update({
-            hasVoted: false,
-            receipt: admin.firestore.FieldValue.delete(),
-            votedAt: admin.firestore.FieldValue.serverTimestamp()
+
+        await db.runTransaction(async (t) => {
+            const voterRef = db.collection("voters").doc(hashedLVN);
+            const voterSnap = await t.get(voterRef);
+            if (!voterSnap.exists) throw new Error("VOTER_NOT_FOUND");
+
+            const voterData = voterSnap.data();
+            const receipt = voterData.receipt;
+
+            if (receipt) {
+                const voteSnap = await db.collection("votes")
+                    .where("receipt", "==", receipt).limit(1).get();
+
+                // Step 2 — delete it inside the transaction using the known ref
+                if (!voteSnap.empty) {
+                    t.delete(voteSnap.docs[0].ref);
+                }
+            }
+
+            t.update(voterRef, {
+                hasVoted: false,
+                receipt: admin.firestore.FieldValue.delete(),
+                votedAt: admin.firestore.FieldValue.delete()
+            });
         });
+
         await logAdminAction(req, "VOTER_RESET", { lvn: "***" });
-        await logSuccessEvent("ADMIN_RESET_VOTER", req, { lvn: "***" });
+        await logImmutableAction(req, "VOTER_RESET", { lvn: "***" });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Reset failed" });
@@ -2914,6 +3184,7 @@ app.post("/admin/settings/timers", async (req, res) => {
 app.post("/admin/purge", async (req, res) => {
     try {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
+        await logImmutableAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
 
@@ -2967,16 +3238,21 @@ app.post("/admin/purge", async (req, res) => {
 
 app.post("/admin/restore", async (req, res) => {
     try {
-        const { backupUrl } = req.body;
+        const { backupUrl, backupHash } = req.body;
 
-        if (!backupUrl) {
-            return res.status(400).json({ error: "Backup URL required" });
+        if (!backupUrl || !backupHash) {
+            return res.status(400).json({ error: "Backup URL and hash required" });
         }
 
-        const response = await axios.get(backupUrl);
-        const jsonData = JSON.stringify(response.data);
+        if (!/^https:\/\/raw\.githubusercontent\.com\//.test(backupUrl) &&
+            !/^https:\/\/api\.github\.com\/repos\//.test(backupUrl)) {
+            return res.status(400).json({ error: "Untrusted backup URL" });
+        }
 
-        const result = await restoreElectionFromBackup(jsonData);
+        const response = await axios.get(backupUrl, { responseType: 'text' });
+        const jsonData = response.data;
+
+        const result = await restoreElectionFromBackup(jsonData, backupHash);
         await alertManager.detectCandidatesStatus();
         await alertManager.detectVoteIntegrity();
         await alertManager.detectSystemHealth();
@@ -3104,6 +3380,7 @@ app.post("/admin/publish/results", async (req, res) => {
             lastUpdated: new Date().toISOString()
         });
         await logAdminAction(req, "RETALLY", { ok: true });
+        await logImmutableAction(req, "RETALLY", { ok: true });
         await logSuccessEvent("ADMIN_PUBLISH_RESULTS", req, { success: true });
         res.json({ success: true });
     } else {
@@ -3218,6 +3495,7 @@ app.post("/admin/delete", async (req, res) => {
             await batch.commit();
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_PARTY", { partyName });
+            await logImmutableAction(req, "DELETE_PARTY", { partyName });
             await logSuccessEvent("ADMIN_DELETE_PARTY", req, { partyName });
             await alertManager.detectCandidatesStatus();
             await alertManager.detectVoteIntegrity();
@@ -3234,6 +3512,8 @@ app.post("/admin/delete", async (req, res) => {
             });
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_CANDIDATE", { position, candidateId });
+            await logImmutableAction(req, "DELETE_CANDIDATE", { position, candidateId });
+
             await logSuccessEvent("ADMIN_DELETE_CANDIDATE", req, { position, candidateId });
             return res.json({ success: true });
         }
@@ -3250,12 +3530,13 @@ app.post("/admin/election/reset", async (req, res) => {
     const confirmation = sanitizeString(req.body.confirmation || '');
     if (confirmation !== "DELETE ELECTION DATA") return res.status(403).json({ error: "Security Mismatch." });
     try {
-        await db.collection("security_logs").add({
+        await db.collection("immutable_audit").add({
             event: "ELECTION_RESET",
-            admin_email: req.user.email,
+            adminEmail: req.user?.email || "unknown",
             ip: req.ip,
             timestamp: admin.firestore.FieldValue.serverTimestamp()
         });
+
         const batchLimit = 400;
         const votersRef = db.collection("voters").where("hasVoted", "==", true);
         const votersSnapshot = await votersRef.get();
@@ -3283,6 +3564,8 @@ app.post("/admin/election/reset", async (req, res) => {
         GlobalCache.dashboard.leaderboard = {};
         await refreshLocalResults();
         await logAdminAction(req, "ELECTION_RESET", { success: true });
+        await logImmutableAction(req, "ELECTION_RESET", { success: true });
+
         await logSuccessEvent("ADMIN_ELECTION_RESET", req, { success: true });
         res.json({ success: true, message: "Election system successfully reset." });
     } catch (e) {
@@ -3299,18 +3582,28 @@ app.post("/admin/session/end", async (req, res) => {
             query = query.where("grade", "==", String(activeGrade));
         }
         const snapshot = await query.get();
-        const batch = db.batch();
+        const BATCH_LIMIT = 400;
+        let currentBatch = db.batch();
         let count = 0;
+        const commits = [];
+
         snapshot.forEach(doc => {
             if (!doc.data().isMissed) {
-                batch.update(doc.ref, {
+                currentBatch.update(doc.ref, {
                     isMissed: true,
                     missedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
                 count++;
+                if (count % BATCH_LIMIT === 0) {
+                    commits.push(currentBatch.commit());
+                    currentBatch = db.batch();
+                }
             }
         });
-        if (count > 0) await batch.commit();
+
+        if (count % BATCH_LIMIT !== 0) commits.push(currentBatch.commit());
+        await Promise.all(commits);
+
         await logAdminAction(req, "SESSION_END", { count });
         await logSuccessEvent("ADMIN_SESSION_END", req, { count });
         res.json({ success: true, count });
@@ -3329,6 +3622,8 @@ app.post("/admin/voters/reset-missed", async (req, res) => {
             missedAt: admin.firestore.FieldValue.delete()
         });
         await logAdminAction(req, "RESET_MISSED", { lvn: "***" });
+        await logImmutableAction(req, "RESET_MISSED", { lvn: "***" });
+
         await logSuccessEvent("ADMIN_RESET_MISSED", req, { lvn: "***" });
         res.json({ success: true });
     } catch (e) {
