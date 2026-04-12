@@ -2644,10 +2644,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const grade = req.user.grade;
 
         const { selections, timestamp, nonce } = req.body;
-        const sessionToken = req.cookies.__session;
-        if (!sessionToken) {
-            return res.status(403).json({ error: "Missing session token" });
-        }
 
         // 🔐 VERIFY JWT
         let decoded;
