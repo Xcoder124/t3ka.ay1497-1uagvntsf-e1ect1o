@@ -2607,6 +2607,7 @@ function stableStringify(obj) {
 
 app.post('/authenticate', async (req, res) => {
     const { lvn, turnstileToken } = req.body;
+    console.log("🔵 AUTH: Request received for LVN hash:", hashLVN(lvn).substring(0, 8));
 
     try {
         const voterHash = hashLVN(lvn);
@@ -2614,19 +2615,24 @@ app.post('/authenticate', async (req, res) => {
         const voterSnap = await voterRef.get();
 
         if (!voterSnap.exists) {
+            console.log("🔴 AUTH: Voter not found");
             return res.status(403).json({ error: "Voter not found" });
         }
 
         const voterData = voterSnap.data();
-
         const sessionId = crypto.randomBytes(32).toString("hex");
+        console.log("🟢 AUTH: SessionID generated:", sessionId.substring(0, 16));
 
         const token = jwt.sign({
             uid: voterHash,
             grade: voterData.grade,
-            sessionId
+            sessionId,
+            jti: crypto.randomBytes(16).toString("hex"),  // ← MISSING!
+            role: "voter"  // ← MISSING!
         }, SECRET, { expiresIn: "30m" });
 
+        console.log("🟡 AUTH: JWT signed, writing to Firestore...");
+        
         await db.collection('active_sessions').doc(sessionId).set({
             voterHash,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2636,10 +2642,14 @@ app.post('/authenticate', async (req, res) => {
             userAgent: req.headers["user-agent"] || null
         });
 
+        console.log("✅ AUTH: Session written to Firestore");
+        console.log("🟢 AUTH: Sending response with token");
+        
         res.json({ token, voterData });
 
     } catch (e) {
-        console.error("Auth error:", e);
+        console.error("❌ AUTH ERROR:", e.message);
+        console.error("Stack:", e.stack);
         res.status(500).json({ error: "Authentication failed" });
     }
 });
