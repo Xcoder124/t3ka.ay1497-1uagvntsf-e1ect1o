@@ -1413,7 +1413,8 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
         "http://127.0.0.1:5500",
         "http://localhost:3000",
         "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app"
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app/"
     ];
 
 app.use(cors({
