@@ -1575,37 +1575,44 @@ async function getLatestAuditHash() {
 }
 
 async function logImmutableAction(action, data, user) {
-    await db.runTransaction(async (t) => {
-        const chainDoc = await t.get(AUDIT_CHAIN_DOC);
-        const previousHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+    try {
+        const safeData = JSON.parse(JSON.stringify(data || {}));
 
-        const logEntry = {
-            action,
-            data,
-            user: {
-                id: user?.uid || null,
-                email: user?.email || null
-            },
-            timestamp: Date.now(),
-            previousHash
+        const safeUser = {
+            id: user?.uid || null,
+            email: user?.email || null
         };
 
-        const hash = crypto.createHash("sha256")
-            .update(JSON.stringify(logEntry))
-            .digest("hex");
+        await db.runTransaction(async (t) => {
+            const chainDoc = await t.get(AUDIT_CHAIN_DOC);
+            const previousHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
 
-        logEntry.hash = hash;
+            const logEntry = {
+                action,
+                data: safeData,
+                user: safeUser,
+                timestamp: Date.now(),
+                previousHash
+            };
 
-        const logRef = db.collection("audit_trail").doc();
+            const hash = crypto.createHash("sha256")
+                .update(JSON.stringify(logEntry))
+                .digest("hex");
 
-        t.set(logRef, logEntry);
+            logEntry.hash = hash;
 
-        // 🔗 update chain head
-        t.set(AUDIT_CHAIN_DOC, {
-            hash,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            const logRef = db.collection("audit_trail").doc();
+
+            t.set(logRef, logEntry);
+            t.set(AUDIT_CHAIN_DOC, {
+                hash,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
         });
-    });
+
+    } catch (e) {
+        console.error("🔥 AUDIT FAILED (IGNORED):", e.message);
+    }
 }
 
 async function logAdminAction(req, action, meta = {}) {
@@ -3429,9 +3436,9 @@ app.post("/admin/add-party", async (req, res) => {
             });
             const groupedData = {};
             for (const c of candidates) {
-                if (!c || !c.position || !c.hash || !c.name) continue;
+                if (!c || !c.position || !c.id || !c.name) continue;
                 const pos = String(c.position).trim();
-                const idStr = String(c.hash).trim();
+                const idStr = String(c.id).trim();
                 const nameUpper = String(c.name).toUpperCase().trim();
                 const partyUpper = String(c.party || "").toUpperCase().trim();
                 if (!ALL_POSITIONS.includes(pos)) throw new Error(`Invalid position '${pos}'.`);
