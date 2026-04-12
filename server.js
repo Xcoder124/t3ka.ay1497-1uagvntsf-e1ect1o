@@ -2610,6 +2610,14 @@ app.post('/authenticate', async (req, res) => {
 
     try {
         const voterHash = hashLVN(lvn);
+        const voterRef = db.collection("voters").doc(voterHash);
+        const voterSnap = await voterRef.get();
+
+        if (!voterSnap.exists) {
+            return res.status(403).json({ error: "Voter not found" });
+        }
+
+        const voterData = voterSnap.data();
 
         const sessionId = crypto.randomBytes(32).toString("hex");
 
@@ -2742,6 +2750,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
+        const voterData = voterSnap.data();
 
         if (!voterSnap.exists) {
             return res.status(403).json({ error: "Voter not found." });
