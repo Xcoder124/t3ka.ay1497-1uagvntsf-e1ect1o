@@ -79,6 +79,7 @@ const db = admin.firestore();
 // GLOBAL VARIABLES
 const MAX_ATTEMPTS = 3;
 const LOCK_TIME = 30 * 1000; // 30 sec
+const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
 
 async function checkLoginAttempts(deviceId) {
     const ref = db.collection("login_attempts").doc(deviceId);
@@ -1569,7 +1570,6 @@ async function checkAbuse(ip) {
 }
 
 async function getLatestAuditHash() {
-    const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
     const doc = await AUDIT_CHAIN_DOC.get();
     return doc.exists ? doc.data().hash : "GENESIS";
 }
