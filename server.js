@@ -1436,7 +1436,7 @@ app.use((req, res, next) => {
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
             frameSrc: ["'self'", "https://challenges.cloudflare.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
             connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
