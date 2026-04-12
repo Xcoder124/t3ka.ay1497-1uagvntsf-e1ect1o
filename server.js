@@ -3291,7 +3291,7 @@ app.post("/admin/retally", async (req, res) => {
         candidatesSnap.forEach(doc => {
             const options = doc.data().options || [];
             options.forEach(c => {
-                newResults[String(c.hash)] = { votes: 0 };
+                newResults[String(c.id)] = { votes: 0 };
             });
         });
         let validVotesCount = 0;
@@ -3405,7 +3405,7 @@ app.post("/admin/add-party", async (req, res) => {
     const rawCandidates = req.body.candidates || [];
     const candidates = rawCandidates.map(c => ({
         position: sanitizeString(c.position || ''),
-        id: sanitizeString(c.hash || ''),
+        id: sanitizeString(c.id || ''),
         name: sanitizeString(c.name || ''),
         party: sanitizeString(c.party || ''),
         img: c.img || "none"
@@ -3428,7 +3428,7 @@ app.post("/admin/add-party", async (req, res) => {
                 list.forEach(c => {
                     const name = c && c.name ? String(c.name).toUpperCase().trim() : "";
                     const party = c && c.party ? String(c.party).toUpperCase().trim() : "";
-                    const id = c && c.hash ? String(c.hash) : "";
+                    const id = c && c.id ? String(c.id) : "";
                     if (name) globalNames.add(name);
                     if (party) partyCounts[posId][party] = (partyCounts[posId][party] || 0) + 1;
                     if (id) idByPosition[posId].add(id);
@@ -3516,7 +3516,7 @@ app.post("/admin/delete", async (req, res) => {
                 const s = await t.get(docRef);
                 if (!s.exists) throw new Error("No doc");
                 const opts = s.data().options || [];
-                const newOpts = opts.filter(c => String(c.hash) !== String(candidateId));
+                const newOpts = opts.filter(c => String(c.id) !== String(candidateId));
                 t.update(docRef, { options: newOpts });
             });
             await refreshLocalCandidates();
