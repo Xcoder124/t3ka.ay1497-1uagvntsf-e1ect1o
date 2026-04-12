@@ -2630,7 +2630,7 @@ app.post('/authenticate', async (req, res) => {
             sessionId,
             jti,
             role: "voter"
-        }, SECRET, { expiresIn: "60m" });
+        }, SECRET, { expiresIn: "30m" });
 
         console.log("🟡 AUTH: JWT signed, writing to Firestore...");
 
@@ -2837,6 +2837,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         await sessionDoc.ref.update({ hasVoted: true });
 
     } catch (e) {
+        console.log("REQ.USER:", req.user);
         console.error("Vote error:", e);
         res.status(500).json({
             error: "System failed to record vote. Please notify a facilitator."
