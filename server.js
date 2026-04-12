@@ -2621,35 +2621,37 @@ app.post('/authenticate', async (req, res) => {
 
         const voterData = voterSnap.data();
         const sessionId = crypto.randomBytes(32).toString("hex");
+        const jti = crypto.randomBytes(16).toString("hex");
         console.log("🟢 AUTH: SessionID generated:", sessionId.substring(0, 16));
 
         const token = jwt.sign({
             uid: voterHash,
             grade: voterData.grade,
             sessionId,
-            jti: crypto.randomBytes(16).toString("hex"),  // ← MISSING!
-            role: "voter"  // ← MISSING!
-        }, SECRET, { expiresIn: "30m" });
+            jti,
+            role: "voter"
+        }, SECRET, { expiresIn: "60m" });
 
         console.log("🟡 AUTH: JWT signed, writing to Firestore...");
-        
+
         await db.collection('active_sessions').doc(sessionId).set({
             voterHash,
+            jti,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             expiresAt: new Date(Date.now() + 30 * 60 * 1000),
             hasVoted: false,
-            ip: req.ip,
+            ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
             userAgent: req.headers["user-agent"] || null
         });
 
-        console.log("✅ AUTH: Session written to Firestore");
-        console.log("🟢 AUTH: Sending response with token");
-        
         res.json({ token, voterData });
 
     } catch (e) {
-        console.error("❌ AUTH ERROR:", e.message);
-        console.error("Stack:", e.stack);
+        console.error("❌ AUTH ERROR:", {
+            message: e.message,
+            stack: e.stack,
+            code: e.code
+        });
         res.status(500).json({ error: "Authentication failed" });
     }
 });
