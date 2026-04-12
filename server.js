@@ -2611,26 +2611,24 @@ app.post('/authenticate', async (req, res) => {
     try {
         const voterHash = hashLVN(lvn);
 
-        const sessionToken = jwt.sign(
-            {
-                voterHash,
-                nonce: crypto.randomBytes(16).toString('hex')
-            },
-            SECRET,
-            { expiresIn: '30m' }
-        );
+        const sessionId = crypto.randomBytes(32).toString("hex");
 
-        await db.collection('active_sessions').doc(sessionToken).set({
+        const token = jwt.sign({
+            uid: voterHash,
+            grade: voterData.grade,
+            sessionId
+        }, SECRET, { expiresIn: "30m" });
+
+        await db.collection('active_sessions').doc(sessionId).set({
             voterHash,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             expiresAt: new Date(Date.now() + 30 * 60 * 1000),
             hasVoted: false,
-
             ip: req.ip,
             userAgent: req.headers["user-agent"] || null
         });
 
-        res.json({ sessionToken, voterData });
+        res.json({ token, voterData });
 
     } catch (e) {
         console.error("Auth error:", e);
@@ -2644,17 +2642,21 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const grade = req.user.grade;
 
         const { selections, timestamp, nonce } = req.body;
+        const sessionToken = req.user.sessionId;
 
-        // 🔐 VERIFY JWT
-        let decoded;
-        try {
-            decoded = jwt.verify(sessionToken, SECRET);
-        } catch {
-            return res.status(403).json({ error: "Invalid token" });
+        if (!sessionToken) {
+            return res.status(403).json({ error: "Missing session token" });
+        }
+
+        // 🔐 VERIFY
+        const sessionId = req.user.sessionId;
+
+        if (!sessionId) {
+            return res.status(403).json({ error: "Missing session" });
         }
 
         // 🔍 FETCH SESSION
-        const sessionDoc = await db.collection('active_sessions').doc(sessionToken).get();
+        const sessionDoc = await db.collection('active_sessions').doc(sessionId).get();
 
         if (!sessionDoc.exists) {
             return res.status(403).json({ error: "Session not found" });
@@ -2668,10 +2670,9 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         }
 
         // 🔐 SESSION BINDING CHECK
-        if (
-            sessionData.ip !== req.ip ||
-            sessionData.userAgent !== req.headers["user-agent"]
-        ) {
+        const clientIp = req.headers["x-forwarded-for"] || req.ip;
+
+        if (sessionData.ip !== clientIp) {
             return res.status(403).json({ error: "Session mismatch" });
         }
 
