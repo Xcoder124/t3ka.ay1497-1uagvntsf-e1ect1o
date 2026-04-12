@@ -2632,17 +2632,7 @@ app.post('/authenticate', async (req, res) => {
             role: "voter"
         }, SECRET, { expiresIn: "30m" });
 
-        console.log("🟡 AUTH: JWT signed, writing to Firestore...");
-
-        await db.collection('active_sessions').doc(sessionId).set({
-            voterHash,
-            jti,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            expiresAt: new Date(Date.now() + 30 * 60 * 1000),
-            hasVoted: false,
-            ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
-            userAgent: req.headers["user-agent"] || null
-        });
+        console.log("🟡 AUTH: JWT signed.");
 
         res.json({ token, voterData });
 
@@ -2662,49 +2652,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const grade = req.user.grade;
 
         const { selections, timestamp, nonce } = req.body;
-        const sessionToken = req.user.sessionId;
-
-        if (!sessionToken) {
-            return res.status(403).json({ error: "Missing session token" });
-        }
-
-        // 🔐 VERIFY
-        const sessionId = req.user.sessionId;
-
-        if (!sessionId) {
-            return res.status(403).json({ error: "Missing session" });
-        }
-
-        // 🔍 FETCH SESSION
-        const sessionDoc = await db.collection('active_sessions').doc(sessionId).get();
-
-        if (!sessionDoc.exists) {
-            return res.status(403).json({ error: "Session not found" });
-        }
-
-        const sessionData = sessionDoc.data();
-
-        // ⏳ EXPIRATION CHECK
-        if (new Date() > sessionData.expiresAt.toDate()) {
-            return res.status(403).json({ error: "Session expired" });
-        }
-
-        // 🔐 SESSION BINDING CHECK
-        const clientIp = req.headers["x-forwarded-for"] || req.ip;
-
-        if (sessionData.ip !== clientIp) {
-            return res.status(403).json({ error: "Session mismatch" });
-        }
-
-        // 🔗 MATCH USER
-        if (sessionData.voterHash !== hashedLVN) {
-            return res.status(403).json({ error: "Session mismatch" });
-        }
-
-        // 🚫 ALREADY USED
-        if (sessionData.hasVoted) {
-            return res.status(403).json({ error: "Session already used" });
-        }
 
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
@@ -2762,7 +2709,13 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
-        const voterData = voterSnap.data();
+        if (!voterSnap.exists) {
+            return res.status(403).json({ error: "Voter not found" });
+        }
+
+        if (voterSnap.data().hasVoted) {
+            return res.status(403).json({ error: "Already voted" });
+        }
 
         if (!voterSnap.exists) {
             return res.status(403).json({ error: "Voter not found." });
@@ -2833,8 +2786,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             hash: voteResult.currentHash,
             prevHash: voteResult.prevHash
         });
-
-        await sessionDoc.ref.update({ hasVoted: true });
 
     } catch (e) {
         console.log("REQ.USER:", req.user);
