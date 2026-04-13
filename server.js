@@ -114,27 +114,23 @@ app.use(
                 defaultSrc: ["'self'"],
                 scriptSrc: [
                     "'self'",
+                    "'unsafe-inline'", // Required for inline scripts in vote.html
                     (req, res) => `'nonce-${req.cspNonce}'`,
                     "https://cdnjs.cloudflare.com",
                     "https://www.gstatic.com",
                     "https://cdn.jsdelivr.net",
                     "https://challenges.cloudflare.com"
                 ],
-                scriptSrcElem: [
-                    "'self'",
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net"
-                ],
+                // REMOVED scriptSrcElem - it falls back to scriptSrc and prevents override issues
                 frameSrc: ["'self'", "https://challenges.cloudflare.com"],
                 styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                styleSrcElem: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
                 connectSrc: [
                     "'self'",
                     "https://identitytoolkit.googleapis.com",
                     "https://securetoken.googleapis.com",
                     "https://challenges.cloudflare.com",
-                    `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
+                    "https://*.firebasedatabase.app", // Wildcard for all Firebase RTDB regions
+                    "https://*.firebaseio.com" // Legacy Firebase RTDB URLs
                 ],
                 fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
                 imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
