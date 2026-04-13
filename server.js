@@ -68,6 +68,58 @@ console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 const app = express();
 let activeUsers = 0;
 
+// --- MIDDLEWARE & APP CONFIG ---
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '110kb' }));
+app.use(cookieParser());
+
+// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+const allowedOrigins = process.env.NODE_ENV === 'production'
+    ? [
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ]
+    : [
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ];
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, origin);
+        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
+    exposedHeaders: ["set-cookie"]
+}));
+
+app.options('*', cors());
+
+// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
+app.use((req, res, next) => {
+    req.cspNonce = generateNonce();
+
+    helmet.contentSecurityPolicy({
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
+            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com", "https://tsf-sslg-election-endpoint.onrender.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+            frameAncestors: ["'none'"],
+
+        },
+    })(req, res, next);
+});
+
 app.use((req, res, next) => {
     activeUsers++;
     const decrement = () => { activeUsers = Math.max(0, activeUsers - 1); };
@@ -1520,56 +1572,6 @@ function requireMobile(req, res, next) {
     }
     next();
 }
-
-// --- MIDDLEWARE & APP CONFIG ---
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '110kb' }));
-app.use(cookieParser());
-
-// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
-const allowedOrigins = process.env.NODE_ENV === 'production'
-    ? [
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
-    ]
-    : [
-        "http://127.0.0.1:5500",
-        "http://localhost:3000",
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
-    ];
-
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error("CORS Policy: Origin not allowed"), false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
-    exposedHeaders: ["set-cookie"]
-}));
-
-// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
-app.use((req, res, next) => {
-    req.cspNonce = generateNonce();
-
-    helmet.contentSecurityPolicy({
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
-            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
-            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-            frameAncestors: ["'none'"],
-
-        },
-    })(req, res, next);
-});
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
