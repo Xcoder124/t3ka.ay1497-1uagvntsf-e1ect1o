@@ -81,6 +81,23 @@ const MAX_ATTEMPTS = 3;
 const LOCK_TIME = 30 * 1000; // 30 sec
 const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
 
+(async () => {
+    try {
+        await refreshLocalResults();
+        console.log("Dashboard cache warmed up");
+    } catch (err) {
+        console.error("Initial dashboard load failed:", err);
+    }
+})();
+
+setInterval(async () => {
+    try {
+        await refreshLocalResults();
+    } catch (err) {
+        console.error("Background dashboard refresh failed:", err);
+    }
+}, 2 * 60 * 1000);
+
 async function checkLoginAttempts(deviceId) {
     const ref = db.collection("login_attempts").doc(deviceId);
     const snap = await ref.get();
@@ -127,61 +144,68 @@ async function recordLoginAttempt(deviceId, success) {
 }
 
 async function validateSelections(selections) {
-    const snapshot = await db.collection("candidates").get();
+    let candidateMap = GlobalCache.candidates;
+
+    if (!candidateMap || Object.keys(candidateMap).length === 0) {
+        const success = await refreshLocalCandidates();
+        candidateMap = GlobalCache.candidates;
+
+        if (!success || !candidateMap || Object.keys(candidateMap).length === 0) {
+            throw new Error("Candidate cache unavailable");
+        }
+    }
+
     const validated = {};
 
-    snapshot.forEach(doc => {
-        const position = doc.id;
-        const options = doc.data().options || [];
+    for (const [position, options] of Object.entries(candidateMap)) {
 
-        if (!selections[position]) return;
+        if (selections[position] === undefined) continue;
+
+        // 🔐 Ensure valid position
+        if (!GlobalCache.candidateHashMap[position]) {
+            throw new Error(`Invalid position ${position}`);
+        }
 
         const selected = selections[position];
 
         const selectedArray = (Array.isArray(selected) ? selected : [selected])
             .map(s => String(s).trim());
 
-        // ❗ Prevent multiple selections on single-select positions
+        if (selectedArray.length === 0) {
+            throw new Error(`No selection provided for ${position}`);
+        }
+
         if (!MULTI_POSITIONS.includes(position) && selectedArray.length > 1) {
             throw new Error(`Multiple selections not allowed for ${position}`);
         }
 
-        // ❗ Prevent over-selection
         if (selectedArray.length > options.length) {
             throw new Error(`Too many selections for ${position}`);
         }
 
-        // ❗ Prevent duplicates
         if (new Set(selectedArray).size !== selectedArray.length) {
             throw new Error(`Duplicate selections for ${position}`);
         }
 
         const resolved = selectedArray.map(sel => {
 
-            // 🔐 FIXED: validate HERE
             if (!/^[a-f0-9]{64}$/.test(sel)) {
                 throw new Error(`Tampered selection detected for ${position}`);
             }
 
-            const match = options.find(c => {
-                if (!c.id) {
-                    console.error("Missing candidate ID:", c);
-                    return false;
-                }
-                return hashCandidateId(c.id) === sel;
-            });
+            const match = GlobalCache.candidateHashMap[position]?.[sel];
 
             if (!match) {
                 throw new Error(`Invalid candidate for ${position}`);
             }
 
-            return match.id;
+            return match;
         });
 
         validated[position] = MULTI_POSITIONS.includes(position)
             ? resolved
             : resolved[0];
-    });
+    }
 
     return validated;
 }
@@ -226,6 +250,59 @@ setInterval(async () => {
         });
     } catch (e) { console.error("Expiry check error:", e); }
 }, 30000);
+
+async function joinQueue(userId) {
+    const queueRef = db.collection("queue").doc("active");
+    const userRef = db.collection("queue_users").doc(userId);
+
+    const existing = await userRef.get();
+    if (existing.exists) {
+        const data = existing.data();
+
+        if (data.status !== "done") return;
+    }
+
+    await db.runTransaction(async (t) => {
+        const queueDoc = await t.get(queueRef);
+        const data = queueDoc.data() || {};
+
+        let lastPosition = data.lastPosition || 0;
+        let activeCount = data.activeCount || 0;
+        let maxActive = data.maxActive || 50; // keep consistent
+
+        const newPosition = lastPosition + 1;
+
+        let status;
+
+        // 🔥 dynamic slot filling
+        if (activeCount < maxActive) {
+            status = "active";
+            activeCount++;
+        } else {
+            status = "waiting";
+        }
+
+        t.set(userRef, {
+            position: newPosition,
+            status,
+            joinedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.set(queueRef, {
+            lastPosition: newPosition,
+            activeCount
+        }, { merge: true });
+    });
+}
+
+function calculateETA(position, currentServing, maxActive = 50, avgTime = 2) {
+    const peopleAhead = position - (currentServing + maxActive);
+
+    if (peopleAhead <= 0) return "You're next!";
+
+    const batches = Math.ceil(peopleAhead / maxActive);
+    return `${batches * avgTime} mins`;
+}
 
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
@@ -282,7 +359,6 @@ async function uploadToGitHub(json, hash) {
             }
         );
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         await alertManager.detectSystemHealth();
 
         return res.data.content.html_url;
@@ -941,20 +1017,32 @@ class AlertManager {
     }
 
     async detectVoteIntegrity() {
-        const votesSnap = await db.collection("votes").get();
-
-        if (votesSnap.size === 0) {
-            await this.createAlert(
-                'vote_integrity',
-                'major',
-                'No Votes Found',
-                'No votes recorded in the system.',
-                {},
-                null
-            );
-        }
         try {
-            const chainInfo = await verifyHashChain();
+            // ✅ Cooldown (prevent spam execution)
+            if (this.lastIntegrityCheck && Date.now() - this.lastIntegrityCheck < 90000) {
+                return { skipped: true, reason: "Cooldown active" };
+            }
+            this.lastIntegrityCheck = Date.now();
+
+            // ✅ Fetch votes ONCE (reuse everywhere)
+            const votesSnap = await db.collection("votes")
+                .orderBy("createdAt", "asc")
+                .get();
+
+            // 🔴 No votes check
+            if (votesSnap.empty) {
+                await this.createAlert(
+                    'vote_integrity',
+                    'major',
+                    'No Votes Found',
+                    'No votes recorded in the system.',
+                    {},
+                    null
+                );
+            }
+
+            // ✅ Reuse snapshot (NO second read)
+            const chainInfo = await verifyHashChain(votesSnap);
 
             if (!chainInfo.valid) {
                 await this.createAlert(
@@ -965,13 +1053,28 @@ class AlertManager {
                     chainInfo,
                     null
                 );
-
             } else {
                 await this.clearResolvedAlerts('hash_chain');
             }
 
-            // Check for orphaned votes
-            const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
+            // =========================================
+            // ✅ COUNT() instead of full voters scan
+            // =========================================
+            const [voteCountSnap, voterCountSnap] = await Promise.all([
+                db.collection("votes").count().get(),
+                db.collection("voters").where("hasVoted", "==", true).count().get()
+            ]);
+
+            const totalVotes = voteCountSnap.data().count;
+            const totalVoters = voterCountSnap.data().count;
+
+            // =========================================
+            // ⚠️ Orphan check (still needs receipts)
+            // =========================================
+            // NOTE: This is the ONLY remaining heavy read (can be optimized later)
+            const votersSnap = await db.collection("voters")
+                .where("hasVoted", "==", true)
+                .get();
 
             const validReceipts = new Set();
             votersSnap.forEach(doc => {
@@ -981,13 +1084,13 @@ class AlertManager {
 
             let orphanedCount = 0;
 
-            votesSnap.forEach(doc => {
+            for (const doc of votesSnap.docs) {
                 const vote = doc.data();
 
                 if (!vote.receipt || !validReceipts.has(vote.receipt)) {
                     orphanedCount++;
                 }
-            });
+            }
 
             if (orphanedCount > 0) {
                 await this.createAlert(
@@ -1002,24 +1105,35 @@ class AlertManager {
                 await this.clearResolvedAlerts('invalid_votes');
             }
 
-            if (votesSnap.size > votersSnap.size) {
+            // =========================================
+            // ✅ Count-based mismatch check (CHEAP)
+            // =========================================
+            if (totalVotes > totalVoters) {
                 await this.createAlert(
                     'vote_integrity',
                     'critical',
                     'Vote Count Mismatch',
                     'Votes exceed number of voters. Consider re-tallying the election results.',
                     {
-                        votes: votesSnap.size,
-                        voters: votersSnap.size
+                        votes: totalVotes,
+                        voters: totalVoters
                     },
                     null
                 );
-            }
-            else {
+            } else {
                 await this.clearResolvedAlerts('vote_integrity');
             }
-            console.log("Running chain detection...");
-            return { success: true, chainValid: chainInfo.valid, orphanedCount };
+
+            console.log("Integrity check completed");
+
+            return {
+                success: true,
+                chainValid: chainInfo.valid,
+                orphanedCount,
+                totalVotes,
+                totalVoters
+            };
+
         } catch (e) {
             console.error("[ALERT] Vote integrity detection error:", e);
             return { success: false, error: e.message };
@@ -1511,8 +1625,6 @@ const GlobalCache = {
     },
 };
 
-Object.freeze(GlobalCache.candidates);
-
 const ALL_POSITIONS = [
     "president", "vp", "secretary", "treasurer", "auditor",
     "pio", "protocol", "rep7", "rep8", "rep9", "rep10", "rep11", "rep12",
@@ -1741,22 +1853,50 @@ async function refreshLocalCandidates() {
     try {
         const docRef = db.collection("app_config").doc("candidates_static");
         const doc = await docRef.get();
-        if (doc.exists) {
-            const data = doc.data();
-            const newCandidates = data.payload || {};
-            Object.assign(GlobalCache.candidates, newCandidates);
-            Object.freeze(GlobalCache.candidates);
-            const ts = data.lastUpdated;
-            GlobalCache.timestamps.candidates = ts && ts.toDate
-                ? ts.toDate().toISOString()
-                : (ts || new Date().toISOString());
-            return true;
-        } else {
-            Object.assign(GlobalCache.candidates, {});
-            Object.freeze(GlobalCache.candidates);
+
+        if (!doc.exists) {
+            GlobalCache.candidates = Object.freeze({});
+            GlobalCache.candidateHashMap = Object.freeze({});
             return false;
         }
+
+        const data = doc.data();
+        const newCandidates = data.payload || {};
+
+        // ✅ Build hash map (FAST lookup)
+        const candidateHashMap = {};
+
+        for (const [position, options] of Object.entries(newCandidates)) {
+            candidateHashMap[position] = {};
+
+            for (const c of options) {
+                if (c?.id) {
+                    const hash = hashCandidateId(c.id);
+
+                    // ⚠️ Safety: detect accidental hash collisions
+                    if (candidateHashMap[position][hash]) {
+                        console.warn(`Hash collision detected at ${position}`, c.id);
+                    }
+
+                    candidateHashMap[position][hash] = c.id;
+                }
+            }
+        }
+
+        // ✅ Replace cache atomically
+        GlobalCache.candidates = Object.freeze({ ...newCandidates });
+        GlobalCache.candidateHashMap = Object.freeze(candidateHashMap);
+
+        // ✅ Timestamp handling (keep yours)
+        const ts = data.lastUpdated;
+        GlobalCache.timestamps.candidates = ts && ts.toDate
+            ? ts.toDate().toISOString()
+            : (ts || new Date().toISOString());
+
+        return true;
+
     } catch (err) {
+        console.error("Candidate refresh failed:", err);
         return false;
     }
 }
@@ -2324,62 +2464,120 @@ function normalizeName(name) {
 
 app.get("/candidates", async (req, res) => {
     try {
-        const snapshot = await db.collection("candidates").get();
+        let candidateMap = GlobalCache.candidates;
 
-        const safeCandidates = [];
+        if (!candidateMap || Object.keys(candidateMap).length === 0) {
+            const success = await refreshLocalCandidates();
+            candidateMap = GlobalCache.candidates;
 
-        snapshot.forEach(doc => {
-            const position = doc.id;
-            const options = doc.data().options || [];
+            if (!success || !candidateMap || Object.keys(candidateMap).length === 0) {
+                return res.status(503).json({ error: "Candidate data unavailable" });
+            }
+        }
 
-            safeCandidates.push({
-                position,
-                options: options.map(c => ({
-                    name: c.name,
-                    party: c.party,
-                    image: c.img,
-                    hash: hashCandidateId(c.id)
-                }))
-            });
-        });
+        const safeCandidates = Object.entries(candidateMap).map(([position, options]) => ({
+            position,
+            options: (options || []).map(c => ({
+                name: c.name || "",
+                party: c.party || "",
+                image: c.img || "",
+                hash: c.hash || hashCandidateId(c.id) // fallback if not precomputed
+            }))
+        }));
 
-        res.json(safeCandidates);
-    } catch (e) {
-        res.status(500).json({ error: "Failed to load candidates" });
+        res.set("Cache-Control", "no-store");
+
+        return res.json(safeCandidates);
+
+    } catch (err) {
+        console.error("Candidates route error:", err);
+        return res.status(500).json({ error: "Failed to load candidates" });
     }
 });
 
-app.get("/dashboard", async (req, res) => {
-    await refreshLocalResults();
-    res.json({ ...GlobalCache.dashboard, lastUpdated: GlobalCache.timestamps.results });
+app.get("/dashboard", (req, res) => {
+    try {
+        const dashboard = GlobalCache.dashboard;
+
+        if (!dashboard || Object.keys(dashboard).length === 0) {
+            return res.status(503).json({
+                error: "Dashboard data not ready",
+                lastUpdated: GlobalCache.timestamps.results || null
+            });
+        }
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+            ...dashboard,
+            lastUpdated: GlobalCache.timestamps.results || null
+        });
+
+    } catch (err) {
+        console.error("Dashboard route error:", err);
+        return res.status(500).json({ error: "Failed to load dashboard" });
+    }
 });
 
 // --- VERIFIABLE VOTING: PUBLIC BULLETIN BOARD ---
 app.get("/public-receipts", async (req, res) => {
     try {
-        const votesSnap = await db.collection("votes")
+        // ✅ Pagination controls (safe limits)
+        const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+        const cursor = req.query.cursor || null;
+
+        let query = db.collection("votes")
             .orderBy("createdAt", "asc")
-            .get();
+            .limit(limit);
+
+        // ✅ Cursor support (ISO string → Date)
+        if (cursor) {
+            query = query.startAfter(new Date(cursor));
+        }
+
+        const votesSnap = await query.get();
+
         const receipts = [];
-        votesSnap.forEach((doc) => {
+        let lastTimestamp = null;
+
+        for (const doc of votesSnap.docs) {
             const data = doc.data();
+
+            const ts = data.createdAt
+                ? data.createdAt.toDate().toISOString()
+                : null;
+
+            if (ts) lastTimestamp = ts;
+
             receipts.push({
                 receipt: data.receipt,
-                timestamp: data.createdAt ? data.createdAt.toDate().toISOString() : null,
+                timestamp: ts,
                 hash: data.hash,
                 prevHash: data.prevHash
             });
+        }
+
+        // ✅ Only verify chain on FIRST page (avoid repeated heavy checks)
+        let chainInfo = null;
+        if (!cursor) {
+            chainInfo = await verifyHashChain(votesSnap); // reuse snapshot
+        }
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+            receipts,
+            pageSize: receipts.length,
+            nextCursor: lastTimestamp, // client uses this for next page
+            chainValid: chainInfo ? chainInfo.valid : undefined,
+            chainInfo: chainInfo || undefined
         });
-        const chainInfo = await verifyHashChain();
-        res.json({
-            receipts: receipts,
-            totalCount: receipts.length,
-            chainValid: chainInfo.valid,
-            chainInfo: chainInfo
-        });
+
     } catch (e) {
         console.error("Public receipts error:", e);
-        res.status(500).json({ error: "Failed to retrieve public receipts" });
+        return res.status(500).json({
+            error: "Failed to retrieve public receipts"
+        });
     }
 });
 
@@ -2411,45 +2609,72 @@ app.get("/verify-receipt/:receipt", async (req, res) => {
 });
 
 // --- VERIFIABLE VOTING: HASH CHAIN VERIFICATION ---
-async function verifyHashChain() {
+async function verifyHashChain(votesSnapParam = null) {
     try {
-        const votesSnap = await db.collection("votes")
+        // ✅ Use provided snapshot OR fetch only if needed
+        const votesSnap = votesSnapParam || await db.collection("votes")
             .orderBy("createdAt", "asc")
             .get();
-        const votes = [];
-        votesSnap.forEach((doc) => {
-            votes.push({ id: doc.id, ...doc.data() });
-        });
-        if (votes.length === 0) {
-            return { valid: true, message: "No votes to verify", totalVotes: 0 };
+
+        if (!votesSnap || votesSnap.empty) {
+            return {
+                valid: true,
+                message: "No votes to verify",
+                totalVotes: 0,
+                invalidCount: 0,
+                firstInvalidIndex: -1
+            };
         }
+
+        let prevHash = "GENESIS";
+        let index = 0;
         let invalidCount = 0;
         let firstInvalidIndex = -1;
-        for (let i = 0; i < votes.length; i++) {
-            const vote = votes[i];
-            const expectedPrevHash = i === 0 ? "GENESIS" : votes[i - 1].hash;
-            if (vote.prevHash !== expectedPrevHash) {
+
+        // ✅ Iterate directly (no array allocation → better memory)
+        for (const doc of votesSnap.docs) {
+            const vote = doc.data();
+
+            // 🔐 Check previous hash linkage
+            if (vote.prevHash !== prevHash) {
                 invalidCount++;
-                if (firstInvalidIndex === -1) firstInvalidIndex = i;
-                continue;
+                if (firstInvalidIndex === -1) firstInvalidIndex = index;
+            } else {
+                // 🔐 Verify current hash only if prevHash is valid
+                const expectedHash = crypto.createHash("sha256")
+                    .update(vote.receipt + vote.prevHash)
+                    .digest("hex");
+
+                if (vote.hash !== expectedHash) {
+                    invalidCount++;
+                    if (firstInvalidIndex === -1) firstInvalidIndex = index;
+                }
             }
-            const expectedHash = crypto.createHash("sha256")
-                .update(vote.receipt + vote.prevHash)
-                .digest("hex");
-            if (vote.hash !== expectedHash) {
-                invalidCount++;
-                if (firstInvalidIndex === -1) firstInvalidIndex = i;
-            }
+
+            // Move chain forward regardless (so we detect cascading issues)
+            prevHash = vote.hash;
+            index++;
         }
+
         return {
             valid: invalidCount === 0,
-            totalVotes: votes.length,
-            invalidCount: invalidCount,
-            firstInvalidIndex: firstInvalidIndex,
-            message: invalidCount === 0 ? "Hash chain integrity verified" : `Hash chain broken at ${invalidCount} position(s)`
+            totalVotes: index,
+            invalidCount,
+            firstInvalidIndex,
+            message: invalidCount === 0
+                ? "Hash chain integrity verified"
+                : `Hash chain broken at ${invalidCount} position(s)`
         };
+
     } catch (e) {
-        return { valid: false, message: "Verification error: " + e.message };
+        console.error("Hash chain verification error:", e);
+        return {
+            valid: false,
+            message: "Verification error: " + e.message,
+            totalVotes: 0,
+            invalidCount: 0,
+            firstInvalidIndex: -1
+        };
     }
 }
 
@@ -2466,7 +2691,7 @@ async function monitorIntegrity() {
         );
     }
 }
-setInterval(monitorIntegrity, 60000);
+setInterval(monitorIntegrity, 5 * 60 * 1000);
 
 app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, res) => {
     try {
@@ -2482,48 +2707,72 @@ app.post("/verify", loginLimiter, async (req, res) => {
     if (!(await verifyCaptcha(req.body.captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
     }
+
     try {
         const lvn = sanitizeString(req.body.lvn || '');
         const code = sanitizeString(req.body.code || '');
-        if (!lvn || !code) return res.status(400).json({ error: "Missing credentials." });
+
+        if (!lvn || !code) {
+            return res.status(400).json({ error: "Missing credentials." });
+        }
+
         const hashedLVN = hashLVN(lvn);
 
         if (await isVoterLocked(hashedLVN)) {
-            return res.status(403).json({ error: "Account temporarily locked due to multiple failed attempts. Please try again later." });
+            return res.status(403).json({
+                error: "Account temporarily locked due to multiple failed attempts. Please try again later."
+            });
         }
+
         const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
+
         const deviceFingerprint = crypto.createHash("sha256")
             .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
             .digest("hex");
+
         const deviceRef = db.collection("device_tracking").doc(deviceFingerprint);
         const deviceSnap = await deviceRef.get();
+
         if (deviceSnap.exists) {
             const usedLvns = deviceSnap.data().lvns || [];
+
             if (!usedLvns.includes(hashedLVN)) {
                 if (usedLvns.length >= 10) {
-                    return res.status(403).json({ error: "Device Limit Reached: Maximum 10 voters allowed per device." });
+                    return res.status(403).json({
+                        error: "Device Limit Reached: Maximum 10 voters allowed per device."
+                    });
                 }
             }
         }
+
         const settingsSnap = await db.collection("settings").doc("electionStatus").get();
+        const settingsData = settingsSnap.data() || {};
+
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
+
         if (!voterSnap.exists) {
             await recordVoterFailedAttempt(hashedLVN);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
+
         const d = voterSnap.data();
         const inputCode = code.toUpperCase();
 
         const isCodeValid = await bcrypt.compare(inputCode, d.code);
+
         if (!isCodeValid) {
             await recordVoterFailedAttempt(hashedLVN);
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
             return res.status(401).json({ error: "Invalid Credentials." });
         }
+
         if (d.isMissed === true) {
-            return res.status(403).json({ error: "Voting Session Expired: You missed the cutoff time." });
+            return res.status(403).json({
+                error: "Voting Session Expired: You missed the cutoff time."
+            });
         }
+
         if (d.isTrap === true) {
             await db.collection("security_logs").add({
                 event: "HONEYTOKEN_USED",
@@ -2532,30 +2781,50 @@ app.post("/verify", loginLimiter, async (req, res) => {
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 method: "LOGIN_ATTEMPT"
             });
+
             const fakeToken = jwt.sign(
                 { uid: hashedLVN, grade: "12", role: "shadow_realm" },
                 SECRET,
                 { expiresIn: "60m" }
             );
-            return res.json({ name: "JOHN DOE (TEST)", grade: "12", token: fakeToken, csrfToken: "" });
+
+            return res.json({
+                name: "JOHN DOE (TEST)",
+                grade: "12",
+                token: fakeToken,
+                csrfToken: ""
+            });
         }
-        if (!settingsSnap.exists || !settingsSnap.data().isLive) {
+
+        if (!settingsSnap.exists || !settingsData.isLive) {
             return res.status(403).json({ error: "Election PAUSED." });
         }
+
         if (d.hasVoted) {
             await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
             return res.status(403).json({ error: "Already Voted." });
         }
-        const activeGrade = settingsSnap.data().activeGrade;
+
+        const activeGrade = settingsData.activeGrade;
+
         if (activeGrade && String(activeGrade) !== "ALL" && String(activeGrade) !== "0") {
             if (String(d.grade) !== String(activeGrade)) {
                 return res.status(403).json({ error: `Grade ${activeGrade} Only.` });
             }
         }
+
+        // 🔥 QUEUE CHECK + JOIN
+        const isQueue = settingsData.isQueue === true;
+
+        if (isQueue) {
+            await joinQueue(hashedLVN); // ✅ SAFE + CONSISTENT
+        }
+
         await deviceRef.set({
             lvns: admin.firestore.FieldValue.arrayUnion(hashedLVN),
             lastLogin: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
+
         res.cookie("__device_id", deviceFingerprint, {
             httpOnly: true,
             secure: true,
@@ -2563,10 +2832,18 @@ app.post("/verify", loginLimiter, async (req, res) => {
             path: "/",
             maxAge: 365 * 24 * 60 * 60 * 1000
         });
+
         await clearVoterBruteForce(hashedLVN);
+
         const csrfToken = crypto.randomBytes(32).toString('hex');
         const jti = crypto.randomBytes(16).toString("hex");
-        const sessionToken = jwt.sign({ uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, jti }, SECRET, { expiresIn: "60m" });
+
+        const sessionToken = jwt.sign(
+            { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, jti },
+            SECRET,
+            { expiresIn: "60m" }
+        );
+
         res.cookie("__session", sessionToken, {
             httpOnly: true,
             secure: true,
@@ -2574,7 +2851,16 @@ app.post("/verify", loginLimiter, async (req, res) => {
             path: "/",
             maxAge: 60 * 60 * 1000
         });
-        return res.json({ success: true, name: d.name, grade: d.grade, token: sessionToken, csrfToken });
+
+        return res.json({
+            success: true,
+            name: d.name,
+            grade: d.grade,
+            token: sessionToken,
+            csrfToken,
+            isQueue // ✅ FRONTEND USES THIS
+        });
+
     } catch (e) {
         return res.status(500).json({ error: "Server error during verification." });
     }
@@ -2653,6 +2939,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         const { selections, timestamp, nonce } = req.body;
 
+        // 🔍 Basic validation
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
         }
@@ -2670,6 +2957,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: "Request expired" });
         }
 
+        // 🔒 Anti-replay (nonce)
         const nonceRef = db.collection("used_nonces").doc(nonce);
 
         const nonceUsed = await db.runTransaction(async (tx) => {
@@ -2689,6 +2977,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: "Duplicate request detected" });
         }
 
+        // 🔍 Validate selections
         let validatedSelections;
         try {
             validatedSelections = await validateSelections(selections);
@@ -2697,25 +2986,39 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: e.message });
         }
 
+        // ⚙️ Election settings
         const settings = await db.collection("settings").doc("electionStatus").get();
 
         if (!settings.exists || !settings.data().isLive) {
             return res.status(403).json({ error: "Election closed." });
         }
 
-        if (settings.data().endTime && Date.now() > settings.data().endTime.toMillis()) {
+        const electionData = settings.data();
+
+        // 🚦 QUEUE ENFORCEMENT
+        if (electionData.isQueue) {
+            const queueRef = db.collection("queue_users").doc(hashedLVN);
+            const queueSnap = await queueRef.get();
+
+            if (!queueSnap.exists) {
+                return res.status(403).json({ error: "You are not in the queue." });
+            }
+
+            const queueData = queueSnap.data();
+
+            if (queueData.status !== "active") {
+                return res.status(403).json({ error: "Please wait for your turn." });
+            }
+        }
+
+        // ⏱ End time check
+        if (electionData.endTime && Date.now() > electionData.endTime.toMillis()) {
             return res.status(403).json({ error: "Voting period ended." });
         }
 
+        // 👤 Voter validation
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
-        if (!voterSnap.exists) {
-            return res.status(403).json({ error: "Voter not found" });
-        }
-
-        if (voterSnap.data().hasVoted) {
-            return res.status(403).json({ error: "Already voted" });
-        }
 
         if (!voterSnap.exists) {
             return res.status(403).json({ error: "Voter not found." });
@@ -2725,6 +3028,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Already voted." });
         }
 
+        // 🔗 Blockchain chain head
         const CHAIN_DOC = db.collection("_meta").doc("chain_head");
 
         const voteResult = await db.runTransaction(async (t) => {
@@ -2744,7 +3048,9 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 timestamp: Date.now()
             });
 
-            const receipt = crypto.createHash("sha256").update(payload + randomSalt).digest("hex");
+            const receipt = crypto.createHash("sha256")
+                .update(payload + randomSalt)
+                .digest("hex");
 
             const verificationCode = crypto.createHash("sha256")
                 .update(receipt + stableStringify(validatedSelections))
@@ -2774,11 +3080,15 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 receipt
             });
 
-            t.set(CHAIN_DOC, { hash: currentHash, count: prevCount + 1 });
+            t.set(CHAIN_DOC, {
+                hash: currentHash,
+                count: prevCount + 1
+            });
 
             return { receipt, currentHash, prevHash, verificationCode };
         });
 
+        // ✅ Respond immediately
         res.json({
             success: true,
             receipt: voteResult.receipt,
@@ -2786,6 +3096,53 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             hash: voteResult.currentHash,
             prevHash: voteResult.prevHash
         });
+
+        // 🔄 QUEUE PROGRESSION (DYNAMIC SLOT SYSTEM)
+        if (electionData.isQueue) {
+            setImmediate(async () => {
+                try {
+                    const queueRef = db.collection("queue").doc("active");
+                    const userRef = db.collection("queue_users").doc(hashedLVN);
+
+                    await db.runTransaction(async (t) => {
+                        const queueDoc = await t.get(queueRef);
+                        const data = queueDoc.data() || {};
+
+                        let activeCount = data.activeCount || 0;
+
+                        // mark user done
+                        t.set(userRef, { status: "done" }, { merge: true });
+
+                        // 🔥 free slot
+                        activeCount = Math.max(0, activeCount - 1);
+
+                        // 🔥 activate next waiting user (FIFO)
+                        const nextSnap = await db.collection("queue_users")
+                            .where("status", "==", "waiting")
+                            .orderBy("position")
+                            .limit(1)
+                            .get();
+
+                        if (!nextSnap.empty) {
+                            t.set(nextSnap.docs[0].ref, {
+                                status: "active"
+                            }, { merge: true });
+
+                            activeCount++; // fill slot immediately
+                        }
+
+                        t.set(queueRef, {
+                            activeCount
+                        }, { merge: true });
+                    });
+
+                } catch (err) {
+                    console.error("Queue update failed:", err);
+                }
+            });
+        }
+
+        await refreshLocalResults();
 
     } catch (e) {
         console.log("REQ.USER:", req.user);
@@ -2795,6 +3152,42 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         });
     }
 });
+
+async function completeVoting(userId) {
+    const userRef = db.collection("queue_users").doc(userId);
+    const queueRef = db.collection("queue").doc("active");
+
+    await db.runTransaction(async (t) => {
+        const queueDoc = await t.get(queueRef);
+        const data = queueDoc.data();
+
+        let currentServing = data.currentServing || 0;
+
+        // mark user done
+        t.update(userRef, {
+            status: "done"
+        });
+
+        // move queue forward
+        currentServing++;
+
+        t.update(queueRef, {
+            currentServing
+        });
+
+        // 🔥 Activate next user
+        const nextUserSnap = await db.collection("queue_users")
+            .where("position", "==", currentServing + data.maxActive)
+            .limit(1)
+            .get();
+
+        if (!nextUserSnap.empty) {
+            t.update(nextUserSnap.docs[0].ref, {
+                status: "active"
+            });
+        }
+    });
+}
 
 app.post("/verify-vote", rateLimit({
     windowMs: 60 * 1000,
@@ -3059,7 +3452,6 @@ app.post("/admin/voters/delete", async (req, res) => {
         await logImmutableAction(req, "VOTER_DELETE", { lvn: "***" });
         await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "hard" });
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Delete failed" });
@@ -3110,11 +3502,22 @@ app.post("/admin/settings/session", async (req, res) => {
         const voterTime = req.body.voterTime;
         const activeGrade = req.body.activeGrade;
         const isLive = req.body.isLive;
+        const isQueue = req.body.isQueue;
+
         const statusUpdate = {};
-        if (typeof isLive === 'boolean') statusUpdate.isLive = isLive;
+
+        if (typeof isLive === 'boolean') {
+            statusUpdate.isLive = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            statusUpdate.isQueue = isQueue;
+        }
+
         if (activeGrade !== undefined) {
             statusUpdate.activeGrade = (activeGrade === "ALL") ? "ALL" : Number(activeGrade);
         }
+
         if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
             const minutes = Number(voterTime);
             const futureDate = new Date(Date.now() + (minutes * 60 * 1000));
@@ -3122,40 +3525,60 @@ app.post("/admin/settings/session", async (req, res) => {
         } else if (voterTime == 0) {
             statusUpdate.sessionTimer = admin.firestore.FieldValue.delete();
         }
+
         await db.collection("settings").doc("electionStatus").set(statusUpdate, { merge: true });
+
         const now = admin.firestore.FieldValue.serverTimestamp();
-        await db.collection("app_config").doc("candidates_static").set({ lastUpdated: now }, { merge: true });
+
+        await db.collection("app_config").doc("candidates_static").set({
+            lastUpdated: now
+        }, { merge: true });
+
         const resultsConfig = { lastUpdated: now };
-        if (typeof isLive === 'boolean') resultsConfig.isLive = isLive;
+
+        if (typeof isLive === 'boolean') {
+            resultsConfig.isLive = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            resultsConfig.isQueue = isQueue;
+        }
+
         await db.collection("app_config").doc("results_public").set(resultsConfig, { merge: true });
-        if (typeof isLive === 'boolean') GlobalCache.dashboard.isLive = isLive;
+
+        if (typeof isLive === 'boolean') {
+            GlobalCache.dashboard.isLive = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            GlobalCache.dashboard.isQueue = isQueue;
+        }
+
         await logAdminAction(req, "SET_ELECTION_SESSION", {
             isLive: typeof isLive === 'boolean' ? isLive : null,
+            isQueue: typeof isQueue === 'boolean' ? isQueue : null,
             activeGrade: activeGrade !== undefined ? activeGrade : null,
             voterTime: voterTime !== undefined ? voterTime : null,
         });
-        await logSuccessEvent("ADMIN_SET_SESSION", req, { isLive: typeof isLive === 'boolean' ? isLive : null, activeGrade: activeGrade !== undefined ? activeGrade : null });
+
+        await logSuccessEvent("ADMIN_SET_SESSION", req, {
+            isLive: typeof isLive === 'boolean' ? isLive : null,
+            isQueue: typeof isQueue === 'boolean' ? isQueue : null,
+            activeGrade: activeGrade !== undefined ? activeGrade : null
+        });
+
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         await alertManager.detectSystemHealth();
-        res.json({ success: true, isLive, activeGrade });
+
+        res.json({
+            success: true,
+            isLive,
+            isQueue,
+            activeGrade
+        });
+
     } catch (e) {
         res.status(500).json({ error: "Failed to update election status" });
-    }
-});
-
-app.post("/admin/settings/timers", async (req, res) => {
-    const voterTime = req.body.voterTime;
-    try {
-        await db.collection("settings").doc("config").set({
-            voterTimeoutMinutes: parseInt(voterTime) || 60,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        await logAdminAction(req, "SET_VOTER_TIMEOUT", { voterTimeoutMinutes: parseInt(voterTime) || 60 });
-        await logSuccessEvent("ADMIN_SET_TIMERS", req, { voterTimeoutMinutes: parseInt(voterTime) || 60 });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: "Failed to save timer settings" });
     }
 });
 
@@ -3183,7 +3606,6 @@ app.post("/admin/purge", async (req, res) => {
 
         await purgeElectionData();
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         await alertManager.detectSystemHealth();
 
         await alertManager.createAlert(
@@ -3338,7 +3760,6 @@ app.post("/admin/publish/candidates", async (req, res) => {
             );
 
             await alertManager.detectCandidatesStatus();
-            await alertManager.detectVoteIntegrity();
             await alertManager.detectSystemHealth();
             res.json({ success: true, message: "Candidates published successfully." });
             await alertManager.clearResolvedAlerts('candidate_sync');
@@ -3448,7 +3869,6 @@ app.post("/admin/add-party", async (req, res) => {
             24 * 60 * 60 * 1000
         );
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -3476,7 +3896,6 @@ app.post("/admin/delete", async (req, res) => {
             await logImmutableAction(req, "DELETE_PARTY", { partyName });
             await logSuccessEvent("ADMIN_DELETE_PARTY", req, { partyName });
             await alertManager.detectCandidatesStatus();
-            await alertManager.detectVoteIntegrity();
             return res.json({ success: true });
         }
         if (position && candidateId) {
@@ -3496,7 +3915,6 @@ app.post("/admin/delete", async (req, res) => {
             return res.json({ success: true });
         }
         await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
         await alertManager.detectSystemHealth();
         res.status(400).json({ error: "Bad Params" });
     } catch (e) {
