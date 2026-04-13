@@ -254,41 +254,45 @@ setInterval(async () => {
 }, 30000);
 
 async function joinQueue(userId) {
-    const queueStatusRef = rtdb.ref("queue/status");
-    const userRef = rtdb.ref(`queue/users/${userId}`);
+    const queueRef = rtdb.ref('queue');
 
-    // Check if user is already in queue
-    const snapshot = await userRef.get();
-    if (snapshot.exists()) {
-        const data = snapshot.val();
-        if (data.s !== "done") return; // Status: s (status), p (position)
-    }
+    await queueRef.transaction(current => {
+        // Initialise if empty
+        current = current || {
+            activeCount: 0,
+            maxActive: 50,
+            lastPosition: 0,
+            users: {}
+        };
 
-    // Atomic transaction for position increment
-    await queueStatusRef.transaction((current) => {
-        const data = current || { lastPosition: 0, activeCount: 0 };
-        const maxActive = 50; // You can also pull this from rtdb.ref("queue/config/maxActive")
-        
-        const newPosition = data.lastPosition + 1;
-        let newStatus = "waiting";
-        let newActiveCount = data.activeCount;
+        // If user already exists and status is 'done', do nothing
+        if (current.users[userId] && current.users[userId].status === 'done') {
+            return; // abort transaction
+        }
 
-        if (newActiveCount < maxActive) {
-            newStatus = "active";
+        // Assign new position
+        const newPosition = current.lastPosition + 1;
+
+        // Determine status based on available slots
+        let newStatus = 'waiting';
+        let newActiveCount = current.activeCount;
+        if (current.activeCount < current.maxActive) {
+            newStatus = 'active';
             newActiveCount++;
         }
 
-        // Set user data inside the transaction to ensure atomicity
-        userRef.set({
-            p: newPosition,
-            s: newStatus,
-            t: admin.database.ServerValue.TIMESTAMP
-        });
-
-        return {
-            lastPosition: newPosition,
-            activeCount: newActiveCount
+        // Update user record
+        current.users[userId] = {
+            position: newPosition,
+            status: newStatus,
+            joinedAt: admin.database.ServerValue.TIMESTAMP
         };
+
+        // Update global counters
+        current.activeCount = newActiveCount;
+        current.lastPosition = newPosition;
+
+        return current;
     });
 }
 
@@ -2992,18 +2996,13 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         const electionData = settings.data();
 
-        // 🚦 QUEUE ENFORCEMENT
         if (electionData.isQueue) {
-            const queueRef = db.collection("queue_users").doc(hashedLVN);
-            const queueSnap = await queueRef.get();
-
-            if (!queueSnap.exists) {
+            const userSnap = await rtdb.ref(`queue/users/${hashedLVN}`).once('value');
+            if (!userSnap.exists()) {
                 return res.status(403).json({ error: "You are not in the queue." });
             }
-
-            const queueData = queueSnap.data();
-
-            if (queueData.status !== "active") {
+            const queueData = userSnap.val();
+            if (queueData.status !== 'active') {
                 return res.status(403).json({ error: "Please wait for your turn." });
             }
         }
@@ -3094,48 +3093,37 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             prevHash: voteResult.prevHash
         });
 
-        // 🔄 QUEUE PROGRESSION (DYNAMIC SLOT SYSTEM)
         if (electionData.isQueue) {
             setImmediate(async () => {
-                try {
-                    const queueRef = db.collection("queue").doc("active");
-                    const userRef = db.collection("queue_users").doc(hashedLVN);
+                const queueRef = rtdb.ref('queue');
+                await queueRef.transaction(current => {
+                    if (!current) return current;
+                    const user = current.users[hashedLVN];
+                    if (!user) return current;
 
-                    await db.runTransaction(async (t) => {
-                        const queueDoc = await t.get(queueRef);
-                        const data = queueDoc.data() || {};
+                    // Mark this user as done
+                    user.status = 'done';
+                    // Free one active slot
+                    let newActiveCount = Math.max(0, (current.activeCount || 0) - 1);
 
-                        let activeCount = data.activeCount || 0;
-
-                        // mark user done
-                        t.set(userRef, { status: "done" }, { merge: true });
-
-                        // 🔥 free slot
-                        activeCount = Math.max(0, activeCount - 1);
-
-                        // 🔥 activate next waiting user (FIFO)
-                        const nextSnap = await db.collection("queue_users")
-                            .where("status", "==", "waiting")
-                            .orderBy("position")
-                            .limit(1)
-                            .get();
-
-                        if (!nextSnap.empty) {
-                            t.set(nextSnap.docs[0].ref, {
-                                status: "active"
-                            }, { merge: true });
-
-                            activeCount++; // fill slot immediately
+                    // Find next waiting user (FIFO by position)
+                    let nextUserId = null;
+                    let lowestPosition = Infinity;
+                    for (const [uid, data] of Object.entries(current.users)) {
+                        if (data.status === 'waiting' && data.position < lowestPosition) {
+                            nextUserId = uid;
+                            lowestPosition = data.position;
                         }
+                    }
 
-                        t.set(queueRef, {
-                            activeCount
-                        }, { merge: true });
-                    });
+                    if (nextUserId) {
+                        current.users[nextUserId].status = 'active';
+                        newActiveCount++;
+                    }
 
-                } catch (err) {
-                    console.error("Queue update failed:", err);
-                }
+                    current.activeCount = newActiveCount;
+                    return current;
+                });
             });
         }
 
