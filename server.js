@@ -1596,6 +1596,17 @@ app.use(
     })
 );
 
+app.use((req, res, next) => {
+    const originalSetHeader = res.setHeader;
+    res.setHeader = function(name, value) {
+        if (name === 'Content-Security-Policy') {
+            console.log('🔐 CSP HEADER SET:', value);
+        }
+        return originalSetHeader.call(this, name, value);
+    };
+    next();
+});
+
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
