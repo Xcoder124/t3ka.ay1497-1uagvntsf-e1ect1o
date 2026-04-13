@@ -2882,7 +2882,8 @@ app.post("/verify", loginLimiter, async (req, res) => {
             grade: d.grade,
             token: sessionToken,
             csrfToken,
-            isQueue // ✅ FRONTEND USES THIS
+            isQueue, // ✅ FRONTEND USES THIS
+            ...(isQueue && { queueKey: hashedLVN }) // ✅ RTDB path key for queue listener
         });
 
     } catch (e) {
