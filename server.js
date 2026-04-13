@@ -1,4 +1,5 @@
 const admin = require("firebase-admin");
+const rtdb = admin.database();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -44,7 +45,8 @@ try {
             projectId: process.env.FIREBASE_PROJECT_ID,
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
             privateKey: privateKey.replace(/\\n/g, '\n'),
-        })
+        }),
+        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com` // Ensure this matches your RTDB URL
     });
     console.log("Firebase Admin initialized successfully");
 } catch (error) {
@@ -252,46 +254,41 @@ setInterval(async () => {
 }, 30000);
 
 async function joinQueue(userId) {
-    const queueRef = db.collection("queue").doc("active");
-    const userRef = db.collection("queue_users").doc(userId);
+    const queueStatusRef = rtdb.ref("queue/status");
+    const userRef = rtdb.ref(`queue/users/${userId}`);
 
-    const existing = await userRef.get();
-    if (existing.exists) {
-        const data = existing.data();
-
-        if (data.status !== "done") return;
+    // Check if user is already in queue
+    const snapshot = await userRef.get();
+    if (snapshot.exists()) {
+        const data = snapshot.val();
+        if (data.s !== "done") return; // Status: s (status), p (position)
     }
 
-    await db.runTransaction(async (t) => {
-        const queueDoc = await t.get(queueRef);
-        const data = queueDoc.data() || {};
+    // Atomic transaction for position increment
+    await queueStatusRef.transaction((current) => {
+        const data = current || { lastPosition: 0, activeCount: 0 };
+        const maxActive = 50; // You can also pull this from rtdb.ref("queue/config/maxActive")
+        
+        const newPosition = data.lastPosition + 1;
+        let newStatus = "waiting";
+        let newActiveCount = data.activeCount;
 
-        let lastPosition = data.lastPosition || 0;
-        let activeCount = data.activeCount || 0;
-        let maxActive = data.maxActive || 50; // keep consistent
-
-        const newPosition = lastPosition + 1;
-
-        let status;
-
-        // 🔥 dynamic slot filling
-        if (activeCount < maxActive) {
-            status = "active";
-            activeCount++;
-        } else {
-            status = "waiting";
+        if (newActiveCount < maxActive) {
+            newStatus = "active";
+            newActiveCount++;
         }
 
-        t.set(userRef, {
-            position: newPosition,
-            status,
-            joinedAt: admin.firestore.FieldValue.serverTimestamp()
+        // Set user data inside the transaction to ensure atomicity
+        userRef.set({
+            p: newPosition,
+            s: newStatus,
+            t: admin.database.ServerValue.TIMESTAMP
         });
 
-        t.set(queueRef, {
+        return {
             lastPosition: newPosition,
-            activeCount
-        }, { merge: true });
+            activeCount: newActiveCount
+        };
     });
 }
 
