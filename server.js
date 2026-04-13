@@ -1555,21 +1555,42 @@ app.use(cors({
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
+    next();
+});
 
+app.use(
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net", "https://www.gstatic.com"],
+            scriptSrc: [
+                "'self'",
+                (req, res) => `'nonce-${req.cspNonce}'`,
+                "https://cdnjs.cloudflare.com",
+                "https://www.gstatic.com",
+                "https://cdn.jsdelivr.net",
+                "https://challenges.cloudflare.com"
+            ],
+            scriptSrcElem: [
+                "'self'",
+                "https://www.gstatic.com",
+                "https://cdn.jsdelivr.net",
+                "https://cdnjs.cloudflare.com"
+            ],
             frameSrc: ["'self'", "https://challenges.cloudflare.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
+            connectSrc: [
+                "'self'",
+                "https://identitytoolkit.googleapis.com",
+                "https://securetoken.googleapis.com",
+                "https://challenges.cloudflare.com",
+                `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
+            ],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
             imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-            frameAncestors: ["'none'"],
-
-        },
-    })(req, res, next);
-});
+            frameAncestors: ["'none'"]
+        }
+    })
+);
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
