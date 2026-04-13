@@ -100,36 +100,44 @@ app.use(cors({
     exposedHeaders: ["set-cookie"]
 }));
 
-// CSP Middleware with Signed Nonce Support - MANUAL CSP (Helmet CSP disabled)
+// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
     next();
 });
 
-// DISABLE Helmet's CSP completely - we set it manually below
 app.use(
     helmet({
-        contentSecurityPolicy: false // CRITICAL: Disable helmet's CSP entirely
+        contentSecurityPolicy: {
+            useDefaults: false,
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: [
+                    "'self'",
+                    "'unsafe-inline'",
+                    (req, res) => `'nonce-${req.cspNonce}'`,
+                    "https://cdnjs.cloudflare.com",
+                    "https://www.gstatic.com",
+                    "https://cdn.jsdelivr.net",
+                    "https://challenges.cloudflare.com"
+                ],
+                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+                styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+                connectSrc: [
+                    "'self'",
+                    "https://identitytoolkit.googleapis.com",
+                    "https://securetoken.googleapis.com",
+                    "https://challenges.cloudflare.com",
+                    "https://*.firebasedatabase.app",
+                    "https://*.firebaseio.com"
+                ],
+                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+                frameAncestors: ["'none'"]
+            }
+        }
     })
 );
-
-// MANUAL CSP - Set it ourselves to avoid Helmet v7 issues
-app.use((req, res, next) => {
-    const cspDirectives = [
-        `default-src 'self'`,
-        `script-src 'self' 'unsafe-inline' 'nonce-${req.cspNonce}' https://cdnjs.cloudflare.com https://www.gstatic.com https://cdn.jsdelivr.net https://challenges.cloudflare.com`,
-        `frame-src 'self' https://challenges.cloudflare.com`,
-        `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com`,
-        `connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://challenges.cloudflare.com https://*.firebasedatabase.app https://*.firebaseio.com`,
-        `font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com`,
-        `img-src 'self' data: blob: https://firebasestorage.googleapis.com https://ui-avatars.com`,
-        `frame-ancestors 'none'`
-    ];
-    
-    const cspHeader = cspDirectives.join('; ');
-    res.setHeader('Content-Security-Policy', cspHeader);
-    next();
-});
 
 app.use((req, res, next) => {
     const originalSetHeader = res.setHeader;
