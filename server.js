@@ -103,9 +103,9 @@ app.use(cors({
         }
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Requested-With"],
-    exposedHeaders: ["set-cookie", "Content-Type"],
+     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Submit-Token"],
+     exposedHeaders: ["set-cookie", "Content-Type"],
     preflightContinue: false,
     optionsSuccessStatus: 204
 }));
@@ -2758,6 +2758,12 @@ app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, re
 });
 
 app.post("/verify", loginLimiter, async (req, res) => {
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+    
     if (!(await verifyCaptcha(req.body.captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
     }
