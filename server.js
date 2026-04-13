@@ -79,7 +79,8 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
     ? [
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
+        "https://adesportstorres-v2.web.app",
+        "https://tsf-sslg-election-endpoint.onrender.com"
     ]
     : [
         "http://127.0.0.1:5500",
@@ -90,15 +91,27 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
     ];
 
 app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    origin: function(origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl)
+        if (!origin) return callback(null, true);
+        
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        } else {
+            console.log('Blocked CORS request from:', origin);
+            return callback(new Error("CORS Policy: Origin not allowed"), false);
+        }
     },
     credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
-    exposedHeaders: ["set-cookie"]
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Requested-With"],
+    exposedHeaders: ["set-cookie", "Content-Type"],
+    preflightContinue: false,
+    optionsSuccessStatus: 204
 }));
+
+// Handle preflight requests explicitly
+app.options('*', cors());
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
