@@ -315,46 +315,44 @@ setInterval(async () => {
     } catch (e) { console.error("Expiry check error:", e); }
 }, 30000);
 
-async function joinQueue(userId) {
-    const queueRef = rtdb.ref('queue');
+async function joinQueue(userId, grade) {
+    const gradeKey = `sessionG${grade}`;
+    const queueRef = rtdb.ref(`queue/${gradeKey}`);
 
     await queueRef.transaction(current => {
-        // Initialise if empty
         current = current || {
             activeCount: 0,
-            maxActive: 50,
+            maxActive: 50,  // 50 voters per grade at a time
             lastPosition: 0,
             users: {}
         };
 
-        if (!current.users) {
-            current.users = {};
-        }
+        if (!current.users) current.users = {};
 
-        // If user already exists and status is 'done', do nothing
+        // If user already exists and is done, don't re-add
         if (current.users[userId] && current.users[userId].status === 'done') {
             return; // abort transaction
         }
 
-        // Assign new position
         const newPosition = current.lastPosition + 1;
 
-        // Determine status based on available slots
+        // Determine status based on position within this grade's slots
         let newStatus = 'waiting';
         let newActiveCount = current.activeCount;
-        if (current.activeCount < current.maxActive) {
+
+        // If position is within maxActive slots for THIS GRADE, they're active immediately
+        if (newPosition <= current.maxActive) {
             newStatus = 'active';
             newActiveCount++;
         }
 
-        // Update user record
         current.users[userId] = {
             position: newPosition,
             status: newStatus,
-            joinedAt: admin.database.ServerValue.TIMESTAMP
+            joinedAt: admin.database.ServerValue.TIMESTAMP,
+            grade: grade  // Store grade for reference
         };
 
-        // Update global counters
         current.activeCount = newActiveCount;
         current.lastPosition = newPosition;
 
@@ -362,7 +360,7 @@ async function joinQueue(userId) {
     });
 }
 
-function calculateETA(position, currentServing, maxActive = 50, avgTime = 2) {
+function calculateETA(position, currentServing, maxActive = 100, avgTime = 5) {
     const peopleAhead = position - (currentServing + maxActive);
 
     if (peopleAhead <= 0) return "You're next!";
@@ -2825,6 +2823,27 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
 
         if (d.hasVoted) {
+            // ✅ Clean up queue entry if they somehow still exist
+            if (settingsData.isQueue) {
+                setImmediate(async () => {
+                    try {
+                        const queueRef = rtdb.ref('queue');
+                        await queueRef.transaction(current => {
+                            if (current && current.users && current.users[hashedLVN]) {
+                                delete current.users[hashedLVN];
+                                // Adjust activeCount if needed
+                                if (current.users[hashedLVN]?.status === 'active') {
+                                    current.activeCount = Math.max(0, (current.activeCount || 0) - 1);
+                                }
+                            }
+                            return current;
+                        });
+                    } catch (err) {
+                        console.error("Failed to cleanup voted user from queue:", err);
+                    }
+                });
+            }
+
             await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
             return res.status(403).json({ error: "Already Voted." });
         }
@@ -2841,7 +2860,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isQueue = settingsData.isQueue === true;
 
         if (isQueue) {
-            await joinQueue(hashedLVN); 
+            await joinQueue(hashedLVN, d.grade || activeGrade);
         }
 
         await deviceRef.set({
@@ -3119,35 +3138,50 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         if (electionData.isQueue) {
             setImmediate(async () => {
-                const queueRef = rtdb.ref('queue');
-                await queueRef.transaction(current => {
-                    if (!current || !current.users) return current;
-                    const user = current.users[hashedLVN];
-                    if (!user) return current;
+                try {
+                    const grade = req.user.grade;
+                    const gradeKey = `sessionG${grade}`;
+                    const queueRef = rtdb.ref(`queue/${gradeKey}`);
 
-                    // Mark this user as done
-                    user.status = 'done';
-                    // Free one active slot
-                    let newActiveCount = Math.max(0, (current.activeCount || 0) - 1);
+                    await queueRef.transaction(current => {
+                        if (!current || !current.users) return current;
 
-                    // Find next waiting user (FIFO by position)
-                    let nextUserId = null;
-                    let lowestPosition = Infinity;
-                    for (const [uid, data] of Object.entries(current.users)) {
-                        if (data.status === 'waiting' && data.position < lowestPosition) {
-                            nextUserId = uid;
-                            lowestPosition = data.position;
+                        // Remove the user who just voted
+                        if (current.users[hashedLVN]) {
+                            delete current.users[hashedLVN];
                         }
-                    }
 
-                    if (nextUserId) {
-                        current.users[nextUserId].status = 'active';
-                        newActiveCount++;
-                    }
+                        // Recalculate active count based on current active users
+                        let newActiveCount = 0;
+                        let nextUserId = null;
+                        let lowestPosition = Infinity;
 
-                    current.activeCount = newActiveCount;
-                    return current;
-                });
+                        // Count active users and find next waiting user
+                        for (const [uid, data] of Object.entries(current.users)) {
+                            if (data.status === 'active') {
+                                newActiveCount++;
+                            } else if (data.status === 'waiting' && data.position < lowestPosition) {
+                                nextUserId = uid;
+                                lowestPosition = data.position;
+                            }
+                        }
+
+                        // Activate the next user if there's room
+                        if (nextUserId && newActiveCount < current.maxActive) {
+                            current.users[nextUserId].status = 'active';
+                            newActiveCount++;
+                        }
+
+                        current.activeCount = newActiveCount;
+
+                        return current;
+                    });
+
+                    console.log(`✅ User ${hashedLVN.substring(0, 8)} removed from ${gradeKey} queue after voting`);
+
+                } catch (err) {
+                    console.error("Failed to remove user from queue:", err);
+                }
             });
         }
 
@@ -3162,41 +3196,55 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
     }
 });
 
-async function completeVoting(userId) {
-    const userRef = db.collection("queue_users").doc(userId);
-    const queueRef = db.collection("queue").doc("active");
+setInterval(async () => {
+    const grades = ['G7', 'G8', 'G9', 'G10', 'G11', 'G12'];
 
-    await db.runTransaction(async (t) => {
-        const queueDoc = await t.get(queueRef);
-        const data = queueDoc.data();
+    for (const grade of grades) {
+        const gradeKey = `session${grade}`;
+        const usersRef = rtdb.ref(`queue/${gradeKey}/users`);
+        const queueRef = rtdb.ref(`queue/${gradeKey}`);
 
-        let currentServing = data.currentServing || 0;
+        try {
+            const snapshot = await usersRef.once('value');
+            const users = snapshot.val() || {};
 
-        // mark user done
-        t.update(userRef, {
-            status: "done"
-        });
+            let cleanedCount = 0;
+            let needsRecalc = false;
 
-        // move queue forward
-        currentServing++;
+            for (const [userId, userData] of Object.entries(users)) {
+                // ✅ Just check RTDB status - no Firestore call!
+                if (userData.status === 'done') {
+                    await usersRef.child(userId).remove();
+                    cleanedCount++;
+                    needsRecalc = true;
+                }
+            }
 
-        t.update(queueRef, {
-            currentServing
-        });
+            if (cleanedCount > 0) {
+                console.log(`🧹 Cleaned up ${cleanedCount} 'done' entries from ${gradeKey}`);
 
-        // 🔥 Activate next user
-        const nextUserSnap = await db.collection("queue_users")
-            .where("position", "==", currentServing + data.maxActive)
-            .limit(1)
-            .get();
+                if (needsRecalc) {
+                    // Recalculate activeCount from remaining users
+                    const remainingSnapshot = await usersRef.once('value');
+                    const remainingUsers = remainingSnapshot.val() || {};
 
-        if (!nextUserSnap.empty) {
-            t.update(nextUserSnap.docs[0].ref, {
-                status: "active"
-            });
+                    let newActiveCount = 0;
+                    for (const [_, data] of Object.entries(remainingUsers)) {
+                        if (data.status === 'active') {
+                            newActiveCount++;
+                        }
+                    }
+
+                    await queueRef.update({ activeCount: newActiveCount });
+                    console.log(`📊 ${gradeKey} activeCount recalculated: ${newActiveCount}`);
+                }
+            }
+
+        } catch (err) {
+            console.error(`Queue cleanup error for ${gradeKey}:`, err);
         }
-    });
-}
+    }
+}, 10 * 60 * 1000);
 
 app.post("/verify-vote", rateLimit({
     windowMs: 60 * 1000,
