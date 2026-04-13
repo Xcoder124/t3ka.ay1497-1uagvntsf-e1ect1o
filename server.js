@@ -1,5 +1,4 @@
 const admin = require("firebase-admin");
-const rtdb = admin.database();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -46,13 +45,15 @@ try {
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
             privateKey: privateKey.replace(/\\n/g, '\n'),
         }),
-        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com` // Ensure this matches your RTDB URL
+        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app` // Ensure this matches your RTDB URL
     });
     console.log("Firebase Admin initialized successfully");
 } catch (error) {
     console.error("Firebase initialization failed:", error.message);
     process.exit(1);
 }
+
+const rtdb = admin.database();
 
 console.log("=== SERVER STARTING ===");
 console.log("NODE_ENV:", process.env.NODE_ENV);
