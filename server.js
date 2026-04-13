@@ -327,6 +327,10 @@ async function joinQueue(userId) {
             users: {}
         };
 
+        if (!current.users) {
+            current.users = {};
+        }
+
         // If user already exists and status is 'done', do nothing
         if (current.users[userId] && current.users[userId].status === 'done') {
             return; // abort transaction
@@ -3116,7 +3120,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             setImmediate(async () => {
                 const queueRef = rtdb.ref('queue');
                 await queueRef.transaction(current => {
-                    if (!current) return current;
+                    if (!current || !current.users) return current;
                     const user = current.users[hashedLVN];
                     if (!user) return current;
 
