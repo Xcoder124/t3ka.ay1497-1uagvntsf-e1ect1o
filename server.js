@@ -55,6 +55,7 @@ try {
 
 const rtdb = admin.database();
 
+
 console.log("=== SERVER STARTING ===");
 console.log("NODE_ENV:", process.env.NODE_ENV);
 console.log("FIREBASE_PROJECT_ID exists:", !!process.env.FIREBASE_PROJECT_ID);
@@ -67,6 +68,92 @@ console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
 const app = express();
 let activeUsers = 0;
+
+// --- MIDDLEWARE & APP CONFIG ---
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '110kb' }));
+app.use(cookieParser());
+
+// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+const allowedOrigins = process.env.NODE_ENV === 'production'
+    ? [
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ]
+    : [
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ];
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
+    exposedHeaders: ["set-cookie"]
+}));
+
+// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
+app.use((req, res, next) => {
+    req.cspNonce = generateNonce();
+    next();
+});
+
+app.use(
+    helmet({
+        contentSecurityPolicy: {
+            useDefaults: false,
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: [
+                    "'self'",
+                    (req, res) => `'nonce-${req.cspNonce}'`,
+                    "https://cdnjs.cloudflare.com",
+                    "https://www.gstatic.com",
+                    "https://cdn.jsdelivr.net",
+                    "https://challenges.cloudflare.com"
+                ],
+                scriptSrcElem: [
+                    "'self'",
+                    "https://cdnjs.cloudflare.com",
+                    "https://www.gstatic.com",
+                    "https://cdn.jsdelivr.net"
+                ],
+                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+                styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
+                styleSrcElem: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
+                connectSrc: [
+                    "'self'",
+                    "https://identitytoolkit.googleapis.com",
+                    "https://securetoken.googleapis.com",
+                    "https://challenges.cloudflare.com",
+                    `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
+                ],
+                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+                frameAncestors: ["'none'"]
+            }
+        }
+    })
+);
+
+app.use((req, res, next) => {
+    const originalSetHeader = res.setHeader;
+    res.setHeader = function(name, value) {
+        if (name === 'Content-Security-Policy') {
+            console.log('🔐 CSP HEADER SET:', value);
+        }
+        return originalSetHeader.call(this, name, value);
+    };
+    next();
+});
 
 app.use((req, res, next) => {
     activeUsers++;
@@ -1520,92 +1607,6 @@ function requireMobile(req, res, next) {
     }
     next();
 }
-
-// --- MIDDLEWARE & APP CONFIG ---
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '110kb' }));
-app.use(cookieParser());
-
-// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
-const allowedOrigins = process.env.NODE_ENV === 'production'
-    ? [
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
-    ]
-    : [
-        "http://127.0.0.1:5500",
-        "http://localhost:3000",
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
-    ];
-
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error("CORS Policy: Origin not allowed"), false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
-    exposedHeaders: ["set-cookie"]
-}));
-
-// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
-app.use((req, res, next) => {
-    req.cspNonce = generateNonce();
-    next();
-});
-
-app.use(
-    helmet({
-        contentSecurityPolicy: {
-            useDefaults: false,
-            directives: {
-                defaultSrc: ["'self'"],
-                scriptSrc: [
-                    "'self'",
-                    (req, res) => `'nonce-${req.cspNonce}'`,
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net",
-                    "https://challenges.cloudflare.com"
-                ],
-                scriptSrcElem: [
-                    "'self'",
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net"
-                ],
-                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-                styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                styleSrcElem: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                connectSrc: [
-                    "'self'",
-                    "https://identitytoolkit.googleapis.com",
-                    "https://securetoken.googleapis.com",
-                    "https://challenges.cloudflare.com",
-                    `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
-                ],
-                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-                frameAncestors: ["'none'"]
-            }
-        }
-    })
-);
-
-app.use((req, res, next) => {
-    const originalSetHeader = res.setHeader;
-    res.setHeader = function(name, value) {
-        if (name === 'Content-Security-Policy') {
-            console.log('🔐 CSP HEADER SET:', value);
-        }
-        return originalSetHeader.call(this, name, value);
-    };
-    next();
-});
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
