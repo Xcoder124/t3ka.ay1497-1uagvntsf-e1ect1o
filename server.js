@@ -55,7 +55,6 @@ try {
 
 const rtdb = admin.database();
 
-
 console.log("=== SERVER STARTING ===");
 console.log("NODE_ENV:", process.env.NODE_ENV);
 console.log("FIREBASE_PROJECT_ID exists:", !!process.env.FIREBASE_PROJECT_ID);
@@ -68,97 +67,6 @@ console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
 const app = express();
 let activeUsers = 0;
-
-// --- MIDDLEWARE & APP CONFIG ---
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '110kb' }));
-app.use(cookieParser());
-
-// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
-const allowedOrigins = process.env.NODE_ENV === 'production'
-    ? [
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app",
-        "https://tsf-sslg-election-endpoint.onrender.com"
-    ]
-    : [
-        "http://127.0.0.1:5500",
-        "http://localhost:3000",
-        "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
-    ];
-
-app.use(cors({
-    origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl)
-        if (!origin) return callback(null, true);
-
-        if (allowedOrigins.includes(origin)) {
-            return callback(null, true);
-        } else {
-            console.log('Blocked CORS request from:', origin);
-            return callback(new Error("CORS Policy: Origin not allowed"), false);
-        }
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Submit-Token"],
-    exposedHeaders: ["set-cookie", "Content-Type"],
-    preflightContinue: false,
-    optionsSuccessStatus: 204
-}));
-
-// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
-app.use((req, res, next) => {
-    req.cspNonce = generateNonce();
-    next();
-});
-
-app.use(
-    helmet({
-        contentSecurityPolicy: {
-            useDefaults: false,
-            directives: {
-                defaultSrc: ["'self'"],
-                scriptSrc: [
-                    "'self'",
-                    "'unsafe-inline'",
-                    (req, res) => `'nonce-${req.cspNonce}'`,
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net",
-                    "https://challenges.cloudflare.com"
-                ],
-                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-                styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-                connectSrc: [
-                    "'self'",
-                    "https://identitytoolkit.googleapis.com",
-                    "https://securetoken.googleapis.com",
-                    "https://challenges.cloudflare.com",
-                    "https://*.firebasedatabase.app",
-                    "https://*.firebaseio.com"
-                ],
-                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-                frameAncestors: ["'none'"]
-            }
-        }
-    })
-);
-
-app.use((req, res, next) => {
-    const originalSetHeader = res.setHeader;
-    res.setHeader = function (name, value) {
-        if (name === 'Content-Security-Policy') {
-            console.log('🔐 CSP HEADER SET:', value);
-        }
-        return originalSetHeader.call(this, name, value);
-    };
-    next();
-});
 
 app.use((req, res, next) => {
     activeUsers++;
@@ -1612,6 +1520,92 @@ function requireMobile(req, res, next) {
     }
     next();
 }
+
+// --- MIDDLEWARE & APP CONFIG ---
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '110kb' }));
+app.use(cookieParser());
+
+// --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+const allowedOrigins = process.env.NODE_ENV === 'production'
+    ? [
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ]
+    : [
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "https://tsf-g-digital-election.web.app",
+        "https://tanauanschooloffisheries.web.app",
+        "https://adesportstorres-v2.web.app"
+    ];
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
+    exposedHeaders: ["set-cookie"]
+}));
+
+// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
+app.use((req, res, next) => {
+    req.cspNonce = generateNonce();
+    next();
+});
+
+app.use(
+    helmet({
+        contentSecurityPolicy: {
+            useDefaults: false,
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: [
+                    "'self'",
+                    (req, res) => `'nonce-${req.cspNonce}'`,
+                    "https://cdnjs.cloudflare.com",
+                    "https://www.gstatic.com",
+                    "https://cdn.jsdelivr.net",
+                    "https://challenges.cloudflare.com"
+                ],
+                scriptSrcElem: [
+                    "'self'",
+                    "https://cdnjs.cloudflare.com",
+                    "https://www.gstatic.com",
+                    "https://cdn.jsdelivr.net"
+                ],
+                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+                styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
+                styleSrcElem: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
+                connectSrc: [
+                    "'self'",
+                    "https://identitytoolkit.googleapis.com",
+                    "https://securetoken.googleapis.com",
+                    "https://challenges.cloudflare.com",
+                    `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
+                ],
+                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+                frameAncestors: ["'none'"]
+            }
+        }
+    })
+);
+
+app.use((req, res, next) => {
+    const originalSetHeader = res.setHeader;
+    res.setHeader = function(name, value) {
+        if (name === 'Content-Security-Policy') {
+            console.log('🔐 CSP HEADER SET:', value);
+        }
+        return originalSetHeader.call(this, name, value);
+    };
+    next();
+});
 
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
@@ -4095,39 +4089,8 @@ app.get("/admin/forms/submissions", async (req, res) => {
     }
 });
 
-// --- KEEP-ALIVE: Prevent Render free-tier from sleeping ---
-// Ping ourselves every 14 minutes so the server never goes idle
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
-setInterval(async () => {
-    try {
-        const res = await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
-        console.log(`[keep-alive] ping OK ${res.status}`);
-    } catch (err) {
-        console.warn(`[keep-alive] ping failed: ${err.message}`);
-    }
-}, 14 * 60 * 1000);
-
-// --- HEALTH CHECK (used by keep-alive + Render health checks) ---
-app.get("/health", (req, res) => {
-    res.status(200).json({ status: "ok", ts: Date.now() });
-});
-
-app.use((err, req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && allowedOrigins.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Vary', 'Origin');
-    }
-    console.error('Unhandled error:', err.stack || err.message);
-    if (!res.headersSent) {
-        const status = err.status || err.statusCode || 500;
-        res.status(status).json({ error: err.message || 'Internal server error' });
-    }
-});
-
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`\uD83D\uDE80 Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
