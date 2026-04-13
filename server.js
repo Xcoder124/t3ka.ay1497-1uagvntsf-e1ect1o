@@ -99,7 +99,16 @@ app.use(cors({
     exposedHeaders: ["set-cookie"]
 }));
 
-app.options('*', cors());
+app.options('*', (req, res) => {
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes(origin)) {
+        res.header('Access-Control-Allow-Origin', origin);
+        res.header('Access-Control-Allow-Credentials', 'true');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-CSRF-Token, X-Admin-Key');
+    }
+    res.sendStatus(204);
+});
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
@@ -111,7 +120,7 @@ app.use((req, res, next) => {
             scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
             frameSrc: ["'self'", "https://challenges.cloudflare.com"],
             styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com", "https://tsf-sslg-election-endpoint.onrender.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com", "https://tsf-sslg-election-endpoint.onrender.com", "https://tsf-g-digital-election.web.app", "https//tanauanschooloffisheries.web.app"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
             imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
             frameAncestors: ["'none'"],
@@ -2828,7 +2837,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isQueue = settingsData.isQueue === true;
 
         if (isQueue) {
-            await joinQueue(hashedLVN); // ✅ SAFE + CONSISTENT
+            await joinQueue(hashedLVN); 
         }
 
         await deviceRef.set({
