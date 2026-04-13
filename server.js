@@ -110,9 +110,6 @@ app.use(cors({
     optionsSuccessStatus: 204
 }));
 
-// Handle preflight requests explicitly
-app.options('*', cors());
-
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
@@ -2758,12 +2755,6 @@ app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, re
 });
 
 app.post("/verify", loginLimiter, async (req, res) => {
-    const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-    }
-    
     if (!(await verifyCaptcha(req.body.captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
     }
