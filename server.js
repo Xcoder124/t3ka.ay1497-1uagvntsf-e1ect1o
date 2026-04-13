@@ -100,45 +100,36 @@ app.use(cors({
     exposedHeaders: ["set-cookie"]
 }));
 
-// CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
+// CSP Middleware with Signed Nonce Support - MANUAL CSP (Helmet CSP disabled)
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
     next();
 });
 
+// DISABLE Helmet's CSP completely - we set it manually below
 app.use(
     helmet({
-        contentSecurityPolicy: {
-            useDefaults: false,
-            directives: {
-                defaultSrc: ["'self'"],
-                scriptSrc: [
-                    "'self'",
-                    "'unsafe-inline'", // Required for inline scripts in vote.html
-                    (req, res) => `'nonce-${req.cspNonce}'`,
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net",
-                    "https://challenges.cloudflare.com"
-                ],
-                // REMOVED scriptSrcElem - it falls back to scriptSrc and prevents override issues
-                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-                styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                connectSrc: [
-                    "'self'",
-                    "https://identitytoolkit.googleapis.com",
-                    "https://securetoken.googleapis.com",
-                    "https://challenges.cloudflare.com",
-                    "https://*.firebasedatabase.app", // Wildcard for all Firebase RTDB regions
-                    "https://*.firebaseio.com" // Legacy Firebase RTDB URLs
-                ],
-                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-                frameAncestors: ["'none'"]
-            }
-        }
+        contentSecurityPolicy: false // CRITICAL: Disable helmet's CSP entirely
     })
 );
+
+// MANUAL CSP - Set it ourselves to avoid Helmet v7 issues
+app.use((req, res, next) => {
+    const cspDirectives = [
+        `default-src 'self'`,
+        `script-src 'self' 'unsafe-inline' 'nonce-${req.cspNonce}' https://cdnjs.cloudflare.com https://www.gstatic.com https://cdn.jsdelivr.net https://challenges.cloudflare.com`,
+        `frame-src 'self' https://challenges.cloudflare.com`,
+        `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com`,
+        `connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://challenges.cloudflare.com https://*.firebasedatabase.app https://*.firebaseio.com`,
+        `font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com`,
+        `img-src 'self' data: blob: https://firebasestorage.googleapis.com https://ui-avatars.com`,
+        `frame-ancestors 'none'`
+    ];
+    
+    const cspHeader = cspDirectives.join('; ');
+    res.setHeader('Content-Security-Policy', cspHeader);
+    next();
+});
 
 app.use((req, res, next) => {
     const originalSetHeader = res.setHeader;
