@@ -91,10 +91,10 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
     ];
 
 app.use(cors({
-    origin: function(origin, callback) {
+    origin: function (origin, callback) {
         // Allow requests with no origin (like mobile apps or curl)
         if (!origin) return callback(null, true);
-        
+
         if (allowedOrigins.includes(origin)) {
             return callback(null, true);
         } else {
@@ -103,9 +103,9 @@ app.use(cors({
         }
     },
     credentials: true,
-     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Submit-Token"],
-     exposedHeaders: ["set-cookie", "Content-Type"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "X-Submit-Token"],
+    exposedHeaders: ["set-cookie", "Content-Type"],
     preflightContinue: false,
     optionsSuccessStatus: 204
 }));
@@ -151,7 +151,7 @@ app.use(
 
 app.use((req, res, next) => {
     const originalSetHeader = res.setHeader;
-    res.setHeader = function(name, value) {
+    res.setHeader = function (name, value) {
         if (name === 'Content-Security-Policy') {
             console.log('🔐 CSP HEADER SET:', value);
         }
@@ -4095,8 +4095,39 @@ app.get("/admin/forms/submissions", async (req, res) => {
     }
 });
 
+// --- KEEP-ALIVE: Prevent Render free-tier from sleeping ---
+// Ping ourselves every 14 minutes so the server never goes idle
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
+setInterval(async () => {
+    try {
+        const res = await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
+        console.log(`[keep-alive] ping OK ${res.status}`);
+    } catch (err) {
+        console.warn(`[keep-alive] ping failed: ${err.message}`);
+    }
+}, 14 * 60 * 1000);
+
+// --- HEALTH CHECK (used by keep-alive + Render health checks) ---
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", ts: Date.now() });
+});
+
+app.use((err, req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
+    console.error('Unhandled error:', err.stack || err.message);
+    if (!res.headersSent) {
+        const status = err.status || err.statusCode || 500;
+        res.status(status).json({ error: err.message || 'Internal server error' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`\uD83D\uDE80 Server running on port ${PORT}`);
 });
