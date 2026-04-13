@@ -430,6 +430,13 @@ async function restoreElectionFromBackup(jsonData, providedHash) {
     };
 }
 
+app.get('/api/firebase-config', (req, res) => {
+    res.json({
+        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`,
+        projectId: process.env.FIREBASE_PROJECT_ID
+    });
+});
+
 // ============================================
 // COMPREHENSIVE ALERT SYSTEM
 // ============================================
