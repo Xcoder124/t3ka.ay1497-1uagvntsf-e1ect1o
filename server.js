@@ -1555,56 +1555,20 @@ app.use(cors({
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
     req.cspNonce = generateNonce();
-    next();
-});
 
-app.use(
-    helmet({
-        contentSecurityPolicy: {
-            useDefaults: false,
-            directives: {
-                defaultSrc: ["'self'"],
-                scriptSrc: [
-                    "'self'",
-                    (req, res) => `'nonce-${req.cspNonce}'`,
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net",
-                    "https://challenges.cloudflare.com"
-                ],
-                scriptSrcElem: [
-                    "'self'",
-                    "https://cdnjs.cloudflare.com",
-                    "https://www.gstatic.com",
-                    "https://cdn.jsdelivr.net"
-                ],
-                frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-                styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                styleSrcElem: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
-                connectSrc: [
-                    "'self'",
-                    "https://identitytoolkit.googleapis.com",
-                    "https://securetoken.googleapis.com",
-                    "https://challenges.cloudflare.com",
-                    `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
-                ],
-                fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-                imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-                frameAncestors: ["'none'"]
-            }
-        }
-    })
-);
+    helmet.contentSecurityPolicy({
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
+            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
+            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
+            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
+            frameAncestors: ["'none'"],
 
-app.use((req, res, next) => {
-    const originalSetHeader = res.setHeader;
-    res.setHeader = function(name, value) {
-        if (name === 'Content-Security-Policy') {
-            console.log('🔐 CSP HEADER SET:', value);
-        }
-        return originalSetHeader.call(this, name, value);
-    };
-    next();
+        },
+    })(req, res, next);
 });
 
 // --- RATE LIMITERS ---
