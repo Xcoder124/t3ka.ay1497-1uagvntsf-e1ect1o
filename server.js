@@ -2716,7 +2716,9 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const d = voterSnap.data();
         const inputCode = code.toUpperCase();
 
-        const isCodeValid = await bcrypt.compare(inputCode, d.code);
+        const hashedInput = encryptAccessCode(inputCode)
+
+        const isCodeValid = hashedInput === d.code;
 
         if (!isCodeValid) {
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
