@@ -77,7 +77,7 @@ app.use(cookieParser());
 const allowedOrigins = process.env.NODE_ENV === 'production'
     ? [
         "https://tsf-g-digital-election.web.app",
-        "https://tanauanschooloffisheries.web.app", 
+        "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app"
     ]
     : [
@@ -92,15 +92,15 @@ app.use(cors({
     origin: function (origin, callback) {
         // Allow requests with no origin (mobile apps, curl, server-to-server)
         if (!origin) return callback(null, true);
-        
+
         // Clean the origin (remove trailing spaces, normalize)
         const cleanOrigin = origin.trim();
-        
+
         // Check if origin matches allowed list
-        const isAllowed = allowedOrigins.some(allowed => 
+        const isAllowed = allowedOrigins.some(allowed =>
             cleanOrigin === allowed || cleanOrigin.startsWith(allowed + '/')
         );
-        
+
         if (isAllowed) {
             // Return the specific origin, not true (required for credentials)
             callback(null, cleanOrigin);
@@ -2841,6 +2841,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         });
 
     } catch (e) {
+        console.error("ERROR:", e);
         return res.status(500).json({ error: "Server error during verification." });
     }
 });
@@ -3516,14 +3517,14 @@ function requireAIAuthOrAdmin(req, res, next) {
     const aiKey = req.headers['x-ai-service-key'];
     if (aiKey && aiKey === AI_SERVICE_KEY) {
         // Set AI service user context
-        req.user = { 
-            uid: 'AI_SERVICE', 
-            role: 'admin', 
-            isAIService: true 
+        req.user = {
+            uid: 'AI_SERVICE',
+            role: 'admin',
+            isAIService: true
         };
         return next();
     }
-    
+
     // Fall back to normal admin auth
     requireAuth(req, res, (err) => {
         if (err) return next(err);
