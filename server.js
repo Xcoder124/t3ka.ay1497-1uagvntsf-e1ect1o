@@ -2796,8 +2796,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
             lastLogin: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        await clearVoterBruteForce(hashedLVN);
-
         // 🔥 ✅ ACTIVE SESSION SET (CORRECT PLACE)
         const userRef = rtdb.ref(`activeSessions/${hashedLVN}`);
         await userRef.set({
