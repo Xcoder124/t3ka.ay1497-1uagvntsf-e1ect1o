@@ -3303,28 +3303,7 @@ app.post("/admin/voters/reset", async (req, res) => {
     }
 });
 
-app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const { isLive, isQueue, activeGrade, voterTime } = req.body;
 
-        const updates = {};
-
-        if (typeof isLive === "boolean") updates["status/isLive"] = isLive;
-        if (typeof isQueue === "boolean") updates["status/isQueue"] = isQueue;
-        if (activeGrade !== undefined) updates["status/activeGrade"] = activeGrade;
-        if (voterTime !== undefined) updates["status/voterTime"] = voterTime;
-
-        if (Object.keys(updates).length > 0) {
-            await rtdb.ref("/").update(updates);
-        }
-
-        res.json({ success: true });
-
-    } catch (e) {
-        console.error("Session update error:", e);
-        res.status(500).json({ error: "Failed to update session" });
-    }
-});
 
 app.post("/admin/purge", async (req, res) => {
     try {
@@ -3704,6 +3683,100 @@ app.post("/admin/election/reset", async (req, res) => {
         res.json({ success: true, message: "Election system successfully reset." });
     } catch (e) {
         res.status(500).json({ error: "Reset failed partially. Check logs." });
+    }
+});
+
+app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const voterTime = req.body.voterTime;
+        const activeGrade = req.body.activeGrade;
+        const isLive = req.body.isLive;
+        const isQueue = req.body.isQueue;
+
+        const firestoreUpdate = {};
+        const rtdbUpdates = {};
+
+        // =========================
+        // 🔥 RTDB (ONLY REALTIME FLAGS)
+        // =========================
+        if (typeof isLive === 'boolean') {
+            rtdbUpdates["status/isLive"] = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            rtdbUpdates["status/isQueue"] = isQueue;
+        }
+
+        // =========================
+        // 🔥 FIRESTORE (GRADE + TIMER)
+        // =========================
+        if (activeGrade !== undefined) {
+            firestoreUpdate.activeGrade =
+                (activeGrade === "ALL") ? "ALL" : Number(activeGrade);
+        }
+
+        if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
+            const minutes = Number(voterTime);
+            const futureDate = new Date(Date.now() + (minutes * 60 * 1000));
+
+            firestoreUpdate.sessionTimer = futureDate.toISOString();
+        } else if (voterTime == 0) {
+            firestoreUpdate.sessionTimer = admin.firestore.FieldValue.delete();
+        }
+
+        // =========================
+        // 🔥 WRITE UPDATES
+        // =========================
+        if (Object.keys(rtdbUpdates).length > 0) {
+            await rtdb.ref("/").update(rtdbUpdates);
+        }
+
+        if (Object.keys(firestoreUpdate).length > 0) {
+            await db.collection("settings").doc("electionStatus")
+                .set(firestoreUpdate, { merge: true });
+        }
+
+        // =========================
+        // 🔥 CACHE
+        // =========================
+        if (typeof isLive === 'boolean') {
+            GlobalCache.dashboard.isLive = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            GlobalCache.dashboard.isQueue = isQueue;
+        }
+
+        if (activeGrade !== undefined) {
+            GlobalCache.dashboard.activeGrade = activeGrade;
+        }
+
+        // =========================
+        // 🔥 LOGS
+        // =========================
+        await logAdminAction(req, "SET_ELECTION_SESSION", {
+            isLive,
+            isQueue,
+            activeGrade,
+            voterTime
+        });
+
+        await logSuccessEvent("ADMIN_SET_SESSION", req, {
+            isLive,
+            isQueue,
+            activeGrade
+        });
+
+        res.json({
+            success: true,
+            isLive,
+            isQueue,
+            activeGrade
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: "Failed to update election status" });
     }
 });
 
