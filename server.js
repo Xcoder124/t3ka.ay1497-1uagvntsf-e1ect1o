@@ -3097,7 +3097,6 @@ app.get("/admin/voters", async (req, res) => {
 
         const statusSnap = await rtdb.ref("voterStatus").once("value");
         const statusMap = await getVoterStatusCache();
-        statuses.forEach(({ id, status }) => { statusMap[id] = status; });
 
         // ── 4. Merge static + dynamic data ────────────────────────────────────
         const voters = pageSlice.map(voter => {
