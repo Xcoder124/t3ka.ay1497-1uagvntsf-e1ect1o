@@ -1422,16 +1422,6 @@ setInterval(async () => {
     }
 }, 15000);
 
-// Scheduled monitoring
-const userRef = rtdb.ref(`activeSessions/${userId}`);
-
-userRef.set({
-    startedAt: Date.now()
-});
-
-// auto remove if:
-userRef.onDisconnect().remove();
-
 // Initial system health check
 setTimeout(async () => {
     await alertManager.detectSystemHealth();
@@ -2322,8 +2312,6 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    await clearBruteForce(deviceId);
-
     const adminJti = crypto.randomBytes(16).toString("hex");
     const token = jwt.sign({
         uid: process.env.ADMIN_USER,
@@ -2763,7 +2751,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
 
         if (d.hasVoted) {
-            // ✅ Clean up queue entry if they somehow still exist
             if (settingsData.isQueue) {
                 setImmediate(async () => {
                     try {
@@ -2771,10 +2758,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
                         await queueRef.transaction(current => {
                             if (current && current.users && current.users[hashedLVN]) {
                                 delete current.users[hashedLVN];
-                                // Adjust activeCount if needed
-                                if (current.users[hashedLVN]?.status === 'active') {
-                                    current.activeCount = Math.max(0, (current.activeCount || 0) - 1);
-                                }
                             }
                             return current;
                         });
@@ -2796,7 +2779,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
             }
         }
 
-        // 🔥 QUEUE CHECK + JOIN
         const isQueue = settingsData.isQueue === true;
 
         if (isQueue) {
@@ -2808,15 +2790,14 @@ app.post("/verify", loginLimiter, async (req, res) => {
             lastLogin: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        res.cookie("__device_id", deviceFingerprint, {
-            httpOnly: true,
-            secure: true,
-            sameSite: "none",
-            path: "/",
-            maxAge: 365 * 24 * 60 * 60 * 1000
-        });
-
         await clearVoterBruteForce(hashedLVN);
+
+        // 🔥 ✅ ACTIVE SESSION SET (CORRECT PLACE)
+        const userRef = rtdb.ref(`activeSessions/${hashedLVN}`);
+        await userRef.set({
+            startedAt: Date.now()
+        });
+        userRef.onDisconnect().remove();
 
         const csrfToken = crypto.randomBytes(32).toString('hex');
         const jti = crypto.randomBytes(16).toString("hex");
@@ -2841,292 +2822,12 @@ app.post("/verify", loginLimiter, async (req, res) => {
             grade: d.grade,
             token: sessionToken,
             csrfToken,
-            isQueue, // ✅ FRONTEND USES THIS
-            ...(isQueue && { queueKey: hashedLVN }) // ✅ RTDB path key for queue listener
+            isQueue,
+            ...(isQueue && { queueKey: hashedLVN })
         });
 
     } catch (e) {
         return res.status(500).json({ error: "Server error during verification." });
-    }
-});
-
-async function useNonce(nonce) {
-    const ref = db.collection("used_nonces").doc(nonce);
-
-    return db.runTransaction(async (tx) => {
-        const doc = await tx.get(ref);
-
-        if (doc.exists) {
-            return false;
-        }
-
-        tx.set(ref, {
-            usedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        return true;
-    });
-}
-
-function stableStringify(obj) {
-    return JSON.stringify(Object.keys(obj).sort().reduce((acc, key) => {
-        acc[key] = obj[key];
-        return acc;
-    }, {}));
-}
-
-app.post('/authenticate', async (req, res) => {
-    const { lvn, turnstileToken } = req.body;
-    console.log("🔵 AUTH: Request received for LVN hash:", hashLVN(lvn).substring(0, 8));
-
-    try {
-        const voterHash = hashLVN(lvn);
-        const voterRef = db.collection("voters").doc(voterHash);
-        const voterSnap = await voterRef.get();
-
-        if (!voterSnap.exists) {
-            console.log("🔴 AUTH: Voter not found");
-            return res.status(403).json({ error: "Voter not found" });
-        }
-
-        const voterData = voterSnap.data();
-        const sessionId = crypto.randomBytes(32).toString("hex");
-        const jti = crypto.randomBytes(16).toString("hex");
-        console.log("🟢 AUTH: SessionID generated:", sessionId.substring(0, 16));
-
-        const token = jwt.sign({
-            uid: voterHash,
-            grade: voterData.grade,
-            sessionId,
-            jti,
-            role: "voter"
-        }, SECRET, { expiresIn: "30m" });
-
-        console.log("🟡 AUTH: JWT signed.");
-
-        res.json({ token, voterData });
-
-    } catch (e) {
-        console.error("❌ AUTH ERROR:", {
-            message: e.message,
-            stack: e.stack,
-            code: e.code
-        });
-        res.status(500).json({ error: "Authentication failed" });
-    }
-});
-
-app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
-    try {
-        const hashedLVN = req.user.uid;
-        const grade = req.user.grade;
-
-        const { selections, timestamp, nonce } = req.body;
-
-        // 🔍 Basic validation
-        if (!selections || typeof selections !== "object") {
-            return res.status(400).json({ error: "Invalid ballot format." });
-        }
-
-        if (typeof timestamp !== "number") {
-            return res.status(400).json({ error: "Invalid timestamp" });
-        }
-
-        if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
-            return res.status(400).json({ error: "Invalid nonce" });
-        }
-
-        const now = Date.now();
-        if (Math.abs(now - timestamp) > 60000) {
-            return res.status(400).json({ error: "Request expired" });
-        }
-
-        // 🔍 Validate selections
-        let validatedSelections;
-        try {
-            validatedSelections = await validateSelections(selections);
-        } catch (e) {
-            await createAlert("tamper", "critical", "Tampered Vote", e.message, { selections });
-            return res.status(400).json({ error: e.message });
-        }
-
-        // ⚙️ Election settings
-        const settings = await db.collection("settings").doc("electionStatus").get();
-
-        if (!settings.exists || !settings.data().isLive) {
-            return res.status(403).json({ error: "Election closed." });
-        }
-
-        const electionData = settings.data();
-
-        if (electionData.isQueue) {
-            const userSnap = await rtdb.ref(`queue/users/${hashedLVN}`).once('value');
-            if (!userSnap.exists()) {
-                return res.status(403).json({ error: "You are not in the queue." });
-            }
-            const queueData = userSnap.val();
-            if (queueData.status !== 'active') {
-                return res.status(403).json({ error: "Please wait for your turn." });
-            }
-        }
-
-        // ⏱ End time check
-        if (electionData.endTime && Date.now() > electionData.endTime.toMillis()) {
-            return res.status(403).json({ error: "Voting period ended." });
-        }
-
-        // 👤 Voter validation
-        const voterRef = db.collection("voters").doc(hashedLVN);
-        const voterSnap = await voterRef.get();
-
-        if (!voterSnap.exists) {
-            return res.status(403).json({ error: "Voter not found." });
-        }
-
-        if (voterSnap.data().hasVoted) {
-            return res.status(403).json({ error: "Already voted." });
-        }
-
-        // 🔗 Blockchain chain head
-        const CHAIN_DOC = db.collection("_meta").doc("chain_head");
-
-        const voteResult = await db.runTransaction(async (t) => {
-            const voterDoc = await t.get(voterRef);
-            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
-            if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
-
-            const chainDoc = await t.get(CHAIN_DOC);
-            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
-            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
-
-            const randomSalt = crypto.randomBytes(32).toString("hex");
-
-            const payload = JSON.stringify({
-                voter_hash: hashedLVN,
-                selections: validatedSelections,
-                timestamp: Date.now()
-            });
-
-            const receipt = crypto.createHash("sha256")
-                .update(payload + randomSalt)
-                .digest("hex");
-
-            const verificationCode = crypto.createHash("sha256")
-                .update(receipt + stableStringify(validatedSelections))
-                .digest("hex")
-                .substring(0, 12);
-
-            const currentHash = crypto.createHash("sha256")
-                .update(receipt + prevHash + stableStringify(validatedSelections))
-                .digest("hex");
-
-            const voteRef = db.collection("votes").doc();
-
-            t.set(voteRef, {
-                selections: validatedSelections,
-                grade: String(grade),
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                receipt,
-                hash: currentHash,
-                prevHash,
-                salt: randomSalt,
-                sequence: prevCount + 1
-            });
-
-            t.update(voterRef, {
-                hasVoted: true,
-                votedAt: admin.firestore.FieldValue.serverTimestamp(),
-                receipt
-            });
-
-            t.set(CHAIN_DOC, {
-                hash: currentHash,
-                count: prevCount + 1
-            });
-
-            return { receipt, currentHash, prevHash, verificationCode };
-        });
-
-        // ✅ Respond immediately
-        res.json({
-            success: true,
-            receipt: maskReceipt(voteResult.receipt).mask,
-            verificationCode: voteResult.verificationCode,
-            blockHash: voteResult.currentHash,
-            prevBlockHash: voteResult.prevHash,
-        });
-
-        setImmediate(async () => {
-            try {
-                await updateVoterStatusInRTDB(hashedLVN, {
-                    hasVoted: true,
-                    isMissed: false,
-                    integrityStatus: "VOTED"
-                });
-            } catch (err) {
-                console.error("RTDB voterStatus write failed after vote:", err);
-            }
-        });
-
-        rtdb.ref(`activeSessions/${userId}`).remove();
-
-        if (electionData.isQueue) {
-            setImmediate(async () => {
-                try {
-                    const grade = req.user.grade;
-                    const gradeKey = `sessionG${grade}`;
-                    const queueRef = rtdb.ref(`queue/${gradeKey}`);
-
-                    await queueRef.transaction(current => {
-                        if (!current || !current.users) return current;
-
-                        // Remove the user who just voted
-                        if (current.users[hashedLVN]) {
-                            delete current.users[hashedLVN];
-                        }
-
-                        // Recalculate active count based on current active users
-                        let newActiveCount = 0;
-                        let nextUserId = null;
-                        let lowestPosition = Infinity;
-
-                        // Count active users and find next waiting user
-                        for (const [uid, data] of Object.entries(current.users)) {
-                            if (data.status === 'active') {
-                                newActiveCount++;
-                            } else if (data.status === 'waiting' && data.position < lowestPosition) {
-                                nextUserId = uid;
-                                lowestPosition = data.position;
-                            }
-                        }
-
-                        // Activate the next user if there's room
-                        if (nextUserId && newActiveCount < current.maxActive) {
-                            current.users[nextUserId].status = 'active';
-                            newActiveCount++;
-                        }
-
-                        current.activeCount = newActiveCount;
-
-                        return current;
-                    });
-
-                    console.log(`✅ User ${hashedLVN.substring(0, 8)} removed from ${gradeKey} queue after voting`);
-
-                } catch (err) {
-                    console.error("Failed to remove user from queue:", err);
-                }
-            });
-        }
-
-        await refreshLocalResults();
-
-    } catch (e) {
-        console.log("REQ.USER:", req.user);
-        console.error("Vote error:", e);
-        res.status(500).json({
-            error: "System failed to record vote. Please notify a facilitator."
-        });
     }
 });
 
