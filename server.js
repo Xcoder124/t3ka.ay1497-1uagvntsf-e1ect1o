@@ -2682,12 +2682,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
 
         const hashedLVN = hashLVN(lvn);
 
-        if (await isVoterLocked(hashedLVN)) {
-            return res.status(403).json({
-                error: "Account temporarily locked due to multiple failed attempts. Please try again later."
-            });
-        }
-
         const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
 
         const deviceFingerprint = crypto.createHash("sha256")
