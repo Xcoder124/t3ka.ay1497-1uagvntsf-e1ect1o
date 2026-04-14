@@ -399,7 +399,7 @@ async function loadVotersStaticCache() {
                 grade: v.grade || "",
                 section: v.section || "",
                 // Decrypt once at cache-load time rather than per-request
-                accessCode: v.code ? (decryptAccessCode(v.code) || "ERROR") : null,
+                accessCode: v.code ? (decryptAccessCode(v.codeHash) || "ERROR") : null,
                 addedAt: v.addedAt ? v.addedAt.toDate().toISOString() : null,
             });
         });
@@ -2715,10 +2715,8 @@ app.post("/verify", loginLimiter, async (req, res) => {
 
         const d = voterSnap.data();
         const inputCode = code.toUpperCase();
-
-        const hashedInput = encryptAccessCode(inputCode)
-
-        const isCodeValid = hashedInput === d.code;
+        
+        const isCodeValid = await bcrypt.compare(inputCode, d.code);
 
         if (!isCodeValid) {
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
@@ -3183,11 +3181,13 @@ app.post("/admin/voters/add", async (req, res) => {
             if (!name || !name.trim()) continue;
             const cleanName = name.toUpperCase().trim();
             const codeHashForUpdate = encryptAccessCode(accessCode);
+            const code = await bcrypt.hash(accessCode.toUpperCase(), 10);
             if (existingMap[cleanName]) {
                 batch.update(existingMap[cleanName], {
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: codeHashForUpdate,
+                    code: code,
+                    codeHash: codeHashForUpdate,
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
                 updatedCount++;
@@ -3196,6 +3196,7 @@ app.post("/admin/voters/add", async (req, res) => {
                 const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
                 const hashedLVN = hashLVN(lvn);
                 const encryptedCode = encryptAccessCode(accessCode);
+                const codeForNewSet = await bcrypt.hash(accessCode.toUpperCase(), 10);
                 const existingLvnSnap = await db.collection("voters").doc(hashedLVN).get();
                 const voterRef = db.collection("voters").doc(hashedLVN);
                 batch.set(voterRef, {
@@ -3203,7 +3204,8 @@ app.post("/admin/voters/add", async (req, res) => {
                     name: cleanName,
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: encryptedCode,
+                    code: codeForNewSet,
+                    codeHash: encryptedCode,
                     hasVoted: false,
                     addedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
