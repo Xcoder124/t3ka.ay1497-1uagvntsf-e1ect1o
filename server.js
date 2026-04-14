@@ -3511,6 +3511,27 @@ app.get("/admin/status", (req, res) => {
     res.json(GlobalCache.timestamps);
 });
 
+const AI_SERVICE_KEY = process.env.JWT_SECRET;
+
+function requireAIAuthOrAdmin(req, res, next) {
+    const aiKey = req.headers['x-ai-service-key'];
+    if (aiKey && aiKey === AI_SERVICE_KEY) {
+        // Set AI service user context
+        req.user = { 
+            uid: 'AI_SERVICE', 
+            role: 'admin', 
+            isAIService: true 
+        };
+        return next();
+    }
+    
+    // Fall back to normal admin auth
+    requireAuth(req, res, (err) => {
+        if (err) return next(err);
+        requireRole('admin')(req, res, next);
+    });
+}
+
 app.post("/admin/add-party", async (req, res) => {
     const rawCandidates = req.body.candidates || [];
     const candidates = rawCandidates.map(c => ({
