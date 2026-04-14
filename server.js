@@ -3050,7 +3050,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const electionData = settings.data();
 
         if (electionData.isQueue) {
-            const userSnap = await rtdb.ref(`queue/users/${hashedLVN}`).once('value');
+            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
             if (!userSnap.exists()) {
                 return res.status(403).json({ error: "You are not in the queue." });
             }
