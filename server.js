@@ -2710,7 +2710,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const voterSnap = await voterRef.get();
 
         if (!voterSnap.exists) {
-            await recordVoterFailedAttempt(hashedLVN);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
 
@@ -2720,7 +2719,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isCodeValid = await bcrypt.compare(inputCode, d.code);
 
         if (!isCodeValid) {
-            await recordVoterFailedAttempt(hashedLVN);
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
             return res.status(401).json({ error: "Invalid Credentials." });
         }
