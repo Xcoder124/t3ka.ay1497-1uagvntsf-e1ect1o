@@ -140,7 +140,9 @@ const ALLOWED_AI_ORIGINS = [
     'https://tsf-g-digital-election.web.app/conversation',
     'https://tsf-g-digital-election.web.app/conversation.html',
     'https://tanauanschooloffisheries.web.app/conversation',
-    'https://tanauanschooloffisheries.web.app/conversation.html'
+    'https://tanauanschooloffisheries.web.app/conversation.html',
+    'https://tsf-g-digital-election.web.app',
+    'https://tanauanschooloffisheries.web.app'
 ];
 const AI_SERVICE_KEY = process.env.AI_SERVICE_KEY;
 if (!AI_SERVICE_KEY) {
