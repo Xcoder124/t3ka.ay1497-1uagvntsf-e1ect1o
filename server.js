@@ -3001,6 +3001,206 @@ function stableStringify(obj) {
   }).join(",") + "}";
 }
 
+app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
+    try {
+        const hashedLVN = req.user.uid;
+        const grade = req.user.grade;
+
+        const { selections, timestamp, nonce } = req.body;
+
+        // 🔍 Basic validation
+        if (!selections || typeof selections !== "object") {
+            return res.status(400).json({ error: "Invalid ballot format." });
+        }
+
+        if (typeof timestamp !== "number") {
+            return res.status(400).json({ error: "Invalid timestamp" });
+        }
+
+        if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
+            return res.status(400).json({ error: "Invalid nonce" });
+        }
+
+        const now = Date.now();
+        if (Math.abs(now - timestamp) > 60000) {
+            return res.status(400).json({ error: "Request expired" });
+        }
+
+        // 🔍 Validate selections
+        let validatedSelections;
+        try {
+            validatedSelections = await validateSelections(selections);
+        } catch (e) {
+            await createAlert("tamper", "critical", "Tampered Vote", e.message, { selections });
+            return res.status(400).json({ error: e.message });
+        }
+
+        // ⚙️ Election settings
+        const settings = await db.collection("settings").doc("electionStatus").get();
+
+        if (!settings.exists || !settings.data().isLive) {
+            return res.status(403).json({ error: "Election closed." });
+        }
+
+        const electionData = settings.data();
+
+        if (electionData.isQueue) {
+            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
+            if (!userSnap.exists()) {
+                return res.status(403).json({ error: "You are not in the queue." });
+            }
+            const queueData = userSnap.val();
+            if (queueData.status !== 'active') {
+                return res.status(403).json({ error: "Please wait for your turn." });
+            }
+        }
+
+        // ⏱ End time check
+        if (electionData.endTime && Date.now() > electionData.endTime.toMillis()) {
+            return res.status(403).json({ error: "Voting period ended." });
+        }
+
+        // 👤 Voter validation
+        const voterRef = db.collection("voters").doc(hashedLVN);
+        const voterSnap = await voterRef.get();
+
+        if (!voterSnap.exists) {
+            return res.status(403).json({ error: "Voter not found." });
+        }
+
+        if (voterSnap.data().hasVoted) {
+            return res.status(403).json({ error: "Already voted." });
+        }
+
+        // 🔗 Blockchain chain head
+        const CHAIN_DOC = db.collection("_meta").doc("chain_head");
+
+        const voteResult = await db.runTransaction(async (t) => {
+            const voterDoc = await t.get(voterRef);
+            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
+            if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
+
+            const chainDoc = await t.get(CHAIN_DOC);
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
+
+            const randomSalt = crypto.randomBytes(32).toString("hex");
+
+            const payload = JSON.stringify({
+                voter_hash: hashedLVN,
+                selections: validatedSelections,
+                timestamp: Date.now()
+            });
+
+            const receipt = crypto.createHash("sha256")
+                .update(payload + randomSalt)
+                .digest("hex");
+
+            const verificationCode = crypto.createHash("sha256")
+                .update(receipt + stableStringify(validatedSelections))
+                .digest("hex")
+                .substring(0, 12);
+
+            const currentHash = crypto.createHash("sha256")
+                .update(receipt + prevHash + stableStringify(validatedSelections))
+                .digest("hex");
+
+            const voteRef = db.collection("votes").doc();
+
+            t.set(voteRef, {
+                selections: validatedSelections,
+                grade: String(grade),
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt,
+                hash: currentHash,
+                prevHash,
+                salt: randomSalt,
+                sequence: prevCount + 1
+            });
+
+            t.update(voterRef, {
+                hasVoted: true,
+                votedAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt
+            });
+
+            t.set(CHAIN_DOC, {
+                hash: currentHash,
+                count: prevCount + 1
+            });
+
+            return { receipt, currentHash, prevHash, verificationCode };
+        });
+
+        // ✅ Respond immediately
+        res.json({
+            success: true,
+            receipt: voteResult.receipt,
+            verificationCode: voteResult.verificationCode,
+            hash: voteResult.currentHash,
+            prevHash: voteResult.prevHash
+        });
+
+        if (electionData.isQueue) {
+            setImmediate(async () => {
+                try {
+                    const grade = req.user.grade;
+                    const gradeKey = `sessionG${grade}`;
+                    const queueRef = rtdb.ref(`queue/${gradeKey}`);
+
+                    await queueRef.transaction(current => {
+                        if (!current || !current.users) return current;
+
+                        // Remove the user who just voted
+                        if (current.users[hashedLVN]) {
+                            delete current.users[hashedLVN];
+                        }
+
+                        // Recalculate active count based on current active users
+                        let newActiveCount = 0;
+                        let nextUserId = null;
+                        let lowestPosition = Infinity;
+
+                        // Count active users and find next waiting user
+                        for (const [uid, data] of Object.entries(current.users)) {
+                            if (data.status === 'active') {
+                                newActiveCount++;
+                            } else if (data.status === 'waiting' && data.position < lowestPosition) {
+                                nextUserId = uid;
+                                lowestPosition = data.position;
+                            }
+                        }
+
+                        // Activate the next user if there's room
+                        if (nextUserId && newActiveCount < current.maxActive) {
+                            current.users[nextUserId].status = 'active';
+                            newActiveCount++;
+                        }
+
+                        current.activeCount = newActiveCount;
+
+                        return current;
+                    });
+
+                    console.log(`✅ User ${hashedLVN.substring(0, 8)} removed from ${gradeKey} queue after voting`);
+
+                } catch (err) {
+                    console.error("Failed to remove user from queue:", err);
+                }
+            });
+        }
+
+        await refreshLocalResults();
+
+    } catch (e) {
+        console.log("REQ.USER:", req.user);
+        console.error("Vote error:", e);
+        res.status(500).json({
+            error: "System failed to record vote. Please notify a facilitator."
+        });
+    }
+});
+
 app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, async (req, res) => {
     const submitToken = req.headers["x-submit-token"] || req.body._submitToken;
     if (!verifySubmitToken(submitToken, req.user.jti)) {
