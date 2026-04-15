@@ -4099,6 +4099,70 @@ app.get("/admin/forms/submissions", async (req, res) => {
     }
 });
 
+app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const votersSnap = await db.collection("voters").get();
+        const votesSnap = await db.collection("votes").get();
+
+        const totalRegistered = votersSnap.size;
+        const totalVotes = votesSnap.size;
+
+        const turnoutRate = totalRegistered === 0
+            ? 0
+            : ((totalVotes / totalRegistered) * 100);
+
+        const remainingVotes = totalRegistered - totalVotes;
+
+        // Grade breakdown
+        const gradeStats = {};
+
+        votersSnap.forEach(doc => {
+            const g = doc.data().grade;
+            if (!gradeStats[g]) {
+                gradeStats[g] = { total: 0, voted: 0 };
+            }
+            gradeStats[g].total++;
+        });
+
+        votesSnap.forEach(doc => {
+            const g = doc.data().grade;
+            if (gradeStats[g]) {
+                gradeStats[g].voted++;
+            }
+        });
+
+        // Compute turnout per grade
+        Object.keys(gradeStats).forEach(g => {
+            const s = gradeStats[g];
+            s.turnout = s.total === 0 ? 0 : ((s.voted / s.total) * 100);
+        });
+
+        // 🔥 System Health (IMPORTANT for Page 7)
+        const systemHealth = await detectSystemHealth(); // use your AlertManager or create one
+
+        res.json({
+            REG_USR: totalRegistered,
+            VT_CST: totalVotes,
+            TN_RT: turnoutRate.toFixed(2) + "%",
+            RG_VT: remainingVotes,
+            CURRENTDATEANDTIME: new Date().toLocaleString(),
+
+            gradeStats,
+
+            systemHealth
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: "Failed to generate report data" });
+    }
+});
+
+app.get("/api/system/health", async (req, res) => {
+    const health = await detectSystemHealth();
+    res.json(health);
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
