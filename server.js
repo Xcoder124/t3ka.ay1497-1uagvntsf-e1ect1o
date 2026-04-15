@@ -4487,6 +4487,9 @@ app.get("/api/system/health", async (req, res) => {
     res.json(health);
 });
 
+// ============================================
+// GEMINI AI INTEGRATION FOR NAME VALIDATION
+// ============================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
@@ -4494,15 +4497,68 @@ if (!GEMINI_API_KEY) {
     console.warn('⚠️ GEMINI_API_KEY not set. AI name validation will be disabled.');
 }
 
+// ============================================
+// DEVICE-BASED RATE LIMITING (2 ATTEMPTS PER DEVICE)
+// ============================================
+const deviceValidationStore = new Map();
+
+setInterval(() => {
+    const now = Date.now();
+    const oneHourAgo = now - (60 * 60 * 1000);
+    
+    for (const [deviceId, data] of deviceValidationStore.entries()) {
+        if (data.lastAttempt < oneHourAgo) {
+            deviceValidationStore.delete(deviceId);
+        }
+    }
+}, 30 * 60 * 1000);
+
+function getDeviceFingerprint(req) {
+    const ip = req.ip || req.connection.remoteAddress || '';
+    const ua = req.headers['user-agent'] || '';
+    return crypto.createHash('sha256').update(`${ip}:${ua}`).digest('hex').substring(0, 16);
+}
+
+function checkDeviceLimit(req) {
+    const deviceId = getDeviceFingerprint(req);
+    const now = Date.now();
+    const oneHourAgo = now - (60 * 60 * 1000);
+    
+    let record = deviceValidationStore.get(deviceId);
+    
+    if (record && record.lastAttempt < oneHourAgo) {
+        deviceValidationStore.delete(deviceId);
+        record = null;
+    }
+    
+    if (!record) {
+        return { deviceId, attempts: 0, remaining: 2, limit: 2, limited: false };
+    }
+    
+    return { deviceId, attempts: record.count, remaining: Math.max(0, 2 - record.count), limit: 2, limited: record.count >= 2 };
+}
+
+function trackDeviceAttempt(req) {
+    const deviceId = getDeviceFingerprint(req);
+    const now = Date.now();
+    
+    let record = deviceValidationStore.get(deviceId);
+    if (!record) record = { count: 0, firstAttempt: now };
+    
+    record.count++;
+    record.lastAttempt = now;
+    deviceValidationStore.set(deviceId, record);
+    
+    return { attempts: record.count, remaining: Math.max(0, 2 - record.count), limited: record.count >= 2 };
+}
+
 /**
- * Validates a name using Google's Gemini AI for onomastic analysis
- * @param {string} name - The name to validate
- * @returns {Promise<Object>} Validation result with confidence score and reasoning
+ * Validates a name using Gemini AI - NO FALLBACK
+ * @returns {Promise<Object>} Validation result or throws error
  */
 async function validateNameWithGemini(name) {
     if (!GEMINI_API_KEY) {
-        console.warn('[GEMINI] API key missing, falling back to basic validation');
-        return fallbackNameValidation(name);
+        throw new Error('GEMINI_API_KEY not configured');
     }
 
     const cleanName = sanitizeString(name).trim();
@@ -4518,150 +4574,56 @@ Evaluation Criteria:
 
 Input String to Analyze: "${cleanName}"
 
-For explaning the reason, you can just say the patterns that led you to your decision, no deep explanations just clear straightforward explanation.
-Sample of how you should reason you must follow this reasoning template all time:
-If the score was below 85: "Based on the {Reasoning} contributing to a {percentage} match probability, this case requires immediate escalation to a technical facilitator to ensure compliance with our verification protocols."
-
-If the score was 85 and above:
-"Following a successful validation with a {percentage} match probability regarding {Reasoning}, your profile has been formally registered in the system."
-
-
 Response Format (JSON only - no markdown, no extra text):
 {
  "confidence_score": (Integer 1-100),
  "classification": "Real" | "Suspicious" | "Gibberish",
  "reasoning": "Short 1-sentence explanation of why the score was given.",
  "is_culturally_valid": (Boolean)
-}`;
-
-    try {
-        const response = await axios.post(
-            `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
-            {
-                contents: [{
-                    parts: [{ text: prompt }]
-                }],
-                generationConfig: {
-                    temperature: 0.1,
-                    maxOutputTokens: 256,
-                    topP: 0.8,
-                    topK: 10
-                }
-            },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 8000
-            }
-        );
-
-        // Extract and parse JSON from Gemini response
-        const textResponse = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        
-        if (!textResponse) {
-            throw new Error('Empty response from Gemini');
-        }
-
-        // Clean the response - remove any markdown code blocks
-        let cleanJson = textResponse
-            .replace(/```json\s*/g, '')
-            .replace(/```\s*/g, '')
-            .trim();
-
-        // Extract JSON object
-        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            throw new Error('No JSON found in response');
-        }
-
-        const result = JSON.parse(jsonMatch[0]);
-
-        // Validate the response structure
-        if (typeof result.confidence_score !== 'number' || 
-            !result.classification || 
-            !result.reasoning) {
-            throw new Error('Invalid response structure from Gemini');
-        }
-
-        // Ensure score is within bounds
-        result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
-        
-        console.log(`[GEMINI] Name validation complete: ${cleanName} -> ${result.confidence_score}% (${result.classification})`);
-        
-        return {
-            success: true,
-            confidence_score: result.confidence_score,
-            classification: result.classification,
-            reasoning: result.reasoning,
-            is_culturally_valid: result.is_culturally_valid ?? (result.confidence_score >= 70),
-            name: cleanName,
-            source: 'gemini'
-        };
-
-    } catch (error) {
-        console.error('[GEMINI] Validation error:', error.message);
-        
-        // Log the error for monitoring
-        await logSecurityEvent('GEMINI_VALIDATION_ERROR', { 
-            error: error.message, 
-            name: cleanName?.substring(0, 2) + '***' 
-        });
-        
-        // Fallback to basic validation
-        return fallbackNameValidation(cleanName);
-    }
 }
 
-/**
- * Fallback validation when Gemini is unavailable
- */
-function fallbackNameValidation(name) {
-    const cleanName = name.trim();
+NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLINE NICKNAMES AND USERNAMES.`;
+
+    const response = await axios.post(
+        `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
+        {
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 256, topP: 0.8, topK: 10 }
+        },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
+    );
+
+    const textResponse = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!textResponse) throw new Error('Empty response from Gemini');
+
+    let cleanJson = textResponse.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON found in response');
+
+    const result = JSON.parse(jsonMatch[0]);
     
-    // Basic heuristics
-    const hasValidChars = /^[A-Za-z\s.\-']+$/.test(cleanName);
-    const parts = cleanName.split(/\s+/);
-    const hasMultipleParts = parts.length >= 2;
-    const hasMinLength = cleanName.length >= 3;
-    const noRepeatedChars = !/(.)\1{3,}/.test(cleanName);
-    const notAllCaps = cleanName !== cleanName.toUpperCase() || cleanName.length < 10;
-    const notGibberish = !/^[^aeiou]{5,}$/i.test(cleanName.replace(/\s/g, ''));
-    
-    let confidence = 0;
-    let reasons = [];
-    
-    if (hasValidChars) confidence += 20;
-    if (hasMultipleParts) confidence += 30;
-    if (hasMinLength) confidence += 15;
-    if (noRepeatedChars) confidence += 15;
-    if (notAllCaps) confidence += 10;
-    if (notGibberish) confidence += 10;
-    
-    // Additional checks
-    const commonPrefixes = /^(Ma\.|Dr\.|Mr\.|Ms\.|Mrs\.)/i;
-    if (commonPrefixes.test(cleanName)) confidence += 5;
-    
-    const looksLikeKeyboardMash = /^(asdf|qwer|zxcv|tyui|ghjk|bnm[^aeiou])/i.test(cleanName.toLowerCase());
-    if (looksLikeKeyboardMash) confidence = Math.max(0, confidence - 50);
-    
-    if (confidence >= 85) {
-        reasons.push('follows standard naming patterns');
-    } else if (confidence >= 60) {
-        reasons.push('has some irregular patterns');
-    } else {
-        reasons.push('requires additional verification');
+    if (typeof result.confidence_score !== 'number' || !result.classification || !result.reasoning) {
+        throw new Error('Invalid response structure from Gemini');
     }
+
+    result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
+    
+    console.log(`[GEMINI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`);
     
     return {
         success: true,
-        confidence_score: Math.max(1, Math.min(100, confidence)),
-        classification: confidence >= 85 ? 'Real' : (confidence >= 60 ? 'Suspicious' : 'Gibberish'),
-        reasoning: `Based on name structure analysis, this name ${reasons.join(' and ')}.`,
-        is_culturally_valid: confidence >= 70,
+        confidence_score: result.confidence_score,
+        classification: result.classification,
+        reasoning: result.reasoning,
+        is_culturally_valid: result.is_culturally_valid ?? (result.confidence_score >= 70),
         name: cleanName,
-        source: 'fallback'
+        source: 'gemini'
     };
 }
 
+// ============================================
+// AI NAME VALIDATION ENDPOINT (2 ATTEMPTS PER DEVICE)
+// ============================================
 app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
     try {
         const { name } = req.body;
@@ -4669,53 +4631,89 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
         if (!name || typeof name !== 'string') {
             return res.status(400).json({ 
                 error: "Name is required",
-                validation: {
-                    confidence_score: 0,
-                    classification: "Invalid",
-                    reasoning: "No name provided for validation.",
-                    requires_facilitator: true
-                }
+                requires_facilitator: true,
+                facilitator_message: "No name provided. Please try again or request manual verification."
             });
         }
 
-        const validation = await validateNameWithGemini(name);
+        const limitCheck = checkDeviceLimit(req);
         
-        // Determine if facilitator is needed (confidence < 85)
-        const requiresFacilitator = validation.confidence_score < 85;
+        if (limitCheck.limited) {
+            return res.status(429).json({
+                error: "Validation limit reached",
+                requires_facilitator: true,
+                attempts_used: limitCheck.attempts,
+                facilitator_message: "You've used both validation attempts on this device. Your request will be forwarded to a technical facilitator for manual verification."
+            });
+        }
+
+        trackDeviceAttempt(req);
         
-        // Log the validation attempt
-        await logSecurityEvent('AI_NAME_VALIDATION', req, {
-            nameMask: name.substring(0, 2) + '***' + name.slice(-1),
-            score: validation.confidence_score,
-            requiresFacilitator,
-            source: validation.source
-        });
-        
-        res.json({
-            success: true,
-            validation: {
-                ...validation,
-                requires_facilitator: requiresFacilitator,
-                facilitator_message: requiresFacilitator 
-                    ? `Since the likelihood of your name being legitimate is ${validation.confidence_score}% because ${validation.reasoning.toLowerCase()} I have to direct the verification to a technical facilitator.`
-                    : `Following a successful validation with a ${validation.confidence_score}% match probability regarding ${validation.reasoning.toLowerCase()} your profile has been formally registered in the system.`
-            }
-        });
+        try {
+            const validation = await validateNameWithGemini(name);
+            const requiresFacilitator = validation.confidence_score < 85;
+            
+            console.log(`[GEMINI] Device ${limitCheck.deviceId} - Attempt ${limitCheck.attempts + 1}/2 - Score: ${validation.confidence_score}%`);
+            
+            res.json({
+                success: true,
+                validation: {
+                    ...validation,
+                    requires_facilitator: requiresFacilitator,
+                    attempts_used: limitCheck.attempts + 1,
+                    attempts_remaining: Math.max(0, 1 - limitCheck.attempts),
+                    facilitator_message: requiresFacilitator 
+                        ? `Since the likelihood of your name being legitimate is ${validation.confidence_score}% because ${validation.reasoning.toLowerCase()} I have to direct the verification to a technical facilitator.`
+                        : `Following a successful validation with a ${validation.confidence_score}% match probability regarding ${validation.reasoning.toLowerCase()} your profile has been formally registered in the system.`
+                }
+            });
+        } catch (geminiError) {
+            console.error('[GEMINI] Failed, directing to facilitator:', geminiError.message);
+            
+            res.status(503).json({
+                error: "Validation service unavailable",
+                requires_facilitator: true,
+                attempts_used: limitCheck.attempts + 1,
+                attempts_remaining: Math.max(0, 1 - limitCheck.attempts),
+                facilitator_message: "The AI validation service is currently unavailable. Your request will be forwarded to a technical facilitator for manual verification.",
+                gemini_error: process.env.NODE_ENV === 'development' ? geminiError.message : undefined
+            });
+        }
 
     } catch (error) {
         console.error('[AI VALIDATION] Error:', error);
+        
+        if (res.headersSent) return;
+        
         res.status(500).json({ 
             error: "Validation failed",
-            validation: {
-                confidence_score: 0,
-                classification: "Error",
-                reasoning: "Validation service temporarily unavailable.",
-                requires_facilitator: true
-            }
+            requires_facilitator: true,
+            facilitator_message: "An unexpected error occurred. Your request will be forwarded to a technical facilitator for manual verification."
         });
     }
 });
 
+// ============================================
+// GET DEVICE VALIDATION STATUS
+// ============================================
+app.get("/ai/validation-status", requireAIServiceOnly, (req, res) => {
+    const status = checkDeviceLimit(req);
+    
+    res.json({
+        success: true,
+        attempts_used: status.attempts,
+        attempts_remaining: status.remaining,
+        limit: 2,
+        can_validate: !status.limited,
+        message: status.limited 
+            ? "You have used both validation attempts. Manual verification required."
+            : `You have ${status.remaining} validation ${status.remaining === 1 ? 'attempt' : 'attempts'} remaining.`
+    });
+});
+
+// ============================================
+// MANUAL VERIFICATION SUBMISSION
+// ============================================
 app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     try {
         const { name, grade, section, reason, validationScore, geminiReasoning } = req.body;
@@ -4724,7 +4722,6 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
             return res.status(400).json({ error: "Name, grade, and section are required" });
         }
 
-        // Create a manual verification request in Firestore
         const verificationRef = await db.collection("manual_verifications").add({
             name: sanitizeString(name),
             grade: sanitizeString(grade),
@@ -4734,30 +4731,17 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
             geminiReasoning: geminiReasoning || null,
             status: 'PENDING',
             submittedAt: admin.firestore.FieldValue.serverTimestamp(),
-            source: 'AI_ASSISTANT',
-            ipMask: req.ip ? req.ip.split('.').slice(0, 2).join('.') + '.*.*' : 'unknown'
+            source: 'AI_ASSISTANT'
         });
 
-        // Create an alert for admins
         await alertManager.createAlert(
-            'script_error', // Using existing type
+            'script_error',
             'minor',
             '📋 Manual Verification Requested',
             `${name} (Grade ${grade}-${section}) requires manual verification.`,
-            {
-                verificationId: verificationRef.id,
-                reason: reason || 'AI flagged',
-                validationScore
-            },
+            { verificationId: verificationRef.id, reason: reason || 'AI flagged', validationScore },
             24 * 60 * 60 * 1000
         );
-
-        await logSecurityEvent('MANUAL_VERIFICATION_REQUESTED', req, {
-            verificationId: verificationRef.id,
-            nameMask: name.substring(0, 2) + '***',
-            grade,
-            section
-        });
 
         res.json({
             success: true,
@@ -4768,106 +4752,6 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     } catch (error) {
         console.error('[MANUAL VERIFICATION] Error:', error);
         res.status(500).json({ error: "Failed to submit manual verification request" });
-    }
-});
-
-app.get("/admin/manual-verifications", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const snapshot = await db.collection("manual_verifications")
-            .where("status", "==", "PENDING")
-            .orderBy("submittedAt", "desc")
-            .limit(50)
-            .get();
-
-        const requests = [];
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            requests.push({
-                id: doc.id,
-                ...data,
-                submittedAt: data.submittedAt?.toDate?.()?.toISOString() || null
-            });
-        });
-
-        res.json({ requests });
-    } catch (error) {
-        console.error('[ADMIN] Failed to fetch manual verifications:', error);
-        res.status(500).json({ error: "Failed to fetch verification requests" });
-    }
-});
-
-app.post("/admin/manual-verifications/:id/resolve", requireAuth, requireRole("admin"), async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { approved, notes } = req.body;
-
-        const docRef = db.collection("manual_verifications").doc(id);
-        const docSnap = await docRef.get();
-
-        if (!docSnap.exists) {
-            return res.status(404).json({ error: "Request not found" });
-        }
-
-        const data = docSnap.data();
-
-        await docRef.update({
-            status: approved ? 'APPROVED' : 'REJECTED',
-            resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-            resolvedBy: req.user.email || req.user.uid,
-            notes: sanitizeString(notes || ''),
-            approved
-        });
-
-        // If approved, add the voter through the normal flow
-        if (approved) {
-            const grade = String(data.grade).trim();
-            const section = data.section.toUpperCase();
-            const name = data.name.toUpperCase().trim();
-
-            // Reuse the existing voter addition logic
-            const sectionKey = `${grade}_${section}`;
-            const sectionData = await getOrGenerateCode('section_data', sectionKey);
-            const gradePrefix = await getOrGenerateCode('grade_prefix', grade);
-            const accessCode = sectionData.access_code;
-            const sectionPrefix = sectionData.prefix;
-
-            const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
-            const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
-            const hashedLVN = hashLVN(lvn);
-            const encryptedCode = encryptAccessCode(accessCode);
-            const hashedCode = await bcrypt.hash(accessCode.toUpperCase(), 10);
-
-            await db.collection("voters").doc(hashedLVN).set({
-                lvn: lvn,
-                name: name,
-                grade: grade,
-                section: section,
-                code: hashedCode,
-                codeHash: encryptedCode,
-                hasVoted: false,
-                addedAt: admin.firestore.FieldValue.serverTimestamp(),
-                verificationSource: 'MANUAL_APPROVAL',
-                verificationId: id
-            });
-
-            // Invalidate cache
-            setImmediate(() => invalidateVotersCache().catch(console.error));
-        }
-
-        await logAdminAction(req, approved ? 'MANUAL_VERIFICATION_APPROVED' : 'MANUAL_VERIFICATION_REJECTED', {
-            verificationId: id,
-            name: data.name,
-            grade: data.grade
-        });
-
-        res.json({ 
-            success: true, 
-            message: approved ? 'Voter approved and registered.' : 'Verification request rejected.'
-        });
-
-    } catch (error) {
-        console.error('[ADMIN] Failed to resolve verification:', error);
-        res.status(500).json({ error: "Failed to resolve verification request" });
     }
 });
 
