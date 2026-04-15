@@ -66,7 +66,6 @@ console.log("GITHUB_REPO exists:", !!process.env.GITHUB_REPO);
 console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
 const app = express();
-let activeUsers = 0;
 
 // --- MIDDLEWARE & APP CONFIG ---
 app.set('trust proxy', 1);
@@ -74,6 +73,7 @@ app.use(express.json({ limit: '110kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
+// ✅ FIXED CORS CONFIGURATION
 const allowedOrigins = process.env.NODE_ENV === 'production'
     ? [
         "https://tsf-g-digital-election.web.app",
@@ -89,26 +89,33 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
     ];
 
 app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, origin);
-        return callback(new Error("CORS Policy: Origin not allowed"), false);
+    origin: function (origin, callback) {
+        // Allow requests with no origin (mobile apps, curl, server-to-server)
+        if (!origin) return callback(null, true);
+
+        // Clean the origin (remove trailing spaces, normalize)
+        const cleanOrigin = origin.trim();
+
+        // Check if origin matches allowed list
+        const isAllowed = allowedOrigins.some(allowed =>
+            cleanOrigin === allowed || cleanOrigin.startsWith(allowed + '/')
+        );
+
+        if (isAllowed) {
+            // Return the specific origin, not true (required for credentials)
+            callback(null, cleanOrigin);
+        } else {
+            console.warn(`[CORS BLOCKED] Origin: ${cleanOrigin}`);
+            callback(new Error("CORS Policy: Origin not allowed"), false);
+        }
     },
     credentials: true,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "x-ai-service-key"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key"],
     exposedHeaders: ["set-cookie"]
 }));
 
-app.options('*', (req, res) => {
-    const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin);
-        res.header('Access-Control-Allow-Credentials', 'true');
-        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-CSRF-Token, X-Admin-Key');
-    }
-    res.sendStatus(204);
-});
+app.options('*', cors());
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
@@ -129,14 +136,16 @@ app.use((req, res, next) => {
     })(req, res, next);
 });
 
-app.use((req, res, next) => {
-    activeUsers++;
-    const decrement = () => { activeUsers = Math.max(0, activeUsers - 1); };
-    res.on("finish", decrement);
-    res.on("close", decrement);
-    res.on("error", decrement);
-    next();
-});
+const ALLOWED_AI_ORIGINS = [
+    'https://tsf-g-digital-election.web.app/conversation',
+    'https://tsf-g-digital-election.web.app/conversation.html',
+    'https://tanauanschooloffisheries.web.app/conversation',
+    'https://tanauanschooloffisheries.web.app/conversation.html'
+];
+const AI_SERVICE_KEY = process.env.AI_SERVICE_KEY;
+if (!AI_SERVICE_KEY) {
+    console.warn('⚠️  AI_SERVICE_KEY not set. AI Service authentication will be disabled.');
+}
 
 const db = admin.firestore();
 
@@ -144,6 +153,32 @@ const db = admin.firestore();
 const MAX_ATTEMPTS = 3;
 const LOCK_TIME = 30 * 1000; // 30 sec
 const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
+const MASK_SECRET = process.env.JWT_SECRET;
+
+const VotersStaticCache = {
+    data: [],
+    lastUpdated: null,
+    isLoading: false
+};
+
+const VoterStatusCache = {
+    data: null,
+    lastFetch: 0
+};
+
+async function getVoterStatusCache() {
+    const now = Date.now();
+
+    if (!VoterStatusCache.data || now - VoterStatusCache.lastFetch > 3000) {
+        const snap = await rtdb.ref("voterStatus").once("value");
+        VoterStatusCache.data = snap.val() || {};
+        VoterStatusCache.lastFetch = now;
+    }
+
+    return VoterStatusCache.data;
+}
+
+const ACCESS_CODE_KEY = process.env.BACKUP_SECRET;
 
 (async () => {
     try {
@@ -154,58 +189,21 @@ const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
     }
 })();
 
+(async () => {
+    try {
+        await loadVotersStaticCache();
+    } catch (err) {
+        console.error("Voters static cache warm-up failed:", err);
+    }
+})();
+
 setInterval(async () => {
     try {
         await refreshLocalResults();
     } catch (err) {
         console.error("Background dashboard refresh failed:", err);
     }
-}, 2 * 60 * 1000);
-
-async function checkLoginAttempts(deviceId) {
-    const ref = db.collection("login_attempts").doc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) return { allowed: true };
-
-    const data = snap.data();
-
-    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
-        return {
-            allowed: false,
-            message: "Too many attempts. Try again in 30 seconds."
-        };
-    }
-
-    return { allowed: true, attempts: data.attempts || 0 };
-}
-
-async function recordLoginAttempt(deviceId, success) {
-    const ref = db.collection("login_attempts").doc(deviceId);
-    const snap = await ref.get();
-
-    if (success) {
-        await ref.delete();
-        return;
-    }
-
-    let attempts = 1;
-
-    if (snap.exists) {
-        attempts = (snap.data().attempts || 0) + 1;
-    }
-
-    const data = {
-        attempts,
-        lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-    };
-
-    if (attempts >= MAX_ATTEMPTS) {
-        data.lockUntil = admin.firestore.Timestamp.fromMillis(Date.now() + LOCK_TIME);
-    }
-
-    await ref.set(data, { merge: true });
-}
+}, 3 * 60 * 60 * 1000);
 
 async function validateSelections(selections) {
     let candidateMap = GlobalCache.candidates;
@@ -291,17 +289,6 @@ function generateVoteSignature(selections, timestamp, nonce) {
         .digest("hex");
 }
 
-async function isNonceUsed(nonce) {
-    const doc = await db.collection("used_nonces").doc(nonce).get();
-    return doc.exists;
-}
-
-async function markNonceUsed(nonce) {
-    await db.collection("used_nonces").doc(nonce).set({
-        usedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-}
-
 setInterval(async () => {
     try {
         const now = Date.now();
@@ -313,7 +300,7 @@ setInterval(async () => {
             }
         });
     } catch (e) { console.error("Expiry check error:", e); }
-}, 30000);
+}, 1200000);
 
 async function joinQueue(userId, grade) {
     const gradeKey = `sessionG${grade}`;
@@ -367,6 +354,169 @@ function calculateETA(position, currentServing, maxActive = 100, avgTime = 5) {
 
     const batches = Math.ceil(peopleAhead / maxActive);
     return `${batches * avgTime} mins`;
+}
+
+function encryptAccessCode(code) {
+    if (!code) return null;
+    const key = crypto.createHash('sha256').update(ACCESS_CODE_KEY).digest();
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    let encrypted = cipher.update(code.toUpperCase(), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+}
+
+function decryptAccessCode(encryptedCode) {
+    if (!encryptedCode || !encryptedCode.includes(':')) return null;
+    try {
+        const [ivHex, encrypted] = encryptedCode.split(':');
+        const key = crypto.createHash('sha256').update(ACCESS_CODE_KEY).digest();
+        const iv = Buffer.from(ivHex, 'hex');
+        const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+    } catch (e) {
+        console.error('Failed to decrypt access code:', e);
+        return null;
+    }
+}
+
+async function loadVotersStaticCache() {
+    if (VotersStaticCache.isLoading) return;
+    VotersStaticCache.isLoading = true;
+
+    try {
+        console.log('[CACHE] Loading voters static cache from Firestore...');
+
+        // ONE full-collection read — amortised across all future admin page loads.
+        // ~2700 docs × ~4 fields ≈ very cheap on Blaze.
+        const snap = await db.collection("voters").get();
+
+        const voters = [];
+        snap.forEach(doc => {
+            const v = doc.data();
+            voters.push({
+                id: doc.id,                               // hashedLVN — RTDB key
+                lvn: v.lvn || null,                       // raw LVN — admin operations
+                name: v.name || "",
+                grade: v.grade || "",
+                section: v.section || "",
+                // Decrypt once at cache-load time rather than per-request
+                accessCode: v.code ? (decryptAccessCode(v.codeHash) || "ERROR") : null,
+                addedAt: v.addedAt ? v.addedAt.toDate().toISOString() : null,
+            });
+        });
+
+        // Pre-sort by grade → name so slices come out ordered without re-sorting
+        voters.sort((a, b) => {
+            const gDiff = parseInt(a.grade) - parseInt(b.grade);
+            if (gDiff !== 0) return gDiff;
+            return (a.name || "").localeCompare(b.name || "");
+        });
+
+        VotersStaticCache.data = voters;
+        VotersStaticCache.lastUpdated = new Date().toISOString();
+
+        console.log(`[CACHE] Voters static cache loaded: ${voters.length} entries`);
+    } catch (e) {
+        console.error('[CACHE] Failed to load voters static cache:', e);
+    } finally {
+        VotersStaticCache.isLoading = false;
+    }
+}
+
+// Invalidate + reload when voter records are added or deleted
+async function invalidateVotersCache() {
+    VotersStaticCache.data = [];
+    VotersStaticCache.lastUpdated = null;
+    await loadVotersStaticCache();
+}
+
+async function updateVoterStatusInRTDB(voterId, { hasVoted, isMissed, integrityStatus }) {
+    await rtdb.ref(`voterStatus/${voterId}`).set({
+        hasVoted: !!hasVoted,
+        isMissed: !!isMissed,
+        integrityStatus: integrityStatus || "PENDING",
+        updatedAt: admin.database.ServerValue.TIMESTAMP
+    });
+    VoterStatusCache.data = null;
+    VoterStatusCache.lastFetch = 0;
+}
+
+// ============================================
+// AI SERVICE AUTHENTICATION - STRICT SECURITY
+// ============================================
+function validateAIOrigin(req) {
+    // Get origin from headers - browsers send this for CORS/preflight requests
+    const origin = req.headers.origin || req.headers.referer || req.get('origin');
+    
+    // For non-browser requests (like mobile apps), check custom header
+    const aiSource = req.headers['x-ai-source'];
+    
+    // If no origin (direct server-to-server), reject unless in development
+    if (!origin && !aiSource && process.env.NODE_ENV === 'production') {
+        console.log('[AI AUTH] No origin detected, rejecting in production');
+        return false;
+    }
+    
+    // Normalize origin for comparison (remove trailing slash)
+    const normalizedOrigin = origin ? origin.replace(/\/$/, '') : null;
+    
+    // Check against allowed origins
+    const isAllowed = ALLOWED_AI_ORIGINS.some(allowed => {
+        // Exact match
+        if (normalizedOrigin === allowed.replace(/\/$/, '')) return true;
+        // Pattern match for conversation.html variations
+        if (normalizedOrigin && normalizedOrigin.includes(allowed.split('/')[2])) return true;
+        return false;
+    });
+    
+    // Also check x-ai-source header for additional validation
+    const hasValidSourceHeader = aiSource === 'conversation-ai';
+    
+    return isAllowed || hasValidSourceHeader;
+}
+
+function requireAIServiceOnly(req, res, next) {
+    const aiKey = req.headers['x-ai-service-key'];
+    const origin = req.headers.origin || req.headers.referer;
+    
+    // Must have valid key
+    if (!aiKey || !AI_SERVICE_KEY || aiKey !== AI_SERVICE_KEY) {
+        return res.status(401).json({ error: "Invalid or missing AI Service key" });
+    }
+    
+    // Must have valid origin
+    const isAllowedOrigin = ALLOWED_AI_ORIGINS.some(allowed => {
+        return origin === allowed || origin?.startsWith(allowed);
+    });
+    
+    if (!isAllowedOrigin && process.env.NODE_ENV === 'production') {
+        console.warn(`[AI AUTH] Blocked request from origin: ${origin}`);
+        return res.status(403).json({ error: "Forbidden: Invalid origin" });
+    }
+    
+    // Set AI context
+    req.user = {
+        uid: 'AI_SERVICE',
+        role: 'admin',
+        isAIService: true
+    };
+    
+    next();
+}
+
+function requireAIAuthOrAdmin(req, res, next) {
+    // Check if this is the AI Service endpoint
+    if (req.path === '/admin/voters/add' && req.headers['x-ai-service-key']) {
+        return requireAIServiceAuth(req, res, next);
+    }
+    // Otherwise use normal admin auth
+    requireAuth(req, res, (err) => {
+        if (err) return next(err);
+        requireRole('admin')(req, res, next);
+    });
 }
 
 // --- CONSTANTS ---
@@ -423,7 +573,7 @@ async function uploadToGitHub(json, hash) {
                 }
             }
         );
-        await alertManager.detectCandidatesStatus();
+
         await alertManager.detectSystemHealth();
 
         return res.data.content.html_url;
@@ -516,9 +666,7 @@ const ALERT_TYPES = {
     CANDIDATE_PUBLISH_FAILED: { type: 'candidate_publish_failed', level: 'major', autoExpire: null },
 
     // Security alerts
-    BRUTE_FORCE: { type: 'bruteforce', level: 'major', autoExpire: null },
     TAMPER_DETECTED: { type: 'tamper', level: 'critical', autoExpire: null },
-    UNAUTHORIZED_ACCESS: { type: 'unauthorized', level: 'major', autoExpire: null },
 
     // Data integrity alerts
     HASH_CHAIN_BROKEN: { type: 'hash_chain', level: 'critical', autoExpire: null },
@@ -541,7 +689,6 @@ const ALERT_TYPES = {
     ENV_ERROR: { type: 'env_error', level: 'critical', autoExpire: null },
 
     // Election status alerts
-    ELECTION_PAUSED: { type: 'election_paused', level: 'normal', autoExpire: null },
     SESSION_TIMEOUT: { type: 'session_timeout', level: 'minor', autoExpire: null }
 };
 
@@ -803,6 +950,159 @@ class AlertManager {
         } catch (e) {
             console.error("[ALERT ERROR] Failed to create alert:", e);
             return null;
+        }
+    }
+
+    async detectSystemHealth() {
+        let critical = 0;
+        let warnings = 0;
+
+        const indicators = {
+            database: true,
+            auth: true,
+            voteChain: true,
+            antiMultipleVote: true,
+            tamperDetection: true,
+            replayProtection: true,
+            backups: true,
+            anomalyDetection: true,
+            tallyVerification: true,
+            voteConsistency: true
+        };
+
+        try {
+            // 🔍 1. DATABASE LATENCY CHECK
+            const start = Date.now();
+            await db.collection("settings").doc("config").get();
+            const latency = Date.now() - start;
+
+            if (latency > 1000) {
+                warnings++;
+                indicators.database = false;
+
+                await this.createAlert(
+                    'api_error',
+                    'major',
+                    'Slow Database Response',
+                    `Database response time is ${latency}ms.`,
+                    { latency },
+                    10 * 60 * 1000
+                );
+            } else {
+                await this.clearResolvedAlerts('api_error');
+            }
+
+            // 🔍 2. DATABASE READ TEST
+            const testSnap = await db.collection("candidates").limit(1).get();
+            if (testSnap.empty) {
+                critical++;
+                indicators.database = false;
+
+                await this.createAlert(
+                    'database_error',
+                    'critical',
+                    'Database Read Failure',
+                    'Candidates collection is empty or inaccessible.',
+                    {},
+                    null
+                );
+            }
+
+            // 🔍 3. ENV CHECK
+            const requiredEnv = [
+                'FIREBASE_PROJECT_ID',
+                'FIREBASE_CLIENT_EMAIL',
+                'FIREBASE_PRIVATE_KEY',
+                'JWT_SECRET',
+                'ADMIN_KEY'
+            ];
+
+            const missingEnv = requiredEnv.filter(key => !process.env[key]);
+
+            if (missingEnv.length > 0) {
+                critical++;
+                indicators.auth = false;
+
+                await this.createAlert(
+                    'env_error',
+                    'critical',
+                    'Environment Configuration Error',
+                    `Missing: ${missingEnv.join(', ')}`,
+                    { missingEnv },
+                    null
+                );
+            } else {
+                await this.clearResolvedAlerts('env_error');
+            }
+
+            // 🔍 4. HASH CHAIN CHECK (IMPORTANT FOR PAGE 7)
+            let hashStatus = "verified";
+            let anomalies = 0;
+
+            try {
+                const chainDoc = await db.collection("_meta").doc("chain_head").get();
+
+                if (!chainDoc.exists) {
+                    hashStatus = "not verified";
+                    anomalies++;
+                    warnings++;
+                    indicators.voteChain = false;
+                }
+            } catch (e) {
+                hashStatus = "error";
+                anomalies++;
+                critical++;
+                indicators.voteChain = false;
+            }
+
+            // 🔍 5. FINAL STATUS DECISION
+            let overallStatus = "ACTIVE";
+            if (critical > 0) overallStatus = "CRITICAL";
+            else if (warnings > 0) overallStatus = "WARNING";
+
+            return {
+                success: true,
+
+                // 🔥 REQUIRED FOR PDF PAGE 7
+                status: overallStatus,
+                trust:
+                    critical > 0 ? "cannot" :
+                        warnings > 0 ? "can be" : "can",
+
+                hashStatus,
+                anomalies,
+
+                // counts
+                critical,
+                warnings,
+
+                // 🔥 REQUIRED FOR LIVE UI
+                indicators,
+
+                // timestamps
+                lastCheckScan: new Date().toLocaleString()
+            };
+
+        } catch (e) {
+            await this.createAlert(
+                'firebase_error',
+                'critical',
+                'Firebase Connection Failed',
+                `Unable to connect: ${e.message}`,
+                { error: e.message },
+                null
+            );
+
+            return {
+                success: false,
+                status: "CRITICAL",
+                trust: "cannot",
+                error: e.message,
+                critical: 1,
+                warnings: 0,
+                indicators: {},
+                lastCheckScan: new Date().toLocaleString()
+            };
         }
     }
 
@@ -1291,46 +1591,80 @@ async function createAlert(type, level, title, message, meta = {}, expiresInMs =
     return alertManager.createAlert(type, level, title, message, meta, expiresInMs);
 }
 
-// Scheduled monitoring
+async function getActiveSessionCount() {
+    const snap = await rtdb.ref("activeSessions").once("value");
+    return snap.numChildren();
+}
+
+let lastLoadState = null;
+
 setInterval(async () => {
-    if (activeUsers >= 2) { // TESTING
-        await alertManager.createAlert(
-            "high_load",
-            "critical",
-            "Voting Session Critical Load",
-            `Total of ${activeUsers} students are currently voting. System is under heavy stress and may slow down.`,
-            { activeUsers },
-            5 * 60 * 1000
-        );
-    }
-    else if (activeUsers >= 1) {
-        await alertManager.createAlert(
-            'high_load',
-            'major',
-            'Voting Session High Traffic',
-            `Total of ${activeUsers} students are on voting session. Exceeding 500 may affect connectivity. Consider activating Queue System.`,
-            { activeUsers },
-            5 * 60 * 1000
-        );
-    }
+    try {
+        const count = await getActiveSessionCount();
 
-    else {
-        await alertManager.clearResolvedAlerts('high_load');
+        let currentState = "normal";
+
+        if (count >= 800) {
+            currentState = "degraded";
+
+            await rtdb.ref("system/queueEnabled").set(true);
+
+            if (lastLoadState !== currentState) {
+                await alertManager.createAlert(
+                    "high_load",
+                    "critical",
+                    "Degraded performance",
+                    `The system has exceeded the defined threshold of ${count} concurrent active sessions, resulting in degraded application performance. To ensure stability and recover latency, the automated request queue system has been enabled. System traffic is being managed to return to operational parameters. No immediate action required; monitoring.`,
+                    { count }
+                );
+            }
+
+        } else if (count >= 500) {
+            currentState = "critical";
+
+            if (lastLoadState !== currentState) {
+                await alertManager.createAlert(
+                    "high_load",
+                    "critical",
+                    "Critical Load",
+                    `Active sessions have reached critically ${count} users. Current load levels may lead to degraded latency and performance.`,
+                    { count }
+                );
+            }
+
+        } else if (count >= 300) {
+            currentState = "high";
+
+            if (lastLoadState !== currentState) {
+                await alertManager.createAlert(
+                    "high_load",
+                    "major",
+                    "High Load",
+                    `Active sessions have reached ${count}. Current load levels may lead to degraded latency and performance.`,
+                    { count }
+                );
+            }
+
+        } else {
+            currentState = "normal";
+
+            await rtdb.ref("system/queueEnabled").set(false);
+
+            if (lastLoadState !== currentState) {
+                await alertManager.clearResolvedAlerts("high_load");
+            }
+        }
+
+        lastLoadState = currentState;
+
+    } catch (e) {
+        console.error("Active session monitor error:", e);
     }
-
-}, 30000);
-
-// Run comprehensive checks every 30 seconds
-setInterval(async () => {
-    await alertManager.detectCandidatesStatus();
-    await alertManager.detectVoteIntegrity();
-}, 120000);
+}, 15000);
 
 // Initial system health check
 setTimeout(async () => {
     await alertManager.detectSystemHealth();
-    await alertManager.detectCandidatesStatus();
-    await alertManager.detectVoteIntegrity();
 }, 5000);
 
 // --- SECURITY: JWT SECRET ---
@@ -1427,119 +1761,9 @@ async function randomDelay(minMs = 800, maxMs = 1200) {
     return new Promise(resolve => setTimeout(resolve, delay));
 }
 
-// --- SECURITY: FIRESTORE-BACKED BRUTE FORCE TRACKING ---
-const BRUTE_FORCE_WINDOW_MS = 15 * 60 * 1000;
-const BRUTE_FORCE_MAX = 5;
-
-function getDeviceBruteForceDoc(deviceId) {
-    return db.collection("device_brute_force").doc(deviceId);
-}
-
-async function recordDeviceAttempt(deviceId) {
-    const ref = getDeviceBruteForceDoc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) {
-        await ref.set({
-            attempts: 1,
-            lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-        });
-    } else {
-        const attempts = (snap.data().attempts || 0) + 1;
-
-        if (attempts >= 5) {
-            await ref.update({
-                attempts,
-                lockUntil: admin.firestore.Timestamp.fromMillis(Date.now() + 30 * 60 * 1000)
-            });
-        } else {
-            await ref.update({ attempts });
-        }
-    }
-}
-
-async function isDeviceLocked(deviceId) {
-    const ref = getDeviceBruteForceDoc(deviceId);
-    const snap = await ref.get();
-
-    if (!snap.exists) return false;
-
-    const data = snap.data();
-
-    if (data.lockUntil && data.lockUntil.toMillis() > Date.now()) {
-        return true;
-    }
-
-    return false;
-}
-
-async function clearBruteForce(deviceId) {
-    try {
-        const ref = await getDeviceBruteForceDoc(deviceId);
-        await ref.delete();
-    } catch { }
-}
-
 // --- SECURITY: PER-USER (LVN) BRUTE FORCE PROTECTION ---
 const USER_LOCK_ATTEMPTS = 5;
 const USER_LOCK_DURATION_MS = 30 * 60 * 1000;
-
-async function getVoterBruteForceDoc(hashedLVN) {
-    return db.collection("voter_brute_force").doc(hashedLVN);
-}
-
-async function isVoterLocked(hashedLVN) {
-    try {
-        const ref = await getVoterBruteForceDoc(hashedLVN);
-        const snap = await ref.get();
-        if (!snap.exists) return false;
-        const d = snap.data();
-        if (d.lockUntil && d.lockUntil.toMillis() > Date.now()) {
-            return true;
-        }
-        if (d.lockUntil && d.lockUntil.toMillis() <= Date.now()) {
-            await ref.delete();
-            return false;
-        }
-        return false;
-    } catch { return false; }
-}
-
-async function recordVoterFailedAttempt(hashedLVN) {
-    try {
-        const ref = await getVoterBruteForceDoc(hashedLVN);
-        const snap = await ref.get();
-        if (!snap.exists) {
-            await ref.set({
-                failedAttempts: 1,
-                lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        } else {
-            const d = snap.data();
-            const newAttempts = (d.failedAttempts || 0) + 1;
-            if (newAttempts >= USER_LOCK_ATTEMPTS) {
-                const lockUntil = new Date(Date.now() + USER_LOCK_DURATION_MS);
-                await ref.update({
-                    failedAttempts: newAttempts,
-                    lockUntil: admin.firestore.Timestamp.fromDate(lockUntil),
-                    lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-                });
-            } else {
-                await ref.update({
-                    failedAttempts: newAttempts,
-                    lastAttempt: admin.firestore.FieldValue.serverTimestamp()
-                });
-            }
-        }
-    } catch { }
-}
-
-async function clearVoterBruteForce(hashedLVN) {
-    try {
-        const ref = await getVoterBruteForceDoc(hashedLVN);
-        await ref.delete();
-    } catch { }
-}
 
 // --- SECURITY: HASH FUNCTION FOR LVN ENCRYPTION ---
 const LVN_SECRET = process.env.LVN_SECRET;
@@ -1708,47 +1932,6 @@ async function getLatestAuditHash() {
     return doc.exists ? doc.data().hash : "GENESIS";
 }
 
-async function logImmutableAction(action, data, user) {
-    try {
-        const safeData = JSON.parse(JSON.stringify(data || {}));
-
-        const safeUser = {
-            id: user?.uid || null,
-            email: user?.email || null
-        };
-
-        await db.runTransaction(async (t) => {
-            const chainDoc = await t.get(AUDIT_CHAIN_DOC);
-            const previousHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
-
-            const logEntry = {
-                action,
-                data: safeData,
-                user: safeUser,
-                timestamp: Date.now(),
-                previousHash
-            };
-
-            const hash = crypto.createHash("sha256")
-                .update(JSON.stringify(logEntry))
-                .digest("hex");
-
-            logEntry.hash = hash;
-
-            const logRef = db.collection("audit_trail").doc();
-
-            t.set(logRef, logEntry);
-            t.set(AUDIT_CHAIN_DOC, {
-                hash,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        });
-
-    } catch (e) {
-        console.error("🔥 AUDIT FAILED (IGNORED):", e.message);
-    }
-}
-
 async function logAdminAction(req, action, meta = {}) {
     try {
         const u = req.user || {};
@@ -1766,62 +1949,19 @@ async function logAdminAction(req, action, meta = {}) {
     } catch (e) { }
 }
 
-app.get("/verify-audit-chain", async (req, res) => {
-    const logs = await db.collection("audit_trail")
-        .orderBy("timestamp")
-        .get();
-
-    let prevHash = "GENESIS";
-
-    for (const doc of logs.docs) {
-        const entry = doc.data();
-
-        const recalculated = crypto.createHash("sha256")
-            .update(JSON.stringify({
-                action: entry.action,
-                data: entry.data,
-                user: entry.user,
-                timestamp: entry.timestamp,
-                previousHash: prevHash
-            }))
-            .digest("hex");
-
-        if (recalculated !== entry.hash) {
-            return res.json({ valid: false });
-        }
-
-        prevHash = entry.hash;
-    }
-
-    res.json({ valid: true });
-});
 
 // 1. Log every admin data mutation with before/after state
 async function logDataMutation(req, collection, docId, before, after) {
     await db.collection("admin_audit").add({
         action: "DATA_MUTATION",
         collection, docId,
-        before: JSON.stringify(before),   // snapshot before change
+        before: JSON.stringify(before),
         after: JSON.stringify(after),
         adminEmail: req.user?.email,
         ip: req.ip,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 }
-
-// 2. Periodic audit: vote count must equal voter.hasVoted count
-setInterval(async () => {
-    const [voteSnap, voterSnap] = await Promise.all([
-        db.collection("votes").count().get(),
-        db.collection("voters").where("hasVoted", "==", true).count().get()
-    ]);
-    const votes = voteSnap.data().count;
-    const voters = voterSnap.data().count;
-    if (votes !== voters) {
-        await createAlert("vote_integrity", "critical",
-            "Count mismatch", `votes=${votes} vs hasVoted=${voters}`);
-    }
-}, 60000);
 
 // --- CANDIDATE & RESULTS FUNCTIONS ---
 async function getOrGenerateCode(type, key) {
@@ -2184,6 +2324,7 @@ async function verifyCaptcha(token) {
 }
 
 // -- ALERTS
+
 app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const alerts = await alertManager.getActiveAlerts();
@@ -2274,6 +2415,39 @@ app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, r
     }
 });
 
+app.post("/admin/system/status", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const { isLive, isQueue } = req.body;
+
+        // Validate inputs
+        if (typeof isLive !== "boolean" && typeof isQueue !== "boolean") {
+            return res.status(400).json({ error: "Invalid status values" });
+        }
+
+        const updates = {};
+
+        if (typeof isLive === "boolean") updates["status/isLive"] = isLive;
+        if (typeof isQueue === "boolean") updates["status/isQueue"] = isQueue;
+
+        await rtdb.ref("/").update(updates);
+
+        await logAdminAction(req, "UPDATE_SYSTEM_STATUS", {
+            isLive,
+            isQueue
+        });
+
+        res.json({
+            success: true,
+            message: "System status updated",
+            updates
+        });
+
+    } catch (e) {
+        console.error("Update status error:", e);
+        res.status(500).json({ error: "Failed to update system status" });
+    }
+});
+
 async function detectVotingAnomalies(req, voterId) {
     try {
         const recentVotes = await db.collection("votes")
@@ -2361,7 +2535,6 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const username = sanitizeString(req.body.username || '');
     const password = req.body.password || '';
     const captchaToken = req.body.captchaToken;
-    const deviceId = req.cookies.__device_id || req.ip;
 
     await randomDelay(800, 1200);
 
@@ -2375,17 +2548,8 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         });
     }
 
-    const check = await checkLoginAttempts(deviceId);
-    if (!check.allowed) {
-        return res.status(429).json({ error: check.message });
-    }
-
     if (!(await verifyCaptcha(captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
-    }
-
-    if (await isDeviceLocked(deviceId)) {
-        return res.status(403).json({ error: "Locked" });
     }
 
     const isValidUser = username === process.env.ADMIN_USER;
@@ -2394,27 +2558,6 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     if (isValidUser && process.env.ADMIN_HASH) {
         isValidPass = await bcrypt.compare(password, process.env.ADMIN_HASH);
     }
-
-    if (!isValidUser || !isValidPass) {
-        await recordDeviceAttempt(deviceId);
-        const ip = req.ip;
-        await createAlert(
-            "bruteforce",
-            "major",
-            "⚠️ Brute Force Detected",
-            "Multiple failed admin login attempts detected.",
-            { ip }
-        );
-
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
-            username: username ? "***" : null
-        });
-        await recordLoginAttempt(deviceId, isValidPass);
-
-        return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    await clearBruteForce(deviceId);
 
     const adminJti = crypto.randomBytes(16).toString("hex");
     const token = jwt.sign({
@@ -2433,7 +2576,6 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     });
 
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
-    await recordLoginAttempt(deviceId, isValidPass);
 
     res.json({ success: true });
 });
@@ -2544,7 +2686,7 @@ app.get("/dashboard", (req, res) => {
 // --- VERIFIABLE VOTING: PUBLIC BULLETIN BOARD ---
 app.get("/public-receipts", async (req, res) => {
     try {
-        // ✅ Pagination controls (safe limits)
+        // Pagination controls (safe limits)
         const limit = Math.min(parseInt(req.query.limit) || 100, 500);
         const cursor = req.query.cursor || null;
 
@@ -2552,7 +2694,6 @@ app.get("/public-receipts", async (req, res) => {
             .orderBy("createdAt", "asc")
             .limit(limit);
 
-        // ✅ Cursor support (ISO string → Date)
         if (cursor) {
             query = query.startAfter(new Date(cursor));
         }
@@ -2564,35 +2705,41 @@ app.get("/public-receipts", async (req, res) => {
 
         for (const doc of votesSnap.docs) {
             const data = doc.data();
-
-            const ts = data.createdAt
-                ? data.createdAt.toDate().toISOString()
-                : null;
-
+            const ts = data.createdAt ? data.createdAt.toDate().toISOString() : null;
             if (ts) lastTimestamp = ts;
 
+            // CRITICAL: Never expose raw receipt, only masked version
+            const masked = maskReceipt(data.receipt);
+
             receipts.push({
-                receipt: data.receipt,
+                receiptMask: masked.mask,
+                receiptHash: masked.hash,
                 timestamp: ts,
-                hash: data.hash,
-                prevHash: data.prevHash
+                blockHash: data.hash,
+                prevBlockHash: data.prevHash,
+                sequence: data.sequence
             });
         }
 
-        // ✅ Only verify chain on FIRST page (avoid repeated heavy checks)
+        // Only verify chain on FIRST page (avoid repeated heavy checks)
         let chainInfo = null;
         if (!cursor) {
-            chainInfo = await verifyHashChain(votesSnap); // reuse snapshot
+            chainInfo = await verifyHashChain(votesSnap);
         }
 
-        res.set("Cache-Control", "no-store");
+        res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.set("Pragma", "no-cache");
+        res.set("Expires", "0");
 
         return res.json({
             receipts,
             pageSize: receipts.length,
-            nextCursor: lastTimestamp, // client uses this for next page
+            nextCursor: lastTimestamp,
             chainValid: chainInfo ? chainInfo.valid : undefined,
-            chainInfo: chainInfo || undefined
+            totalVerified: chainInfo ? chainInfo.totalVotes : undefined,
+            pageIntegrity: crypto.createHash('sha256')
+                .update(JSON.stringify(receipts.map(r => r.blockHash)))
+                .digest('hex')
         });
 
     } catch (e) {
@@ -2603,26 +2750,54 @@ app.get("/public-receipts", async (req, res) => {
     }
 });
 
-app.get("/verify-receipt/:receipt", async (req, res) => {
+app.post("/verify-receipt", rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: { error: "Too many verification attempts" }
+}), async (req, res) => {
     try {
-        const receipt = sanitizeString(req.params.receipt || '');
-        if (!receipt || receipt.length !== 64) {
+        // Accept receipt in POST body instead of URL parameter
+        const { receipt } = req.body;
+
+        if (!receipt || typeof receipt !== 'string' || receipt.length !== 64) {
             return res.status(400).json({ error: "Invalid receipt format" });
         }
+
+        // Sanitize input
+        const sanitizedReceipt = receipt.replace(/[^a-f0-9]/g, '');
+        if (sanitizedReceipt.length !== 64) {
+            return res.status(400).json({ error: "Invalid receipt characters" });
+        }
+
         const votesSnap = await db.collection("votes")
-            .where("receipt", "==", receipt)
+            .where("receipt", "==", sanitizedReceipt)
             .limit(1)
             .get();
+
         if (votesSnap.empty) {
-            return res.json({ found: false, message: "Receipt not found" });
+            return res.json({
+                found: false,
+                message: "Receipt not found in public ledger"
+            });
         }
+
         const voteData = votesSnap.docs[0].data();
+        const masked = maskReceipt(voteData.receipt);
+
+        // Return verification without exposing raw receipt
         res.json({
             found: true,
-            message: "Vote is recorded and included",
+            verified: true,
+            message: "Vote is recorded and included in the blockchain",
+            receiptMask: masked.mask,  // User can confirm first/last chars match their copy
             timestamp: voteData.createdAt ? voteData.createdAt.toDate().toISOString() : null,
-            hash: voteData.hash,
-            prevHash: voteData.prevHash
+            blockHash: voteData.hash,
+            prevBlockHash: voteData.prevHash,
+            sequence: voteData.sequence,
+            // Verification proof (hash of receipt + block hash)
+            inclusionProof: crypto.createHash('sha256')
+                .update(sanitizedReceipt + voteData.hash)
+                .digest('hex')
         });
     } catch (e) {
         console.error("Verify receipt error:", e);
@@ -2740,12 +2915,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
 
         const hashedLVN = hashLVN(lvn);
 
-        if (await isVoterLocked(hashedLVN)) {
-            return res.status(403).json({
-                error: "Account temporarily locked due to multiple failed attempts. Please try again later."
-            });
-        }
-
         const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
 
         const deviceFingerprint = crypto.createHash("sha256")
@@ -2774,7 +2943,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const voterSnap = await voterRef.get();
 
         if (!voterSnap.exists) {
-            await recordVoterFailedAttempt(hashedLVN);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
 
@@ -2784,7 +2952,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isCodeValid = await bcrypt.compare(inputCode, d.code);
 
         if (!isCodeValid) {
-            await recordVoterFailedAttempt(hashedLVN);
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
             return res.status(401).json({ error: "Invalid Credentials." });
         }
@@ -2823,7 +2990,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
 
         if (d.hasVoted) {
-            // ✅ Clean up queue entry if they somehow still exist
             if (settingsData.isQueue) {
                 setImmediate(async () => {
                     try {
@@ -2831,10 +2997,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
                         await queueRef.transaction(current => {
                             if (current && current.users && current.users[hashedLVN]) {
                                 delete current.users[hashedLVN];
-                                // Adjust activeCount if needed
-                                if (current.users[hashedLVN]?.status === 'active') {
-                                    current.activeCount = Math.max(0, (current.activeCount || 0) - 1);
-                                }
                             }
                             return current;
                         });
@@ -2856,7 +3018,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
             }
         }
 
-        // 🔥 QUEUE CHECK + JOIN
         const isQueue = settingsData.isQueue === true;
 
         if (isQueue) {
@@ -2868,15 +3029,12 @@ app.post("/verify", loginLimiter, async (req, res) => {
             lastLogin: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        res.cookie("__device_id", deviceFingerprint, {
-            httpOnly: true,
-            secure: true,
-            sameSite: "none",
-            path: "/",
-            maxAge: 365 * 24 * 60 * 60 * 1000
+        // 🔥 ✅ ACTIVE SESSION SET (CORRECT PLACE)
+        const userRef = rtdb.ref(`activeSessions/${hashedLVN}`);
+        await userRef.set({
+            startedAt: Date.now()
         });
-
-        await clearVoterBruteForce(hashedLVN);
+        userRef.onDisconnect().remove();
 
         const csrfToken = crypto.randomBytes(32).toString('hex');
         const jti = crypto.randomBytes(16).toString("hex");
@@ -2901,80 +3059,180 @@ app.post("/verify", loginLimiter, async (req, res) => {
             grade: d.grade,
             token: sessionToken,
             csrfToken,
-            isQueue, // ✅ FRONTEND USES THIS
-            ...(isQueue && { queueKey: hashedLVN }) // ✅ RTDB path key for queue listener
+            isQueue,
+            ...(isQueue && { queueKey: hashedLVN })
         });
 
     } catch (e) {
+        console.error("ERROR:", e);
         return res.status(500).json({ error: "Server error during verification." });
     }
 });
 
-async function useNonce(nonce) {
-    const ref = db.collection("used_nonces").doc(nonce);
+setInterval(async () => {
+    const grades = ['G7', 'G8', 'G9', 'G10', 'G11', 'G12'];
 
-    return db.runTransaction(async (tx) => {
-        const doc = await tx.get(ref);
+    for (const grade of grades) {
+        const gradeKey = `session${grade}`;
+        const usersRef = rtdb.ref(`queue/${gradeKey}/users`);
+        const queueRef = rtdb.ref(`queue/${gradeKey}`);
 
-        if (doc.exists) {
-            return false;
+        try {
+            const snapshot = await usersRef.once('value');
+            const users = snapshot.val() || {};
+
+            let cleanedCount = 0;
+            let needsRecalc = false;
+
+            for (const [userId, userData] of Object.entries(users)) {
+                // ✅ Just check RTDB status - no Firestore call!
+                if (userData.status === 'done') {
+                    await usersRef.child(userId).remove();
+                    cleanedCount++;
+                    needsRecalc = true;
+                }
+            }
+
+            if (cleanedCount > 0) {
+                console.log(`🧹 Cleaned up ${cleanedCount} 'done' entries from ${gradeKey}`);
+
+                if (needsRecalc) {
+                    // Recalculate activeCount from remaining users
+                    const remainingSnapshot = await usersRef.once('value');
+                    const remainingUsers = remainingSnapshot.val() || {};
+
+                    let newActiveCount = 0;
+                    for (const [_, data] of Object.entries(remainingUsers)) {
+                        if (data.status === 'active') {
+                            newActiveCount++;
+                        }
+                    }
+
+                    await queueRef.update({ activeCount: newActiveCount });
+                    console.log(`📊 ${gradeKey} activeCount recalculated: ${newActiveCount}`);
+                }
+            }
+
+        } catch (err) {
+            console.error(`Queue cleanup error for ${gradeKey}:`, err);
         }
+    }
+}, 10 * 60 * 1000);
 
-        tx.set(ref, {
-            usedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+function maskReceipt(receipt) {
+    if (!receipt || typeof receipt !== 'string') return { mask: '***', hash: null };
+    if (receipt.length < 16) return { mask: '***', hash: null };
 
-        return true;
-    });
+    const mask = receipt.substring(0, 4) + '⋯' + receipt.substring(receipt.length - 4);
+
+    const hash = crypto.createHmac('sha256', MASK_SECRET)
+        .update(receipt)
+        .digest('hex')
+        .substring(0, 16);
+
+    return { mask, hash };
 }
+
+function maskLVN(lvn) {
+    if (!lvn || typeof lvn !== 'string') return '***';
+    if (lvn.length < 8) return '***';
+    // Show only last 3 digits
+    return '***' + lvn.slice(-3);
+}
+
+function sanitizeVoterData(voter) {
+    const sanitized = { ...voter };
+
+    // Never expose these fields
+    delete sanitized.code;
+    delete sanitized.lvn;
+    delete sanitized.receipt;
+    delete sanitized._deviceFingerprint;
+
+    if (voter.lvn) {
+        sanitized.lvnMask = maskLVN(voter.lvn);
+    }
+    if (voter.receipt) {
+        const masked = maskReceipt(voter.receipt);
+        sanitized.receiptMask = masked.mask;
+        sanitized.receiptHash = masked.hash;
+    }
+
+    return sanitized;
+}
+
+function sanitizePublicVote(voteData) {
+    const { receipt, salt, ...safeData } = voteData;
+
+    delete safeData.voterId; // If exists
+    delete safeData.ip;      // If exists
+
+    if (receipt) {
+        const masked = maskReceipt(receipt);
+        safeData.receiptMask = masked.mask;
+        safeData.receiptVerifyHash = masked.hash;
+    }
+
+    return safeData;
+}
+
+app.post("/verify-vote", rateLimit({
+    windowMs: 60 * 1000,
+    max: 20
+}), async (req, res) => {
+    const { receipt, verificationCode } = req.body;
+
+    if (!receipt || !verificationCode) {
+        return res.status(400).json({ error: "Missing data" });
+    }
+
+    const voteSnap = await db.collection("votes")
+        .where("receipt", "==", receipt)
+        .limit(1)
+        .get();
+
+    if (voteSnap.empty) {
+        return res.json({ found: false });
+    }
+
+    const vote = voteSnap.docs[0].data();
+
+    const expectedCode = crypto.createHash("sha256")
+        .update(receipt + stableStringify(vote.selections))
+        .digest("hex")
+        .substring(0, 12);
+
+    if (verificationCode.length !== expectedCode.length) {
+        return res.json({ found: true, contentMatches: false });
+    }
+
+    const cleanCode = verificationCode.trim().toLowerCase();
+
+    const contentMatches = crypto.timingSafeEqual(
+        Buffer.from(expectedCode),
+        Buffer.from(cleanCode)
+    );
+
+    res.json({
+        found: true,
+        contentMatches
+    });
+});
 
 function stableStringify(obj) {
-    return JSON.stringify(Object.keys(obj).sort().reduce((acc, key) => {
-        acc[key] = obj[key];
-        return acc;
-    }, {}));
-}
-
-app.post('/authenticate', async (req, res) => {
-    const { lvn, turnstileToken } = req.body;
-    console.log("🔵 AUTH: Request received for LVN hash:", hashLVN(lvn).substring(0, 8));
-
-    try {
-        const voterHash = hashLVN(lvn);
-        const voterRef = db.collection("voters").doc(voterHash);
-        const voterSnap = await voterRef.get();
-
-        if (!voterSnap.exists) {
-            console.log("🔴 AUTH: Voter not found");
-            return res.status(403).json({ error: "Voter not found" });
-        }
-
-        const voterData = voterSnap.data();
-        const sessionId = crypto.randomBytes(32).toString("hex");
-        const jti = crypto.randomBytes(16).toString("hex");
-        console.log("🟢 AUTH: SessionID generated:", sessionId.substring(0, 16));
-
-        const token = jwt.sign({
-            uid: voterHash,
-            grade: voterData.grade,
-            sessionId,
-            jti,
-            role: "voter"
-        }, SECRET, { expiresIn: "30m" });
-
-        console.log("🟡 AUTH: JWT signed.");
-
-        res.json({ token, voterData });
-
-    } catch (e) {
-        console.error("❌ AUTH ERROR:", {
-            message: e.message,
-            stack: e.stack,
-            code: e.code
-        });
-        res.status(500).json({ error: "Authentication failed" });
+    if (obj === null || typeof obj !== "object") {
+        return JSON.stringify(obj);
     }
-});
+
+    if (Array.isArray(obj)) {
+        return "[" + obj.map(stableStringify).join(",") + "]";
+    }
+
+    const keys = Object.keys(obj).sort();
+    return "{" + keys.map(key => {
+        return JSON.stringify(key) + ":" + stableStringify(obj[key]);
+    }).join(",") + "}";
+}
 
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
     try {
@@ -3001,26 +3259,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: "Request expired" });
         }
 
-        // 🔒 Anti-replay (nonce)
-        const nonceRef = db.collection("used_nonces").doc(nonce);
-
-        const nonceUsed = await db.runTransaction(async (tx) => {
-            const doc = await tx.get(nonceRef);
-
-            if (doc.exists) return true;
-
-            tx.set(nonceRef, {
-                usedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            return false;
-        });
-
-        if (nonceUsed) {
-            await createAlert("tamper", "critical", "Replay Attack", "Duplicate vote", { nonce });
-            return res.status(400).json({ error: "Duplicate request detected" });
-        }
-
         // 🔍 Validate selections
         let validatedSelections;
         try {
@@ -3040,7 +3278,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const electionData = settings.data();
 
         if (electionData.isQueue) {
-            const userSnap = await rtdb.ref(`queue/users/${hashedLVN}`).once('value');
+            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
             if (!userSnap.exists()) {
                 return res.status(403).json({ error: "You are not in the queue." });
             }
@@ -3196,99 +3434,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
     }
 });
 
-setInterval(async () => {
-    const grades = ['G7', 'G8', 'G9', 'G10', 'G11', 'G12'];
-
-    for (const grade of grades) {
-        const gradeKey = `session${grade}`;
-        const usersRef = rtdb.ref(`queue/${gradeKey}/users`);
-        const queueRef = rtdb.ref(`queue/${gradeKey}`);
-
-        try {
-            const snapshot = await usersRef.once('value');
-            const users = snapshot.val() || {};
-
-            let cleanedCount = 0;
-            let needsRecalc = false;
-
-            for (const [userId, userData] of Object.entries(users)) {
-                // ✅ Just check RTDB status - no Firestore call!
-                if (userData.status === 'done') {
-                    await usersRef.child(userId).remove();
-                    cleanedCount++;
-                    needsRecalc = true;
-                }
-            }
-
-            if (cleanedCount > 0) {
-                console.log(`🧹 Cleaned up ${cleanedCount} 'done' entries from ${gradeKey}`);
-
-                if (needsRecalc) {
-                    // Recalculate activeCount from remaining users
-                    const remainingSnapshot = await usersRef.once('value');
-                    const remainingUsers = remainingSnapshot.val() || {};
-
-                    let newActiveCount = 0;
-                    for (const [_, data] of Object.entries(remainingUsers)) {
-                        if (data.status === 'active') {
-                            newActiveCount++;
-                        }
-                    }
-
-                    await queueRef.update({ activeCount: newActiveCount });
-                    console.log(`📊 ${gradeKey} activeCount recalculated: ${newActiveCount}`);
-                }
-            }
-
-        } catch (err) {
-            console.error(`Queue cleanup error for ${gradeKey}:`, err);
-        }
-    }
-}, 10 * 60 * 1000);
-
-app.post("/verify-vote", rateLimit({
-    windowMs: 60 * 1000,
-    max: 20
-}), async (req, res) => {
-    const { receipt, verificationCode } = req.body;
-
-    if (!receipt || !verificationCode) {
-        return res.status(400).json({ error: "Missing data" });
-    }
-
-    const voteSnap = await db.collection("votes")
-        .where("receipt", "==", receipt)
-        .limit(1)
-        .get();
-
-    if (voteSnap.empty) {
-        return res.json({ found: false });
-    }
-
-    const vote = voteSnap.docs[0].data();
-
-    const expectedCode = crypto.createHash("sha256")
-        .update(receipt + stableStringify(vote.selections))
-        .digest("hex")
-        .substring(0, 12);
-
-    if (verificationCode.length !== expectedCode.length) {
-        return res.json({ found: true, contentMatches: false });
-    }
-
-    const cleanCode = verificationCode.trim().toLowerCase();
-
-    const contentMatches = crypto.timingSafeEqual(
-        Buffer.from(expectedCode),
-        Buffer.from(cleanCode)
-    );
-
-    res.json({
-        found: true,
-        contentMatches
-    });
-});
-
 app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, async (req, res) => {
     const submitToken = req.headers["x-submit-token"] || req.body._submitToken;
     if (!verifySubmitToken(submitToken, req.user.jti)) {
@@ -3353,42 +3498,92 @@ app.use("/admin", requireAuth, requireRole("admin"), adminLimiter);
 
 app.get("/admin/voters", async (req, res) => {
     try {
-        const [votersSnap, votesSnap] = await Promise.all([
-            db.collection("voters").get(),
-            db.collection("votes").select("receipt").get()
-        ]);
-        const validReceipts = new Set();
-        votesSnap.forEach(doc => {
-            const d = doc.data();
-            if (d.receipt) validReceipts.add(d.receipt);
-        });
-        const voters = [];
-        votersSnap.forEach(doc => {
-            const v = doc.data();
-            let integrityStatus = "PENDING";
-            if (v.isMissed) {
-                integrityStatus = "MISSED";
-            } else if (v.hasVoted) {
-                if (!v.receipt || !validReceipts.has(v.receipt)) {
-                    integrityStatus = "INVALID";
-                } else {
-                    integrityStatus = "VOTED";
-                }
+        if (VotersStaticCache.data.length === 0) {
+            while (VotersStaticCache.isLoading) {
+                await new Promise(r => setTimeout(r, 50));
             }
-            voters.push({
-                lvn: v.lvn || "***",
-                name: v.name,
-                grade: v.grade,
-                section: v.section,
-                hasVoted: v.hasVoted,
-                isMissed: v.isMissed,
-                integrityStatus
-            });
+            if (VotersStaticCache.data.length === 0) {
+                await loadVotersStaticCache();
+            }
+        }
+
+        // ── 1. Parse query parameters ─────────────────────────────────────────
+        const page = Math.max(1, parseInt(req.query.page || "1", 10));
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "50", 10)));
+        const gradeFilter = sanitizeString(req.query.grade || "ALL");
+        const searchQuery = sanitizeString((req.query.search || "").toLowerCase().trim());
+
+        // ── 2. Filter on static cache (O(n) over in-memory array, no I/O) ────
+        let filtered = VotersStaticCache.data;
+
+        if (gradeFilter && gradeFilter !== "ALL") {
+            filtered = filtered.filter(v => String(v.grade).trim() === String(gradeFilter).trim());
+        }
+
+        if (searchQuery) {
+            filtered = filtered.filter(v =>
+                (v.name || "").toLowerCase().includes(searchQuery) ||
+                (v.lvn || "").toLowerCase().includes(searchQuery) ||
+                (v.section || "").toLowerCase().includes(searchQuery)
+            );
+        }
+
+        const total = filtered.length;
+        const totalPages = Math.ceil(total / limit) || 1;
+        const safePage = Math.min(page, totalPages);
+        const start = (safePage - 1) * limit;
+        const pageSlice = filtered.slice(start, start + limit);
+
+        const statusSnap = await rtdb.ref("voterStatus").once("value");
+        const statusMap = await getVoterStatusCache();
+
+        // ── 4. Merge static + dynamic data ────────────────────────────────────
+        const voters = pageSlice.map(voter => {
+            const s = statusMap[voter.id] || {};
+            return {
+                id: voter.id,
+                lvn: voter.lvn,
+                name: voter.name,
+                grade: voter.grade,
+                section: voter.section,
+                code: voter.accessCode,
+                hasVoted: s.hasVoted ?? false,
+                isMissed: s.isMissed ?? false,
+                integrityStatus: s.integrityStatus ?? "PENDING",
+                addedAt: voter.addedAt,
+            };
         });
-        await logSuccessEvent("ADMIN_VIEW_VOTERS", req, { count: voters.length });
-        res.json(voters);
+
+        await logSuccessEvent("ADMIN_VIEW_VOTERS", req, {
+            page: safePage, limit, total, returned: voters.length
+        });
+
+        res.json({
+            voters,
+            pagination: {
+                page: safePage,
+                limit,
+                total,
+                totalPages,
+                hasNext: safePage < totalPages,
+                hasPrev: safePage > 1,
+            },
+            cacheAge: VotersStaticCache.lastUpdated,
+        });
+
     } catch (e) {
+        console.error("GET /admin/voters error:", e);
         res.status(500).json({ error: "Failed to fetch voters" });
+    }
+});
+
+app.post("/admin/voters/cache-refresh", async (req, res) => {
+    try {
+        await invalidateVotersCache();
+        await logAdminAction(req, "VOTER_CACHE_REFRESH", { count: VotersStaticCache.data.length });
+        res.json({ success: true, count: VotersStaticCache.data.length, cachedAt: VotersStaticCache.lastUpdated });
+    } catch (e) {
+        res.status(500).json({ error: "Cache refresh failed" });
     }
 });
 
@@ -3431,12 +3626,14 @@ app.post("/admin/voters/add", async (req, res) => {
         for (const name of names) {
             if (!name || !name.trim()) continue;
             const cleanName = name.toUpperCase().trim();
-            const codeHashForUpdate = await bcrypt.hash(accessCode.toUpperCase(), 10);
+            const codeHashForUpdate = encryptAccessCode(accessCode);
+            const code = await bcrypt.hash(accessCode.toUpperCase(), 10);
             if (existingMap[cleanName]) {
                 batch.update(existingMap[cleanName], {
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: codeHashForUpdate,
+                    code: code,
+                    codeHash: codeHashForUpdate,
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
                 updatedCount++;
@@ -3444,16 +3641,17 @@ app.post("/admin/voters/add", async (req, res) => {
                 const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
                 const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
                 const hashedLVN = hashLVN(lvn);
-                const codeHash = await bcrypt.hash(accessCode.toUpperCase(), 10);
+                const encryptedCode = encryptAccessCode(accessCode);
+                const codeForNewSet = await bcrypt.hash(accessCode.toUpperCase(), 10);
                 const existingLvnSnap = await db.collection("voters").doc(hashedLVN).get();
-                if (existingLvnSnap.exists) continue;
                 const voterRef = db.collection("voters").doc(hashedLVN);
                 batch.set(voterRef, {
                     lvn: lvn,
                     name: cleanName,
                     grade: targetGrade,
                     section: section.toUpperCase(),
-                    code: codeHash,
+                    code: codeForNewSet,
+                    codeHash: encryptedCode,
                     hasVoted: false,
                     addedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
@@ -3461,14 +3659,11 @@ app.post("/admin/voters/add", async (req, res) => {
             }
         }
         await batch.commit();
+        // Invalidate static cache so new voters appear on next admin load
+        setImmediate(() => invalidateVotersCache().catch(e =>
+            console.error("[CACHE] invalidateVotersCache after add failed:", e)
+        ));
         await logAdminAction(req, "VOTERS_UPSERT", {
-            grade: targetGrade,
-            section: section.toUpperCase(),
-            totalProvided: names.length,
-            updated: updatedCount,
-            added: addedCount,
-        });
-        await logImmutableAction(req, "VOTERS_UPSERT", {
             grade: targetGrade,
             section: section.toUpperCase(),
             totalProvided: names.length,
@@ -3479,6 +3674,119 @@ app.post("/admin/voters/add", async (req, res) => {
         res.json({ success: true, message: `Processed ${names.length}. Promoted/Updated: ${updatedCount}, New: ${addedCount}`, accessCode: accessCode });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
+    const grade = sanitizeString(req.body.grade || '');
+    const section = sanitizeString(req.body.section || '');
+    const names = Array.isArray(req.body.names) ? req.body.names.map(n => sanitizeString(n)) : [];
+    
+    // Validation
+    if (!grade || isNaN(parseInt(grade))) {
+        return res.status(400).json({ error: "Invalid grade value." });
+    }
+    if (!section || !section.trim()) {
+        return res.status(400).json({ error: "Section is required." });
+    }
+    if (!names || !Array.isArray(names) || names.length === 0) {
+        return res.status(400).json({ error: "At least one name is required" });
+    }
+    
+    // AI has stricter limits - max 10 names per request
+    if (names.length > 10) {
+        return res.status(400).json({ error: "Maximum 10 names per request for AI Service" });
+    }
+
+    try {
+        const targetGrade = String(grade).trim();
+        const prevGrade = String(parseInt(targetGrade) - 1);
+        const sectionKey = `${targetGrade}_${section.toUpperCase()}`;
+        const sectionData = await getOrGenerateCode('section_data', sectionKey);
+        const gradePrefix = await getOrGenerateCode('grade_prefix', targetGrade);
+        const accessCode = sectionData.access_code;
+        const sectionPrefix = sectionData.prefix;
+        
+        const batch = db.batch();
+        let addedCount = 0;
+        let updatedCount = 0;
+        
+        const searchGrades = [targetGrade];
+        if (targetGrade !== "7" && parseInt(targetGrade) > 0) {
+            searchGrades.push(prevGrade);
+        }
+        
+        const existingSnap = await db.collection("voters")
+            .where("grade", "in", searchGrades)
+            .get();
+            
+        const existingMap = {};
+        existingSnap.forEach(doc => {
+            const data = doc.data();
+            if (data.name) existingMap[data.name.toUpperCase().trim()] = doc.ref;
+        });
+        
+        for (const name of names) {
+            if (!name || !name.trim()) continue;
+            const cleanName = name.toUpperCase().trim();
+            const codeHashForUpdate = encryptAccessCode(accessCode);
+            const code = await bcrypt.hash(accessCode.toUpperCase(), 10);
+            
+            if (existingMap[cleanName]) {
+                batch.update(existingMap[cleanName], {
+                    grade: targetGrade,
+                    section: section.toUpperCase(),
+                    code: code,
+                    codeHash: codeHashForUpdate,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                updatedCount++;
+            } else {
+                const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
+                const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
+                const hashedLVN = hashLVN(lvn);
+                const encryptedCode = encryptAccessCode(accessCode);
+                const codeForNewSet = await bcrypt.hash(accessCode.toUpperCase(), 10);
+                
+                const voterRef = db.collection("voters").doc(hashedLVN);
+                batch.set(voterRef, {
+                    lvn: lvn,
+                    name: cleanName,
+                    grade: targetGrade,
+                    section: section.toUpperCase(),
+                    code: codeForNewSet,
+                    codeHash: encryptedCode,
+                    hasVoted: false,
+                    addedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                addedCount++;
+            }
+        }
+        
+        await batch.commit();
+        
+        // Invalidate cache
+        setImmediate(() => invalidateVotersCache().catch(e =>
+            console.error("[CACHE] invalidateVotersCache after add failed:", e)
+        ));
+        
+        // Log AI access
+        await logSecurityEvent("AI_SERVICE_ADD_VOTERS", req, {
+            origin: req.headers.origin,
+            grade: targetGrade,
+            section: section.toUpperCase(),
+            count: names.length
+        });
+        
+        res.json({ 
+            success: true, 
+            message: `Processed ${names.length}. Updated: ${updatedCount}, New: ${addedCount}`, 
+            accessCode: accessCode
+        });
+
+    } catch (e) {
+        console.error("AI Service error:", e);
+        res.status(500).json({ error: "Failed to process voters" });
     }
 });
 
@@ -3500,15 +3808,12 @@ app.post("/admin/voters/delete", async (req, res) => {
                 code: admin.firestore.FieldValue.delete(),
             });
             await logAdminAction(req, "VOTER_SOFT_DELETE", { lvn: "***", reason: "Has voted — receipt preserved" });
-            await logImmutableAction(req, "VOTER_SOFT_DELETE", { lvn: "***", reason: "Has voted — receipt preserved" });
             await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "soft" });
             return res.json({ success: true, note: "Voter soft-deleted. Vote record remains intact for integrity." });
         }
         await voterRef.delete();
         await logAdminAction(req, "VOTER_DELETE", { lvn: "***" });
-        await logImmutableAction(req, "VOTER_DELETE", { lvn: "***" });
         await logSuccessEvent("ADMIN_DELETE_VOTER", req, { lvn: "***", method: "hard" });
-        await alertManager.detectCandidatesStatus();
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Delete failed" });
@@ -3547,102 +3852,17 @@ app.post("/admin/voters/reset", async (req, res) => {
         });
 
         await logAdminAction(req, "VOTER_RESET", { lvn: "***" });
-        await logImmutableAction(req, "VOTER_RESET", { lvn: "***" });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Reset failed" });
     }
 });
 
-app.post("/admin/settings/session", async (req, res) => {
-    try {
-        const voterTime = req.body.voterTime;
-        const activeGrade = req.body.activeGrade;
-        const isLive = req.body.isLive;
-        const isQueue = req.body.isQueue;
 
-        const statusUpdate = {};
-
-        if (typeof isLive === 'boolean') {
-            statusUpdate.isLive = isLive;
-        }
-
-        if (typeof isQueue === 'boolean') {
-            statusUpdate.isQueue = isQueue;
-        }
-
-        if (activeGrade !== undefined) {
-            statusUpdate.activeGrade = (activeGrade === "ALL") ? "ALL" : Number(activeGrade);
-        }
-
-        if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
-            const minutes = Number(voterTime);
-            const futureDate = new Date(Date.now() + (minutes * 60 * 1000));
-            statusUpdate.sessionTimer = admin.firestore.Timestamp.fromDate(futureDate);
-        } else if (voterTime == 0) {
-            statusUpdate.sessionTimer = admin.firestore.FieldValue.delete();
-        }
-
-        await db.collection("settings").doc("electionStatus").set(statusUpdate, { merge: true });
-
-        const now = admin.firestore.FieldValue.serverTimestamp();
-
-        await db.collection("app_config").doc("candidates_static").set({
-            lastUpdated: now
-        }, { merge: true });
-
-        const resultsConfig = { lastUpdated: now };
-
-        if (typeof isLive === 'boolean') {
-            resultsConfig.isLive = isLive;
-        }
-
-        if (typeof isQueue === 'boolean') {
-            resultsConfig.isQueue = isQueue;
-        }
-
-        await db.collection("app_config").doc("results_public").set(resultsConfig, { merge: true });
-
-        if (typeof isLive === 'boolean') {
-            GlobalCache.dashboard.isLive = isLive;
-        }
-
-        if (typeof isQueue === 'boolean') {
-            GlobalCache.dashboard.isQueue = isQueue;
-        }
-
-        await logAdminAction(req, "SET_ELECTION_SESSION", {
-            isLive: typeof isLive === 'boolean' ? isLive : null,
-            isQueue: typeof isQueue === 'boolean' ? isQueue : null,
-            activeGrade: activeGrade !== undefined ? activeGrade : null,
-            voterTime: voterTime !== undefined ? voterTime : null,
-        });
-
-        await logSuccessEvent("ADMIN_SET_SESSION", req, {
-            isLive: typeof isLive === 'boolean' ? isLive : null,
-            isQueue: typeof isQueue === 'boolean' ? isQueue : null,
-            activeGrade: activeGrade !== undefined ? activeGrade : null
-        });
-
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectSystemHealth();
-
-        res.json({
-            success: true,
-            isLive,
-            isQueue,
-            activeGrade
-        });
-
-    } catch (e) {
-        res.status(500).json({ error: "Failed to update election status" });
-    }
-});
 
 app.post("/admin/purge", async (req, res) => {
     try {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
-        await logImmutableAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
 
@@ -3662,7 +3882,7 @@ app.post("/admin/purge", async (req, res) => {
         }
 
         await purgeElectionData();
-        await alertManager.detectCandidatesStatus();
+
         await alertManager.detectSystemHealth();
 
         await alertManager.createAlert(
@@ -3710,8 +3930,7 @@ app.post("/admin/restore", async (req, res) => {
         const jsonData = response.data;
 
         const result = await restoreElectionFromBackup(jsonData, backupHash);
-        await alertManager.detectCandidatesStatus();
-        await alertManager.detectVoteIntegrity();
+
         await alertManager.detectSystemHealth();
 
         res.json({
@@ -3816,7 +4035,7 @@ app.post("/admin/publish/candidates", async (req, res) => {
                 10 * 60 * 1000
             );
 
-            await alertManager.detectCandidatesStatus();
+
             await alertManager.detectSystemHealth();
             res.json({ success: true, message: "Candidates published successfully." });
             await alertManager.clearResolvedAlerts('candidate_sync');
@@ -3836,7 +4055,6 @@ app.post("/admin/publish/results", async (req, res) => {
             lastUpdated: new Date().toISOString()
         });
         await logAdminAction(req, "RETALLY", { ok: true });
-        await logImmutableAction(req, "RETALLY", { ok: true });
         await logSuccessEvent("ADMIN_PUBLISH_RESULTS", req, { success: true });
         res.json({ success: true });
     } else {
@@ -3925,7 +4143,7 @@ app.post("/admin/add-party", async (req, res) => {
             {},
             24 * 60 * 60 * 1000
         );
-        await alertManager.detectCandidatesStatus();
+
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -3950,9 +4168,8 @@ app.post("/admin/delete", async (req, res) => {
             await batch.commit();
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_PARTY", { partyName });
-            await logImmutableAction(req, "DELETE_PARTY", { partyName });
             await logSuccessEvent("ADMIN_DELETE_PARTY", req, { partyName });
-            await alertManager.detectCandidatesStatus();
+
             return res.json({ success: true });
         }
         if (position && candidateId) {
@@ -3966,12 +4183,11 @@ app.post("/admin/delete", async (req, res) => {
             });
             await refreshLocalCandidates();
             await logAdminAction(req, "DELETE_CANDIDATE", { position, candidateId });
-            await logImmutableAction(req, "DELETE_CANDIDATE", { position, candidateId });
 
             await logSuccessEvent("ADMIN_DELETE_CANDIDATE", req, { position, candidateId });
             return res.json({ success: true });
         }
-        await alertManager.detectCandidatesStatus();
+
         await alertManager.detectSystemHealth();
         res.status(400).json({ error: "Bad Params" });
     } catch (e) {
@@ -4017,12 +4233,105 @@ app.post("/admin/election/reset", async (req, res) => {
         GlobalCache.dashboard.leaderboard = {};
         await refreshLocalResults();
         await logAdminAction(req, "ELECTION_RESET", { success: true });
-        await logImmutableAction(req, "ELECTION_RESET", { success: true });
 
         await logSuccessEvent("ADMIN_ELECTION_RESET", req, { success: true });
         res.json({ success: true, message: "Election system successfully reset." });
     } catch (e) {
         res.status(500).json({ error: "Reset failed partially. Check logs." });
+    }
+});
+
+app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const voterTime = req.body.voterTime;
+        const activeGrade = req.body.activeGrade;
+        const isLive = req.body.isLive;
+        const isQueue = req.body.isQueue;
+
+        const firestoreUpdate = {};
+        const rtdbUpdates = {};
+
+        // =========================
+        // 🔥 RTDB (ONLY REALTIME FLAGS)
+        // =========================
+        if (typeof isLive === 'boolean') {
+            rtdbUpdates["status/isLive"] = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            rtdbUpdates["status/isQueue"] = isQueue;
+        }
+
+        // =========================
+        // 🔥 FIRESTORE (GRADE + TIMER)
+        // =========================
+        if (activeGrade !== undefined) {
+            firestoreUpdate.activeGrade =
+                (activeGrade === "ALL") ? "ALL" : Number(activeGrade);
+        }
+
+        if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
+            const minutes = Number(voterTime);
+            const futureDate = new Date(Date.now() + (minutes * 60 * 1000));
+
+            firestoreUpdate.sessionTimer = futureDate.toISOString();
+        } else if (voterTime == 0) {
+            firestoreUpdate.sessionTimer = admin.firestore.FieldValue.delete();
+        }
+
+        // =========================
+        // 🔥 WRITE UPDATES
+        // =========================
+        if (Object.keys(rtdbUpdates).length > 0) {
+            await rtdb.ref("/").update(rtdbUpdates);
+        }
+
+        if (Object.keys(firestoreUpdate).length > 0) {
+            await db.collection("settings").doc("electionStatus")
+                .set(firestoreUpdate, { merge: true });
+        }
+
+        // =========================
+        // 🔥 CACHE
+        // =========================
+        if (typeof isLive === 'boolean') {
+            GlobalCache.dashboard.isLive = isLive;
+        }
+
+        if (typeof isQueue === 'boolean') {
+            GlobalCache.dashboard.isQueue = isQueue;
+        }
+
+        if (activeGrade !== undefined) {
+            GlobalCache.dashboard.activeGrade = activeGrade;
+        }
+
+        // =========================
+        // 🔥 LOGS
+        // =========================
+        await logAdminAction(req, "SET_ELECTION_SESSION", {
+            isLive,
+            isQueue,
+            activeGrade,
+            voterTime
+        });
+
+        await logSuccessEvent("ADMIN_SET_SESSION", req, {
+            isLive,
+            isQueue,
+            activeGrade
+        });
+
+        res.json({
+            success: true,
+            isLive,
+            isQueue,
+            activeGrade
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: "Failed to update election status" });
     }
 });
 
@@ -4075,8 +4384,6 @@ app.post("/admin/voters/reset-missed", async (req, res) => {
             missedAt: admin.firestore.FieldValue.delete()
         });
         await logAdminAction(req, "RESET_MISSED", { lvn: "***" });
-        await logImmutableAction(req, "RESET_MISSED", { lvn: "***" });
-
         await logSuccessEvent("ADMIN_RESET_MISSED", req, { lvn: "***" });
         res.json({ success: true });
     } catch (e) {
@@ -4115,6 +4422,67 @@ app.get("/admin/forms/submissions", async (req, res) => {
     } catch (e) {
         res.status(500).json({ error: "Failed to load submissions." });
     }
+});
+
+app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const votersSnap = await db.collection("voters").get();
+        const votesSnap = await db.collection("votes").get();
+
+        const totalRegistered = votersSnap.size;
+        const totalVotes = votesSnap.size;
+
+        const turnoutRate = totalRegistered === 0
+            ? 0
+            : ((totalVotes / totalRegistered) * 100);
+
+        const remainingVotes = totalRegistered - totalVotes;
+
+        const gradeStats = {};
+
+        votersSnap.forEach(doc => {
+            const g = doc.data().grade;
+            if (!gradeStats[g]) {
+                gradeStats[g] = { total: 0, voted: 0 };
+            }
+            gradeStats[g].total++;
+        });
+
+        votesSnap.forEach(doc => {
+            const g = doc.data().grade;
+            if (gradeStats[g]) {
+                gradeStats[g].voted++;
+            }
+        });
+
+        Object.keys(gradeStats).forEach(g => {
+            const s = gradeStats[g];
+            s.turnout = s.total === 0 ? 0 : ((s.voted / s.total) * 100);
+        });
+
+        // ✅ FIXED HERE
+        const systemHealth = await alertManager.detectSystemHealth();
+
+        res.json({
+            REG_USR: totalRegistered,
+            VT_CST: totalVotes,
+            TN_RT: turnoutRate.toFixed(2) + "%",
+            RG_VT: remainingVotes,
+            CURRENTDATEANDTIME: new Date().toLocaleString(),
+
+            gradeStats,
+            systemHealth
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: "Failed to generate report data" });
+    }
+});
+
+app.get("/api/system/health", async (req, res) => {
+    const health = await alertManager.detectSystemHealth();
+    res.json(health);
 });
 
 const PORT = process.env.PORT || 3000;
