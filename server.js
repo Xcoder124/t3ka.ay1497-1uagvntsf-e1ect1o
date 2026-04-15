@@ -4292,7 +4292,7 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
         });
 
         // 🔥 System Health (IMPORTANT for Page 7)
-        const systemHealth = await detectSystemHealth(); // use your AlertManager or create one
+        const systemHealth = await AlertManager.detectSystemHealth(); // use your AlertManager or create one
 
         res.json({
             REG_USR: totalRegistered,
@@ -4313,7 +4313,7 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
 });
 
 app.get("/api/system/health", async (req, res) => {
-    const health = await detectSystemHealth();
+    const health = await AlertManager.detectSystemHealth();
     res.json(health);
 });
 
