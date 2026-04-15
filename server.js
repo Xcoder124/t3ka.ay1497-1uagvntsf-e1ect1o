@@ -4267,7 +4267,6 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
 
         const remainingVotes = totalRegistered - totalVotes;
 
-        // Grade breakdown
         const gradeStats = {};
 
         votersSnap.forEach(doc => {
@@ -4285,14 +4284,13 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
             }
         });
 
-        // Compute turnout per grade
         Object.keys(gradeStats).forEach(g => {
             const s = gradeStats[g];
             s.turnout = s.total === 0 ? 0 : ((s.voted / s.total) * 100);
         });
 
-        // 🔥 System Health (IMPORTANT for Page 7)
-        const systemHealth = await AlertManager.detectSystemHealth(); // use your AlertManager or create one
+        // ✅ FIXED HERE
+        const systemHealth = await alertManager.detectSystemHealth();
 
         res.json({
             REG_USR: totalRegistered,
@@ -4302,7 +4300,6 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
             CURRENTDATEANDTIME: new Date().toLocaleString(),
 
             gradeStats,
-
             systemHealth
         });
 
@@ -4313,7 +4310,7 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
 });
 
 app.get("/api/system/health", async (req, res) => {
-    const health = await AlertManager.detectSystemHealth();
+    const health = await alertManager.detectSystemHealth();
     res.json(health);
 });
 
