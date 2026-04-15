@@ -2092,6 +2092,159 @@ async function verifyCaptcha(token) {
 }
 
 // -- ALERTS
+async detectSystemHealth() {
+    let critical = 0;
+    let warnings = 0;
+
+    const indicators = {
+        database: true,
+        auth: true,
+        voteChain: true,
+        antiMultipleVote: true,
+        tamperDetection: true,
+        replayProtection: true,
+        backups: true,
+        anomalyDetection: true,
+        tallyVerification: true,
+        voteConsistency: true
+    };
+
+    try {
+        // 🔍 1. DATABASE LATENCY CHECK
+        const start = Date.now();
+        await db.collection("settings").doc("config").get();
+        const latency = Date.now() - start;
+
+        if (latency > 1000) {
+            warnings++;
+            indicators.database = false;
+
+            await this.createAlert(
+                'api_error',
+                'major',
+                'Slow Database Response',
+                `Database response time is ${latency}ms.`,
+                { latency },
+                10 * 60 * 1000
+            );
+        } else {
+            await this.clearResolvedAlerts('api_error');
+        }
+
+        // 🔍 2. DATABASE READ TEST
+        const testSnap = await db.collection("candidates").limit(1).get();
+        if (testSnap.empty) {
+            critical++;
+            indicators.database = false;
+
+            await this.createAlert(
+                'database_error',
+                'critical',
+                'Database Read Failure',
+                'Candidates collection is empty or inaccessible.',
+                {},
+                null
+            );
+        }
+
+        // 🔍 3. ENV CHECK
+        const requiredEnv = [
+            'FIREBASE_PROJECT_ID',
+            'FIREBASE_CLIENT_EMAIL',
+            'FIREBASE_PRIVATE_KEY',
+            'JWT_SECRET',
+            'ADMIN_KEY'
+        ];
+
+        const missingEnv = requiredEnv.filter(key => !process.env[key]);
+
+        if (missingEnv.length > 0) {
+            critical++;
+            indicators.auth = false;
+
+            await this.createAlert(
+                'env_error',
+                'critical',
+                'Environment Configuration Error',
+                `Missing: ${missingEnv.join(', ')}`,
+                { missingEnv },
+                null
+            );
+        } else {
+            await this.clearResolvedAlerts('env_error');
+        }
+
+        // 🔍 4. HASH CHAIN CHECK (IMPORTANT FOR PAGE 7)
+        let hashStatus = "verified";
+        let anomalies = 0;
+
+        try {
+            const chainDoc = await db.collection("_meta").doc("chain_head").get();
+
+            if (!chainDoc.exists) {
+                hashStatus = "not verified";
+                anomalies++;
+                warnings++;
+                indicators.voteChain = false;
+            }
+        } catch (e) {
+            hashStatus = "error";
+            anomalies++;
+            critical++;
+            indicators.voteChain = false;
+        }
+
+        // 🔍 5. FINAL STATUS DECISION
+        let overallStatus = "ACTIVE";
+        if (critical > 0) overallStatus = "CRITICAL";
+        else if (warnings > 0) overallStatus = "WARNING";
+
+        return {
+            success: true,
+
+            // 🔥 REQUIRED FOR PDF PAGE 7
+            status: overallStatus,
+            trust:
+                critical > 0 ? "cannot" :
+                warnings > 0 ? "can be" : "can",
+
+            hashStatus,
+            anomalies,
+
+            // counts
+            critical,
+            warnings,
+
+            // 🔥 REQUIRED FOR LIVE UI
+            indicators,
+
+            // timestamps
+            lastCheckScan: new Date().toLocaleString()
+        };
+
+    } catch (e) {
+        await this.createAlert(
+            'firebase_error',
+            'critical',
+            'Firebase Connection Failed',
+            `Unable to connect: ${e.message}`,
+            { error: e.message },
+            null
+        );
+
+        return {
+            success: false,
+            status: "CRITICAL",
+            trust: "cannot",
+            error: e.message,
+            critical: 1,
+            warnings: 0,
+            indicators: {},
+            lastCheckScan: new Date().toLocaleString()
+        };
+    }
+}
+
 app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const alerts = await alertManager.getActiveAlerts();
