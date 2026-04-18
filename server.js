@@ -293,13 +293,6 @@ function generateVoteSignature(selections, timestamp, nonce) {
 // ============================================
 // 🔐 ANTI-REPLAY: FIRESTORE-BACKED NONCE STORE
 // ============================================
-
-/**
- * Atomically consume a vote nonce.
- * Key = SHA-256(nonce + ":" + jti) — ties the nonce to this specific JWT session
- * so a stolen nonce is still useless without the matching session token.
- * Returns true if the nonce was fresh and is now consumed; false if already used.
- */
 async function consumeNonce(nonce, jti) {
     const key = crypto.createHash('sha256').update(`${nonce}:${jti}`).digest('hex');
     const ref = db.collection('used_nonces').doc(key);
@@ -3021,10 +3014,10 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: "Request expired" });
         }
 
-        // 🔐 Anti-replay: consume nonce atomically in Firestore (TTL 2 min)
-        const nonceAccepted = await consumeNonce(nonce, req.user.jti);
+        // 🔐 Anti-replay (nonce)
+        const nonceAccepted = await consumeNonce(nonce, hashedLVN); // 🔥 tied to user
         if (!nonceAccepted) {
-            await logSecurityEvent("REPLAY_ATTACK", req, { hashedLVN: req.user.uid, nonce });
+            await logSecurityEvent("REPLAY_ATTACK", req, { hashedLVN, nonce });
             return res.status(409).json({ error: "Duplicate request detected." });
         }
 
@@ -3037,7 +3030,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(400).json({ error: e.message });
         }
 
-        // ⚙️ Election settings — isLive/isQueue from RTDB; endTime from Firestore
+        // ⚙️ Get system state
         const [settings, rtdbStatusSnap] = await Promise.all([
             db.collection("settings").doc("electionStatus").get(),
             rtdb.ref("status").once("value")
@@ -3047,24 +3040,11 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
 
-        // ✅ Gate on RTDB isLive — single source of truth
         if (!isLive) {
             return res.status(403).json({ error: "Election closed." });
         }
 
-        // Firestore doc still needed for endTime and any other persisted fields
         const electionData = settings.exists ? settings.data() : {};
-
-        if (isQueue) {
-            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
-            if (!userSnap.exists()) {
-                return res.status(403).json({ error: "You are not in the queue." });
-            }
-            const queueData = userSnap.val();
-            if (queueData.status !== 'active') {
-                return res.status(403).json({ error: "Please wait for your turn." });
-            }
-        }
 
         // ⏱ End time check
         if (electionData.endTime && Date.now() > electionData.endTime.toMillis()) {
@@ -3083,6 +3063,20 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(403).json({ error: "Already voted." });
         }
 
+        // 🔁 Queue validation (FIRST PASS)
+        if (isQueue) {
+            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
+
+            if (!userSnap.exists()) {
+                return res.status(403).json({ error: "You are not in the queue." });
+            }
+
+            if (userSnap.val().status !== 'active') {
+                return res.status(403).json({ error: "Please wait for your turn." });
+            }
+        }
+
+        // 🔗 Refs
         const CHAIN_DOC = db.collection("_meta").doc("chain_head");
         const AGG_REF = db.collection("aggregates").doc("dashboard");
 
@@ -3097,6 +3091,29 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
             const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
 
+            // 🔥 HASH CHAIN VALIDATION
+            if (chainDoc.exists) {
+                const expectedPrevHash = chainDoc.data().hash;
+                const expectedSequence = (chainDoc.data().count || 0) + 1;
+
+                if (prevHash !== expectedPrevHash) {
+                    throw new Error("CHAIN_MISMATCH");
+                }
+
+                if (prevCount + 1 !== expectedSequence) {
+                    throw new Error("INVALID_SEQUENCE");
+                }
+            }
+
+            // 🔁 Queue validation (SECOND PASS inside critical section)
+            if (isQueue) {
+                const queueSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
+
+                if (!queueSnap.exists() || queueSnap.val().status !== 'active') {
+                    throw new Error("QUEUE_NOT_ACTIVE");
+                }
+            }
+
             const randomSalt = crypto.randomBytes(32).toString("hex");
 
             const payload = JSON.stringify({
@@ -3108,6 +3125,16 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             const receipt = crypto.createHash("sha256")
                 .update(payload + randomSalt)
                 .digest("hex");
+
+            // 🔒 Receipt uniqueness
+            const receiptCheck = await db.collection("votes")
+                .where("receipt", "==", receipt)
+                .limit(1)
+                .get();
+
+            if (!receiptCheck.empty) {
+                throw new Error("DUPLICATE_RECEIPT");
+            }
 
             const verificationCode = crypto.createHash("sha256")
                 .update(receipt + stableStringify(validatedSelections))
@@ -3145,23 +3172,21 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 count: prevCount + 1
             });
 
-            // ⚡ Update aggregates
+            // ⚡ Aggregates
             const agg = aggDoc.exists ? aggDoc.data() : {
                 stats: { total: 0, voted: 0, grades: {} },
                 leaderboard: {}
             };
 
             const g = String(grade);
-
-            // stats
             agg.stats.voted = (agg.stats.voted || 0) + 1;
 
             if (!agg.stats.grades[g]) {
                 agg.stats.grades[g] = { total: 0, voted: 0, missed: 0 };
             }
+
             agg.stats.grades[g].voted++;
 
-            // leaderboard
             for (const pos in validatedSelections) {
                 const selected = Array.isArray(validatedSelections[pos])
                     ? validatedSelections[pos]
@@ -3183,13 +3208,12 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             }
 
             agg.lastUpdated = admin.firestore.FieldValue.serverTimestamp();
-
             t.set(AGG_REF, agg, { merge: true });
 
             return { receipt, currentHash, prevHash, verificationCode };
         });
 
-        // ✅ Respond immediately
+        // ✅ Respond
         res.json({
             success: true,
             receipt: voteResult.receipt,
@@ -3198,7 +3222,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             prevHash: voteResult.prevHash
         });
 
-        // 🔄 Queue advancement — runs after response is sent
+        // 🔄 Queue advancement (async)
         if (isQueue) {
             setImmediate(async () => {
                 try {
@@ -3208,9 +3232,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                     await queueRef.transaction(current => {
                         if (!current || !current.users) return current;
 
-                        if (current.users[hashedLVN]) {
-                            delete current.users[hashedLVN];
-                        }
+                        delete current.users[hashedLVN];
 
                         let newActiveCount = 0;
                         let nextUserId = null;
@@ -3243,6 +3265,19 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
     } catch (e) {
         console.error("Vote error:", e);
+
+        if (e.message === "CHAIN_MISMATCH" || e.message === "INVALID_SEQUENCE") {
+            return res.status(500).json({ error: "Vote chain integrity error." });
+        }
+
+        if (e.message === "QUEUE_NOT_ACTIVE") {
+            return res.status(403).json({ error: "Queue status changed. Try again." });
+        }
+
+        if (e.message === "DUPLICATE_RECEIPT") {
+            return res.status(409).json({ error: "Duplicate vote detected." });
+        }
+
         res.status(500).json({
             error: "System failed to record vote. Please notify a facilitator."
         });
