@@ -4593,7 +4593,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
         trackDeviceAttempt(req);
 
         try {
-            const validation = await validateNameWithGemini(name);
+            const validation = await validateNameWithZAI(name);
             const requiresFacilitator = validation.confidence_score < 85;
 
             console.log(`[AI] Device ${limitCheck.deviceId} - Attempt ${limitCheck.attempts + 1}/2 - Score: ${validation.confidence_score}%`);
