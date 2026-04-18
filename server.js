@@ -4395,11 +4395,14 @@ app.get("/api/system/health", async (req, res) => {
 // ============================================
 // AI INTEGRATION FOR NAME VALIDATION
 // ============================================
-const ZAI_API_KEY = process.env.ZAI_API_KEY;
-const ZAI_BASE_URL = 'https://api.z.ai/api/paas/v4';
+// ============================================
+// NVIDIA API + KIMI K2.5 INTEGRATION
+// ============================================
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
-if (!ZAI_API_KEY) {
-    console.warn('⚠️ ZAI_API_KEY not set. AI name validation will be disabled.');
+if (!NVIDIA_API_KEY) {
+    console.warn('⚠️ NVIDIA_API_KEY not set. AI name validation will be disabled.');
 }
 
 // ============================================
@@ -4461,9 +4464,12 @@ function trackDeviceAttempt(req) {
  * Validates a name using AI - NO FALLBACK
  * @returns {Promise<Object>} Validation result or throws error
  */
-async function validateNameWithZAI(name) {
-    if (!ZAI_API_KEY) {
-        throw new Error('ZAI_API_KEY not configured');
+// ============================================
+// VALIDATE NAME WITH KIMI K2.5 (NVIDIA)
+// ============================================
+async function validateNameWithKimi(name) {
+    if (!NVIDIA_API_KEY) {
+        throw new Error('NVIDIA_API_KEY not configured');
     }
 
     const cleanName = sanitizeInput(name).trim();
@@ -4476,7 +4482,8 @@ Evaluation Criteria:
 - Entropy Analysis: Analyze the character distribution - real names have natural letter patterns
 - Length vs. Structure: Assess if the name length is justified by cultural standards (Filipino names often have 2-3 parts: First, Middle, Last)
 - Forbidden Patterns: Flag names that are placeholder text (e.g., "asdf", "test"), repeated characters (e.g., "aaaa"), or offensive content
-- Scoring: The score is linked if the name was real, for example "Adeel T. Carandang" is 100% real, because it was a real name. Therefore, scoring is based on realness of the name.
+
+Scoring: The score is linked if the name was real. Therefore, scoring is based on realness of the name.
 
 Input String to Analyze: "${cleanName}"
 
@@ -4492,94 +4499,102 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
 
     try {
         const response = await axios.post(
-    `${ZAI_BASE_URL}/chat/completions`,
-    {
-        model: "glm-4.6",
-        messages: [
+            `${NVIDIA_BASE_URL}/chat/completions`,
             {
-                role: "system",
-                content: "You are an expert in Global Onomastics and Forensic Linguistics. Analyze names for legitimacy."
+                model: "moonshotai/kimi-k2.5",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are an expert in Global Onomastics and Forensic Linguistics. Analyze names for legitimacy and respond only in the requested JSON format."
+                    },
+                    {
+                        role: "user",
+                        content: prompt
+                    }
+                ],
+                max_tokens: 512,
+                temperature: 0.1,
+                top_p: 0.8,
+                stream: false,
+                chat_template_kwargs: { thinking: false }
             },
             {
-                role: "user",
-                content: prompt
+                headers: {
+                    'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                timeout: 15000
             }
-        ],
-        temperature: 0.1,
-        max_tokens: 256,
-        top_p: 0.8
-    },
-    {
-        headers: {
-            'Authorization': `Bearer ${ZAI_API_KEY}`,
-            'Content-Type': 'application/json',
-            'Accept-Language': 'en-US,en'
-        },
-        timeout: 8000
+        );
+
+        const textResponse = response.data?.choices?.[0]?.message?.content;
+        
+        if (!textResponse) {
+            const rawResponse = JSON.stringify(response.data);
+            throw new Error(`Empty response from Kimi. Raw response: "${rawResponse.substring(0, 500)}"`);
+        }
+
+        // Clean JSON safely
+        let cleanJson = textResponse
+            .replace(/```json\s*/gi, '')
+            .replace(/```\s*/g, '')
+            .trim();
+
+        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+            throw new Error(`No JSON found in response. AI responded: "${textResponse.substring(0, 500)}"`);
+        }
+
+        let result;
+        try {
+            result = JSON.parse(jsonMatch[0]);
+        } catch (parseError) {
+            throw new Error(`Failed to parse JSON. AI responded: "${textResponse.substring(0, 500)}"`);
+        }
+
+        if (
+            typeof result.confidence_score !== 'number' ||
+            !result.classification ||
+            !result.reasoning
+        ) {
+            throw new Error(`Invalid response structure from Kimi. AI responded: "${textResponse.substring(0, 500)}"`);
+        }
+
+        result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
+
+        console.log(`[KIMI-NVIDIA] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`);
+
+        return {
+            success: true,
+            confidence_score: result.confidence_score,
+            classification: result.classification,
+            reasoning: result.reasoning,
+            is_culturally_valid: result.is_culturally_valid ?? result.confidence_score >= 70,
+            name: cleanName,
+            source: 'kimi-nvidia'
+        };
+
+    } catch (error) {
+        // If it's already a custom error with AI response included, re-throw it
+        if (error.message && error.message.includes('AI responded:')) {
+            throw error;
+        }
+
+        // Extract AI response text from various error shapes
+        let aiResponseText = 'No response text available';
+        
+        if (error.response?.data?.choices?.[0]?.message?.content) {
+            aiResponseText = error.response.data.choices[0].message.content;
+        } else if (error.response?.data?.error?.message) {
+            aiResponseText = error.response.data.error.message;
+        } else if (error.response?.data) {
+            aiResponseText = JSON.stringify(error.response.data);
+        }
+
+        console.error('[KIMI-NVIDIA ERROR]', error.response?.data || error.message);
+        throw new Error(`Kimi validation failed. AI responded: "${aiResponseText.substring(0, 500)}"`);
     }
-);
-
-const textResponse = response.data?.choices?.[0]?.message?.content;
-if (!textResponse) throw new Error('Empty response from Z.AI');
-
-// Clean JSON safely
-let cleanJson = textResponse
-    .replace(/```json\s*/gi, '')
-    .replace(/```\s*/g, '')
-    .trim();
-
-const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-if (!jsonMatch) {
-    throw new Error(`No JSON found in response. AI responded: "${textResponse.substring(0, 500)}"`);
-}
-
-let result;
-try {
-    result = JSON.parse(jsonMatch[0]);
-} catch (parseError) {
-    throw new Error(`Failed to parse JSON. AI responded: "${textResponse.substring(0, 500)}"`);
-}
-
-if (
-    typeof result.confidence_score !== 'number' ||
-    !result.classification ||
-    !result.reasoning
-) {
-    throw new Error(`Invalid response structure from Z.AI. AI responded: "${textResponse.substring(0, 500)}"`);
-}
-
-result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
-
-console.log(
-    `[Z.AI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`
-);
-
-return {
-    success: true,
-    confidence_score: result.confidence_score,
-    classification: result.classification,
-    reasoning: result.reasoning,
-    is_culturally_valid:
-        result.is_culturally_valid ?? result.confidence_score >= 70,
-    name: cleanName,
-    source: 'zai'
-};
-
-} catch (error) {
-    console.error('[Z.AI ERROR]', error.response?.data || error.message);
-    
-    // If it's already a custom error with AI response included, re-throw it
-    if (error.message.includes('AI responded:')) {
-        throw error;
-    }
-    
-    // For other errors, include what we can
-    const aiResponseText = error.response?.data?.choices?.[0]?.message?.content || 
-                          error.response?.data?.error?.message ||
-                          'No response text available';
-    
-    throw new Error(`Z.AI validation failed. AI responded: "${aiResponseText.substring(0, 500)}"`);
-}
 }
 
 // ============================================
@@ -4611,7 +4626,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
         trackDeviceAttempt(req);
 
         try {
-            const validation = await validateNameWithZAI(name);
+            const validation = await validateNameWithKimi(name);
             const requiresFacilitator = validation.confidence_score < 85;
 
             console.log(`[AI] Device ${limitCheck.deviceId} - Attempt ${limitCheck.attempts + 1}/2 - Score: ${validation.confidence_score}%`);
