@@ -4492,76 +4492,94 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
 
     try {
         const response = await axios.post(
-            `${ZAI_BASE_URL}/chat/completions`,
+    `${ZAI_BASE_URL}/chat/completions`,
+    {
+        model: "glm-4.6",
+        messages: [
             {
-                model: "glm-4.6",
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are an expert in Global Onomastics and Forensic Linguistics. Analyze names for legitimacy."
-                    },
-                    {
-                        role: "user",
-                        content: prompt
-                    }
-                ],
-                temperature: 0.1,
-                max_tokens: 256,
-                top_p: 0.8
+                role: "system",
+                content: "You are an expert in Global Onomastics and Forensic Linguistics. Analyze names for legitimacy."
             },
             {
-                headers: {
-                    'Authorization': `Bearer ${ZAI_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept-Language': 'en-US,en'
-                },
-                timeout: 8000
+                role: "user",
+                content: prompt
             }
-        );
-
-        const textResponse = response.data?.choices?.[0]?.message?.content;
-        if (!textResponse) throw new Error('Empty response from Z.AI');
-
-        // Clean JSON safely
-        let cleanJson = textResponse
-            .replace(/```json\s*/gi, '')
-            .replace(/```\s*/g, '')
-            .trim();
-
-        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error('No JSON found in response');
-
-        const result = JSON.parse(jsonMatch[0]);
-
-        if (
-            typeof result.confidence_score !== 'number' ||
-            !result.classification ||
-            !result.reasoning
-        ) {
-            throw new Error('Invalid response structure from Z.AI');
-        }
-
-        result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
-
-        console.log(
-            `[Z.AI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`
-        );
-
-        return {
-            success: true,
-            confidence_score: result.confidence_score,
-            classification: result.classification,
-            reasoning: result.reasoning,
-            is_culturally_valid:
-                result.is_culturally_valid ?? result.confidence_score >= 70,
-            name: cleanName,
-            source: 'zai'
-        };
-
-    } catch (error) {
-        console.error('[Z.AI ERROR]', error.response?.data || error.message);
-        throw new Error('Z.AI validation failed');
+        ],
+        temperature: 0.1,
+        max_tokens: 256,
+        top_p: 0.8
+    },
+    {
+        headers: {
+            'Authorization': `Bearer ${ZAI_API_KEY}`,
+            'Content-Type': 'application/json',
+            'Accept-Language': 'en-US,en'
+        },
+        timeout: 8000
     }
+);
+
+const textResponse = response.data?.choices?.[0]?.message?.content;
+if (!textResponse) throw new Error('Empty response from Z.AI');
+
+// Clean JSON safely
+let cleanJson = textResponse
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
+
+const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+if (!jsonMatch) {
+    throw new Error(`No JSON found in response. AI responded: "${textResponse.substring(0, 500)}"`);
+}
+
+let result;
+try {
+    result = JSON.parse(jsonMatch[0]);
+} catch (parseError) {
+    throw new Error(`Failed to parse JSON. AI responded: "${textResponse.substring(0, 500)}"`);
+}
+
+if (
+    typeof result.confidence_score !== 'number' ||
+    !result.classification ||
+    !result.reasoning
+) {
+    throw new Error(`Invalid response structure from Z.AI. AI responded: "${textResponse.substring(0, 500)}"`);
+}
+
+result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
+
+console.log(
+    `[Z.AI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`
+);
+
+return {
+    success: true,
+    confidence_score: result.confidence_score,
+    classification: result.classification,
+    reasoning: result.reasoning,
+    is_culturally_valid:
+        result.is_culturally_valid ?? result.confidence_score >= 70,
+    name: cleanName,
+    source: 'zai'
+};
+
+} catch (error) {
+    console.error('[Z.AI ERROR]', error.response?.data || error.message);
+    
+    // If it's already a custom error with AI response included, re-throw it
+    if (error.message.includes('AI responded:')) {
+        throw error;
+    }
+    
+    // For other errors, include what we can
+    const aiResponseText = error.response?.data?.choices?.[0]?.message?.content || 
+                          error.response?.data?.error?.message ||
+                          'No response text available';
+    
+    throw new Error(`Z.AI validation failed. AI responded: "${aiResponseText.substring(0, 500)}"`);
+}
 }
 
 // ============================================
