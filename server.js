@@ -4393,13 +4393,13 @@ app.get("/api/system/health", async (req, res) => {
 });
 
 // ============================================
-// GEMINI AI INTEGRATION FOR NAME VALIDATION
+// AI INTEGRATION FOR NAME VALIDATION
 // ============================================
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const ZAI_API_KEY = process.env.ZAI_API_KEY;
+const ZAI_BASE_URL = 'https://api.z.ai/api/paas/v4';
 
-if (!GEMINI_API_KEY) {
-    console.warn('⚠️ GEMINI_API_KEY not set. AI name validation will be disabled.');
+if (!ZAI_API_KEY) {
+    console.warn('⚠️ ZAI_API_KEY not set. AI name validation will be disabled.');
 }
 
 // ============================================
@@ -4458,12 +4458,12 @@ function trackDeviceAttempt(req) {
 }
 
 /**
- * Validates a name using Gemini AI - NO FALLBACK
+ * Validates a name using AI - NO FALLBACK
  * @returns {Promise<Object>} Validation result or throws error
  */
-async function validateNameWithGemini(name) {
-    if (!GEMINI_API_KEY) {
-        throw new Error('GEMINI_API_KEY not configured');
+async function validateNameWithZAI(name) {
+    if (!ZAI_API_KEY) {
+        throw new Error('ZAI_API_KEY not configured');
     }
 
     const cleanName = sanitizeInput(name).trim();
@@ -4474,8 +4474,9 @@ Task: Analyze the provided "${cleanName}" to determine the likelihood that it is
 Evaluation Criteria:
 - Cultural Plausibility: Determine if the name follows phonetic and structural patterns of any known global culture (Filipino, English, Spanish, Chinese, etc.)
 - Entropy Analysis: Analyze the character distribution - real names have natural letter patterns
-- Length vs. Structure: Assess if the length is justified by cultural standards (Filipino names often have 2-3 parts: First, Middle, Last)
+- Length vs. Structure: Assess if the name length is justified by cultural standards (Filipino names often have 2-3 parts: First, Middle, Last)
 - Forbidden Patterns: Flag names that are placeholder text (e.g., "asdf", "test"), repeated characters (e.g., "aaaa"), or offensive content
+- Scoring: The score is linked if the name was real, for example "Adeel T. Carandang" is 100% real, because it was a real name. Therefore, scoring is based on realness of the name.
 
 Input String to Analyze: "${cleanName}"
 
@@ -4489,41 +4490,78 @@ Response Format (JSON only - no markdown, no extra text):
 
 NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLINE NICKNAMES AND USERNAMES.`;
 
-    const response = await axios.post(
-        `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
-        {
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.1, maxOutputTokens: 256, topP: 0.8, topK: 10 }
-        },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
+    try {
+        const response = await axios.post(
+            `${ZAI_BASE_URL}/chat/completions`,
+            {
+                model: "glm-4.6",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are an expert in Global Onomastics and Forensic Linguistics. Analyze names for legitimacy."
+                    },
+                    {
+                        role: "user",
+                        content: prompt
+                    }
+                ],
+                temperature: 0.1,
+                max_tokens: 256,
+                top_p: 0.8
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${ZAI_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept-Language': 'en-US,en'
+                },
+                timeout: 8000
+            }
+        );
 
-    const textResponse = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!textResponse) throw new Error('Empty response from Gemini');
+        const textResponse = response.data?.choices?.[0]?.message?.content;
+        if (!textResponse) throw new Error('Empty response from Z.AI');
 
-    let cleanJson = textResponse.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-    const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON found in response');
+        // Clean JSON safely
+        let cleanJson = textResponse
+            .replace(/```json\s*/gi, '')
+            .replace(/```\s*/g, '')
+            .trim();
 
-    const result = JSON.parse(jsonMatch[0]);
+        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error('No JSON found in response');
 
-    if (typeof result.confidence_score !== 'number' || !result.classification || !result.reasoning) {
-        throw new Error('Invalid response structure from Gemini');
+        const result = JSON.parse(jsonMatch[0]);
+
+        if (
+            typeof result.confidence_score !== 'number' ||
+            !result.classification ||
+            !result.reasoning
+        ) {
+            throw new Error('Invalid response structure from Z.AI');
+        }
+
+        result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
+
+        console.log(
+            `[Z.AI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`
+        );
+
+        return {
+            success: true,
+            confidence_score: result.confidence_score,
+            classification: result.classification,
+            reasoning: result.reasoning,
+            is_culturally_valid:
+                result.is_culturally_valid ?? result.confidence_score >= 70,
+            name: cleanName,
+            source: 'zai'
+        };
+
+    } catch (error) {
+        console.error('[Z.AI ERROR]', error.response?.data || error.message);
+        throw new Error('Z.AI validation failed');
     }
-
-    result.confidence_score = Math.max(1, Math.min(100, result.confidence_score));
-
-    console.log(`[GEMINI] "${cleanName.substring(0, 2)}***" -> ${result.confidence_score}% (${result.classification})`);
-
-    return {
-        success: true,
-        confidence_score: result.confidence_score,
-        classification: result.classification,
-        reasoning: result.reasoning,
-        is_culturally_valid: result.is_culturally_valid ?? (result.confidence_score >= 70),
-        name: cleanName,
-        source: 'gemini'
-    };
 }
 
 // ============================================
@@ -4558,7 +4596,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
             const validation = await validateNameWithGemini(name);
             const requiresFacilitator = validation.confidence_score < 85;
 
-            console.log(`[GEMINI] Device ${limitCheck.deviceId} - Attempt ${limitCheck.attempts + 1}/2 - Score: ${validation.confidence_score}%`);
+            console.log(`[AI] Device ${limitCheck.deviceId} - Attempt ${limitCheck.attempts + 1}/2 - Score: ${validation.confidence_score}%`);
 
             res.json({
                 success: true,
@@ -4573,7 +4611,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
                 }
             });
         } catch (geminiError) {
-            console.error('[GEMINI] Failed, directing to facilitator:', geminiError.message);
+            console.error('[AI] Failed, directing to facilitator:', geminiError.message);
 
             res.status(503).json({
                 error: "Validation service unavailable",
