@@ -302,7 +302,7 @@ function generateVoteSignature(selections, timestamp, nonce) {
  */
 async function consumeNonce(nonce, jti) {
     const key = crypto.createHash('sha256').update(`${nonce}:${jti}`).digest('hex');
-    const ref  = db.collection('used_nonces').doc(key);
+    const ref = db.collection('used_nonces').doc(key);
 
     let accepted = false;
     await db.runTransaction(async (t) => {
@@ -1790,6 +1790,80 @@ async function refreshLocalCandidates() {
     }
 }
 
+async function refreshLocalResults() {
+    try {
+        if (Object.keys(GlobalCache.candidates).length === 0) await refreshLocalCandidates();
+        const settingsSnap = await db.collection("settings").doc("electionStatus").get();
+        const isLive = settingsSnap.exists ? !!settingsSnap.data().isLive : false;
+        const votersSnap = await db.collection("voters").get();
+        const stats = { total: 0, voted: 0, percentage: 0, grades: {} };
+        votersSnap.forEach((doc) => {
+            const v = doc.data() || {};
+            const grade = String(v.grade || "Unknown");
+            if (!stats.grades[grade]) stats.grades[grade] = { total: 0, voted: 0, missed: 0 };
+            stats.total += 1;
+            stats.grades[grade].total += 1;
+            if (v.isMissed) {
+                stats.grades[grade].missed += 1;
+            }
+            if (v.hasVoted) {
+                stats.voted += 1;
+                stats.grades[grade].voted += 1;
+            }
+        });
+        if (stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
+        const votesSnap = await db.collection("votes").get();
+        const tallies = {};
+        for (const pos of Object.keys(GlobalCache.candidates)) {
+            tallies[pos] = {};
+            for (const c of (GlobalCache.candidates[pos] || [])) {
+                tallies[pos][String(c.id)] = { votes: 0, breakdown: {} };
+            }
+        }
+        votesSnap.forEach((doc) => {
+            const v = doc.data() || {};
+            const grade = String(v.grade || "Unknown");
+            const selections = v.selections || {};
+            for (const pos of Object.keys(tallies)) {
+                const rawSel = selections[pos];
+                if (!rawSel) continue;
+                const selectedIds = Array.isArray(rawSel) ? rawSel : [rawSel];
+                for (const cid of selectedIds) {
+                    const cidStr = String(cid);
+                    if (!tallies[pos][cidStr]) {
+                        tallies[pos][cidStr] = { votes: 0, breakdown: {} };
+                    }
+                    tallies[pos][cidStr].votes += 1;
+                    const key = `votes_${grade}`;
+                    tallies[pos][cidStr].breakdown[key] = (tallies[pos][cidStr].breakdown[key] || 0) + 1;
+                }
+            }
+        });
+        const finalResults = {};
+        for (const pos of Object.keys(GlobalCache.candidates)) {
+            const list = [];
+            for (const c of (GlobalCache.candidates[pos] || [])) {
+                const cidStr = String(c.id);
+                const t = tallies[pos][cidStr] || { votes: 0, breakdown: {} };
+                list.push({
+                    name: c.name,
+                    party: c.party,
+                    hash: c.hash,
+                    votes: t.votes,
+                    breakdown: t.breakdown
+                });
+            }
+            list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
+            finalResults[pos] = list;
+        }
+        GlobalCache.dashboard = { isLive, stats, leaderboard: finalResults };
+        GlobalCache.timestamps.results = new Date().toISOString();
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
 
 
 function generateSubmitToken(jti) {
@@ -2288,12 +2362,12 @@ app.get("/settings", async (req, res) => {
 
         // ✅ isLive and isQueue come exclusively from RTDB
         const rtdbStatus = rtdbStatusSnap.val() || {};
-        const isLive  = rtdbStatus.isLive  === true;
+        const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
 
         // All other fields (activeGrade, sessionTimer, endTime, etc.) still come from Firestore
         const statusData = statusDoc.exists ? statusDoc.data() : {};
-        const config     = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
+        const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
 
         // Spread Firestore data first, then override the two status fields with RTDB values
         res.json({ ...config, ...statusData, isLive, isQueue });
@@ -2627,7 +2701,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
 
         // ✅ isLive and isQueue are authoritative from RTDB only
         const rtdbStatus = rtdbStatusSnap.val() || {};
-        const isLive  = rtdbStatus.isLive  === true;
+        const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
 
         const voterRef = db.collection("voters").doc(hashedLVN);
@@ -2970,8 +3044,8 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         ]);
 
         const rtdbStatus = rtdbStatusSnap.val() || {};
-        const isLive     = rtdbStatus.isLive  === true;
-        const isQueue    = rtdbStatus.isQueue === true;
+        const isLive = rtdbStatus.isLive === true;
+        const isQueue = rtdbStatus.isQueue === true;
 
         // ✅ Gate on RTDB isLive — single source of truth
         if (!isLive) {
