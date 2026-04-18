@@ -3622,113 +3622,127 @@ app.post("/admin/voters/add", async (req, res) => {
 app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
     const grade = sanitizeInput(req.body.grade || '');
     const section = sanitizeInput(req.body.section || '');
-    const names = Array.isArray(req.body.names) ? req.body.names.map(n => sanitizeInput(n)) : [];
+    const names = Array.isArray(req.body.names)
+        ? req.body.names.map(n => sanitizeInput(n))
+        : [];
 
-    // Validation
     if (!grade || isNaN(parseInt(grade))) {
         return res.status(400).json({ error: "Invalid grade value." });
     }
-    if (!section || !section.trim()) {
+
+    if (!section.trim()) {
         return res.status(400).json({ error: "Section is required." });
     }
-    if (!names || !Array.isArray(names) || names.length === 0) {
-        return res.status(400).json({ error: "At least one name is required" });
+
+    if (!Array.isArray(names) || names.length === 0) {
+        return res.status(400).json({ error: "At least one name is required." });
     }
 
-    // AI has stricter limits - max 10 names per request
     if (names.length > 10) {
-        return res.status(400).json({ error: "Maximum 10 names per request for AI Service" });
+        return res.status(400).json({ error: "Maximum 10 names per request." });
     }
 
     try {
-        const targetGrade = String(grade).trim();
-        const prevGrade = String(parseInt(targetGrade) - 1);
-        const sectionKey = `${targetGrade}_${section.toUpperCase()}`;
-        const sectionData = await getOrGenerateCode('section_data', sectionKey);
-        const gradePrefix = await getOrGenerateCode('grade_prefix', targetGrade);
+        const targetGrade = String(parseInt(grade));
+        const upperSection = section.toUpperCase();
+
+        // ==================================================
+        // LOW COST DUPLICATE CHECK
+        // Stops immediately if one name already exists
+        // ==================================================
+        for (const rawName of names) {
+            if (!rawName || !rawName.trim()) continue;
+
+            const cleanName = rawName.toUpperCase().trim();
+
+            const existSnap = await db.collection("voters")
+                .where("nameKey", "==", cleanName)
+                .limit(1)
+                .get();
+
+            if (!existSnap.empty) {
+                return res.json({
+                    status: "exist"
+                });
+            }
+        }
+
+        // ==================================================
+        // CONTINUE ONLY IF NO DUPLICATES
+        // ==================================================
+        const sectionKey = `${targetGrade}_${upperSection}`;
+        const sectionData = await getOrGenerateCode("section_data", sectionKey);
+        const gradePrefix = await getOrGenerateCode("grade_prefix", targetGrade);
+
         const accessCode = sectionData.access_code;
         const sectionPrefix = sectionData.prefix;
 
         const batch = db.batch();
+
+        const addedLVNs = [];
         let addedCount = 0;
-        let updatedCount = 0;
 
-        const searchGrades = [targetGrade];
-        if (targetGrade !== "7" && parseInt(targetGrade) > 0) {
-            searchGrades.push(prevGrade);
-        }
+        for (const rawName of names) {
+            if (!rawName || !rawName.trim()) continue;
 
-        const existingSnap = await db.collection("voters")
-            .where("grade", "in", searchGrades)
-            .get();
+            const cleanName = rawName.toUpperCase().trim();
 
-        const existingMap = {};
-        existingSnap.forEach(doc => {
-            const data = doc.data();
-            if (data.name) existingMap[data.name.toUpperCase().trim()] = doc.ref;
-        });
+            const randomSuffix = Math.floor(
+                1000000 + Math.random() * 9000000
+            ).toString();
 
-        for (const name of names) {
-            if (!name || !name.trim()) continue;
-            const cleanName = name.toUpperCase().trim();
-            const codeHashForUpdate = encryptAccessCode(accessCode);
-            const code = await bcrypt.hash(accessCode.toUpperCase(), 10);
+            const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
+            const hashedLVN = hashLVN(lvn);
 
-            if (existingMap[cleanName]) {
-                batch.update(existingMap[cleanName], {
-                    grade: targetGrade,
-                    section: section.toUpperCase(),
-                    code: code,
-                    codeHash: codeHashForUpdate,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-                updatedCount++;
-            } else {
-                const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
-                const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
-                const hashedLVN = hashLVN(lvn);
-                const encryptedCode = encryptAccessCode(accessCode);
-                const codeForNewSet = await bcrypt.hash(accessCode.toUpperCase(), 10);
+            const voterRef = db.collection("voters").doc(hashedLVN);
 
-                const voterRef = db.collection("voters").doc(hashedLVN);
-                batch.set(voterRef, {
-                    lvn: lvn,
-                    name: cleanName,
-                    grade: targetGrade,
-                    section: section.toUpperCase(),
-                    code: codeForNewSet,
-                    codeHash: encryptedCode,
-                    hasVoted: false,
-                    addedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-                addedCount++;
-            }
+            const encryptedCode = encryptAccessCode(accessCode);
+            const bcryptCode = await bcrypt.hash(accessCode.toUpperCase(), 10);
+
+            batch.set(voterRef, {
+                lvn: lvn,
+                name: cleanName,
+                nameKey: cleanName,
+                grade: targetGrade,
+                section: upperSection,
+                code: bcryptCode,
+                codeHash: encryptedCode,
+                hasVoted: false,
+                addedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            addedLVNs.push(lvn);
+            addedCount++;
         }
 
         await batch.commit();
 
-        // Invalidate cache
-        setImmediate(() => invalidateVotersCache().catch(e =>
-            console.error("[CACHE] invalidateVotersCache after add failed:", e)
-        ));
+        setImmediate(() =>
+            invalidateVotersCache().catch(err =>
+                console.error("[CACHE ERROR]", err)
+            )
+        );
 
-        // Log AI access
         await logSecurityEvent("AI_SERVICE_ADD_VOTERS", req, {
-            origin: req.headers.origin,
             grade: targetGrade,
-            section: section.toUpperCase(),
-            count: names.length
+            section: upperSection,
+            count: addedCount
         });
 
-        res.json({
+        return res.json({
             success: true,
-            message: `Processed ${names.length}. Updated: ${updatedCount}, New: ${addedCount}`,
-            accessCode: accessCode
+            status: "added",
+            count: addedCount,
+            accessCode: accessCode,
+            lvns: addedLVNs
         });
 
-    } catch (e) {
-        console.error("AI Service error:", e);
-        res.status(500).json({ error: "Failed to process voters" });
+    } catch (error) {
+        console.error("AI Service error:", error);
+
+        return res.status(500).json({
+            error: "Failed to process voters."
+        });
     }
 });
 
