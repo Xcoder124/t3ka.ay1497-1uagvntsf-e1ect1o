@@ -74,8 +74,8 @@ app.use(express.json({ limit: '110kb' }));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
-// ✅ FIXED CORS CONFIGURATION
-const allowedOrigins = process.env.NODE_ENV === 'production'
+
+const allowedOrigins = process.env.NODE_ENV === "production"
     ? [
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
@@ -89,23 +89,36 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
         "https://adesportstorres-v2.web.app"
     ];
 
-app.options('*', cors({
+const corsOptions = {
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
+
         const cleanOrigin = origin.trim();
-        const isAllowed = allowedOrigins.some(allowed =>
-            cleanOrigin === allowed || cleanOrigin.startsWith(allowed + '/')
-        );
-        if (isAllowed) {
-            callback(null, cleanOrigin);
-        } else {
-            callback(new Error("CORS Policy: Origin not allowed"), false);
+
+        if (allowedOrigins.includes(cleanOrigin)) {
+            return callback(null, true);
         }
+
+        return callback(new Error("CORS Policy: Origin not allowed"));
     },
     credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "x-ai-service-key"]
-}));
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-CSRF-Token",
+        "x-csrf-token",
+        "X-Admin-Key",
+        "x-ai-service-key"
+    ]
+};
+
+// ✅ APPLY TO ALL REAL REQUESTS
+app.use(cors(corsOptions));
+
+// ✅ HANDLE PREFLIGHT REQUESTS
+app.options("*", cors(corsOptions));
+
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
@@ -114,15 +127,55 @@ app.use((req, res, next) => {
     helmet.contentSecurityPolicy({
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", `'nonce-${req.cspNonce}'`, "https://cdnjs.cloudflare.com", "https://www.gstatic.com", "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"],
-            frameSrc: ["'self'", "https://challenges.cloudflare.com"],
-            styleSrc: ["'self'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
-            connectSrc: ["'self'", "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://challenges.cloudflare.com", "https://tsf-sslg-election-endpoint.onrender.com", "https://tsf-g-digital-election.web.app", "https://tanauanschooloffisheries.web.app"],
-            fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-            imgSrc: ["'self'", "data:", "blob:", "https://firebasestorage.googleapis.com", "https://ui-avatars.com"],
-            frameAncestors: ["'none'"],
 
-        },
+            scriptSrc: [
+                "'self'",
+                `'nonce-${req.cspNonce}'`,
+                "https://cdnjs.cloudflare.com",
+                "https://www.gstatic.com",
+                "https://challenges.cloudflare.com",
+                "https://cdn.jsdelivr.net"
+            ],
+
+            frameSrc: [
+                "'self'",
+                "https://challenges.cloudflare.com"
+            ],
+
+            styleSrc: [
+                "'self'",
+                "https://fonts.googleapis.com",
+                "https://cdnjs.cloudflare.com",
+                "'unsafe-inline'"
+            ],
+
+            connectSrc: [
+                "'self'",
+                "https://identitytoolkit.googleapis.com",
+                "https://securetoken.googleapis.com",
+                "https://challenges.cloudflare.com",
+                "https://tsf-sslg-election-endpoint.onrender.com",
+                "https://tsf-g-digital-election.web.app",
+                "https://tanauanschooloffisheries.web.app",
+                "https://adesportstorres-v2.web.app"
+            ],
+
+            fontSrc: [
+                "'self'",
+                "https://fonts.gstatic.com",
+                "https://cdnjs.cloudflare.com"
+            ],
+
+            imgSrc: [
+                "'self'",
+                "data:",
+                "blob:",
+                "https://firebasestorage.googleapis.com",
+                "https://ui-avatars.com"
+            ],
+
+            frameAncestors: ["'none'"]
+        }
     })(req, res, next);
 });
 
