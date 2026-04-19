@@ -155,6 +155,25 @@ const MAX_ATTEMPTS = 3;
 const LOCK_TIME = 30 * 1000; // 30 sec
 const AUDIT_CHAIN_DOC = db.collection("_meta").doc("chain_head");
 const MASK_SECRET = process.env.JWT_SECRET;
+let liveSystemStatus = {
+    isLive: false,
+    isQueue: false,
+    endTime: null
+};
+let dashboardDirty = false;
+let dashboardSaving = false;
+function markDashboardDirty() {
+    dashboardDirty = true;
+}
+let LiveVoterStatus = {};
+
+rtdb.ref("voterStatus").on("value", (snap) => {
+    LiveVoterStatus = snap.val() || {};
+});
+
+rtdb.ref("status").on("value", snap => {
+    liveSystemStatus = snap.val() || {};
+});
 
 const VotersStaticCache = {
     data: [],
@@ -162,49 +181,37 @@ const VotersStaticCache = {
     isLoading: false
 };
 
-const VoterStatusCache = {
-    data: null,
-    lastFetch: 0
-};
-
 async function getVoterStatusCache() {
-    const now = Date.now();
-
-    if (!VoterStatusCache.data || now - VoterStatusCache.lastFetch > 3000) {
-        const snap = await rtdb.ref("voterStatus").once("value");
-        VoterStatusCache.data = snap.val() || {};
-        VoterStatusCache.lastFetch = now;
-    }
-
-    return VoterStatusCache.data;
+    return LiveVoterStatus;
 }
 
 const ACCESS_CODE_KEY = process.env.BACKUP_SECRET;
 
-(async () => {
-    try {
-        await refreshLocalResults();
-        console.log("Dashboard cache warmed up");
-    } catch (err) {
-        console.error("Initial dashboard load failed:", err);
-    }
-})();
-
-(async () => {
-    try {
-        await loadVotersStaticCache();
-    } catch (err) {
-        console.error("Voters static cache warm-up failed:", err);
-    }
-})();
-
 setInterval(async () => {
     try {
         await refreshLocalResults();
-    } catch (err) {
-        console.error("Background dashboard refresh failed:", err);
+    } catch (e) {
+        console.error("Background dashboard refresh failed:", e);
     }
-}, 3 * 60 * 60 * 1000);
+}, 300000);
+
+setInterval(async () => {
+    if (!dashboardDirty) return;
+    if (dashboardSaving) return;
+
+    dashboardSaving = true;
+
+    try {
+        dashboardDirty = false;
+        await saveAggregateDashboard();
+    } catch (e) {
+        dashboardDirty = true;
+        console.error("Dashboard autosave failed:", e);
+    } finally {
+        dashboardSaving = false;
+    }
+
+}, 30000);
 
 async function validateSelections(selections) {
     let candidateMap = GlobalCache.candidates;
@@ -478,8 +485,6 @@ async function updateVoterStatusInRTDB(voterId, { hasVoted, isMissed, integrityS
         integrityStatus: integrityStatus || "PENDING",
         updatedAt: admin.database.ServerValue.TIMESTAMP
     });
-    VoterStatusCache.data = null;
-    VoterStatusCache.lastFetch = 0;
 }
 
 // ============================================
@@ -513,6 +518,54 @@ function requireAIServiceOnly(req, res, next) {
     };
 
     next();
+}
+
+async function loadAggregateDashboard() {
+    try {
+        const snap = await db.collection("aggregates")
+            .doc("dashboard")
+            .get();
+
+        if (!snap.exists) return false;
+
+        const data = snap.data() || {};
+
+        if (!GlobalCache.dashboard) {
+            GlobalCache.dashboard = {};
+        }
+
+        GlobalCache.dashboard.leaderboard =
+            data.leaderboard || {};
+
+        GlobalCache.dashboard.stats =
+            data.stats || {};
+
+        return true;
+
+    } catch (e) {
+        console.error("Load aggregate failed:", e);
+        return false;
+    }
+}
+
+async function saveAggregateDashboard() {
+    try {
+        if (!GlobalCache.dashboard) return;
+
+        await db.collection("aggregates")
+            .doc("dashboard")
+            .set({
+                leaderboard: GlobalCache.dashboard.leaderboard || {},
+                stats: GlobalCache.dashboard.stats || {},
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+        return true;
+
+    } catch (e) {
+        console.error("Save aggregate failed:", e);
+        return false;
+    }
 }
 
 // --- CONSTANTS ---
@@ -1785,79 +1838,114 @@ async function refreshLocalCandidates() {
 
 async function refreshLocalResults() {
     try {
-        if (Object.keys(GlobalCache.candidates).length === 0) await refreshLocalCandidates();
-        const settingsSnap = await db.collection("settings").doc("electionStatus").get();
-        const isLive = settingsSnap.exists ? !!settingsSnap.data().isLive : false;
-        const votersSnap = await db.collection("voters").get();
-        const stats = { total: 0, voted: 0, percentage: 0, grades: {} };
-        votersSnap.forEach((doc) => {
-            const v = doc.data() || {};
-            const grade = String(v.grade || "Unknown");
-            if (!stats.grades[grade]) stats.grades[grade] = { total: 0, voted: 0, missed: 0 };
-            stats.total += 1;
-            stats.grades[grade].total += 1;
-            if (v.isMissed) {
-                stats.grades[grade].missed += 1;
+        if (Object.keys(GlobalCache.candidates).length === 0) {
+            await refreshLocalCandidates();
+        }
+
+        if (!Array.isArray(VotersStaticCache.data) || VotersStaticCache.data.length === 0) {
+            await loadVotersStaticCache();
+        }
+
+        const stats = {
+            total: 0,
+            voted: 0,
+            percentage: 0,
+            grades: {}
+        };
+
+        const voters = VotersStaticCache.data;
+
+        for (const voter of voters) {
+            const grade = String(voter.grade || "Unknown");
+
+            if (!stats.grades[grade]) {
+                stats.grades[grade] = {
+                    total: 0,
+                    voted: 0,
+                    missed: 0
+                };
             }
-            if (v.hasVoted) {
-                stats.voted += 1;
-                stats.grades[grade].voted += 1;
+
+            stats.total++;
+            stats.grades[grade].total++;
+
+            const live = LiveVoterStatus[voter.id] || {};
+
+            if (live.hasVoted === true) {
+                stats.voted++;
+                stats.grades[grade].voted++;
             }
-        });
-        if (stats.total > 0) stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
-        const votesSnap = await db.collection("votes").get();
-        const tallies = {};
-        for (const pos of Object.keys(GlobalCache.candidates)) {
-            tallies[pos] = {};
-            for (const c of (GlobalCache.candidates[pos] || [])) {
-                tallies[pos][String(c.id)] = { votes: 0, breakdown: {} };
+
+            if (live.isMissed === true) {
+                stats.grades[grade].missed++;
             }
         }
-        votesSnap.forEach((doc) => {
-            const v = doc.data() || {};
-            const grade = String(v.grade || "Unknown");
-            const selections = v.selections || {};
-            for (const pos of Object.keys(tallies)) {
-                const rawSel = selections[pos];
-                if (!rawSel) continue;
-                const selectedIds = Array.isArray(rawSel) ? rawSel : [rawSel];
-                for (const cid of selectedIds) {
-                    const cidStr = String(cid);
-                    if (!tallies[pos][cidStr]) {
-                        tallies[pos][cidStr] = { votes: 0, breakdown: {} };
+
+        if (stats.total > 0) {
+            stats.percentage = (
+                (stats.voted / stats.total) * 100
+            ).toFixed(1);
+        }
+
+        const leaderboard = {};
+
+        for (const position of Object.keys(GlobalCache.candidates)) {
+            const list = GlobalCache.candidates[position] || [];
+
+            leaderboard[position] = list.map(candidate => ({
+                id: String(candidate.id),
+                name: candidate.name,
+                party: candidate.party,
+                hash: candidate.hash,
+                votes: 0,
+                breakdown: {}
+            }));
+        }
+
+        if (
+            GlobalCache.dashboard &&
+            GlobalCache.dashboard.leaderboard
+        ) {
+            const oldBoard = GlobalCache.dashboard.leaderboard;
+
+            for (const position of Object.keys(leaderboard)) {
+                const oldMap = oldBoard[position] || [];
+
+                leaderboard[position].forEach(item => {
+                    const found = oldMap.find(
+                        x => String(x.id) === String(item.id)
+                    );
+
+                    if (found) {
+                        item.votes = found.votes || 0;
+                        item.breakdown = found.breakdown || {};
                     }
-                    tallies[pos][cidStr].votes += 1;
-                    const key = `votes_${grade}`;
-                    tallies[pos][cidStr].breakdown[key] = (tallies[pos][cidStr].breakdown[key] || 0) + 1;
-                }
-            }
-        });
-        const finalResults = {};
-        for (const pos of Object.keys(GlobalCache.candidates)) {
-            const list = [];
-            for (const c of (GlobalCache.candidates[pos] || [])) {
-                const cidStr = String(c.id);
-                const t = tallies[pos][cidStr] || { votes: 0, breakdown: {} };
-                list.push({
-                    name: c.name,
-                    party: c.party,
-                    hash: c.hash,
-                    votes: t.votes,
-                    breakdown: t.breakdown
                 });
             }
-            list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
-            finalResults[pos] = list;
         }
-        GlobalCache.dashboard = { isLive, stats, leaderboard: finalResults };
-        GlobalCache.timestamps.results = new Date().toISOString();
+
+        for (const position of Object.keys(leaderboard)) {
+            leaderboard[position].sort(
+                (a, b) => (b.votes || 0) - (a.votes || 0)
+            );
+        }
+
+        GlobalCache.dashboard = {
+            isLive: liveSystemStatus.isLive === true,
+            stats,
+            leaderboard
+        };
+
+        GlobalCache.timestamps.results =
+            new Date().toISOString();
+
         return true;
+
     } catch (err) {
+        console.error("refreshLocalResults failed:", err);
         return false;
     }
 }
-
-
 
 function generateSubmitToken(jti) {
     if (!jti) throw new Error("jti required for submit token");
@@ -2034,12 +2122,31 @@ async function purgeElectionData() {
 
 // --- CACHE INIT MIDDLEWARE ---
 app.use(async (req, res, next) => {
-    if (Object.keys(GlobalCache.candidates).length === 0) {
-        await refreshLocalCandidates();
-        await refreshLocalResults();
-    }
+    await ensureSystemReady();
     next();
 });
+
+let initPromise = null;
+
+async function ensureSystemReady() {
+    if (
+        Object.keys(GlobalCache.candidates).length > 0 &&
+        VotersStaticCache.data.length > 0
+    ) {
+        return;
+    }
+
+    if (!initPromise) {
+        initPromise = (async () => {
+            await loadVotersStaticCache();
+            await refreshLocalCandidates();
+            await loadAggregateDashboard();
+            await refreshLocalResults();
+        })();
+    }
+
+    await initPromise;
+}
 
 // --- ROUTES ---
 
@@ -2993,153 +3100,65 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
     try {
         const hashedLVN = req.user.uid;
         const grade = req.user.grade;
-
         const { selections, timestamp, nonce } = req.body;
 
-        // 🔍 Basic validation
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
         }
 
-        if (typeof timestamp !== "number") {
-            return res.status(400).json({ error: "Invalid timestamp" });
+        if (typeof timestamp !== "number" || Math.abs(Date.now() - timestamp) > 60000) {
+            return res.status(400).json({ error: "Request expired." });
         }
 
         if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
-            return res.status(400).json({ error: "Invalid nonce" });
+            return res.status(400).json({ error: "Invalid nonce." });
         }
 
-        const now = Date.now();
-        if (Math.abs(now - timestamp) > 60000) {
-            return res.status(400).json({ error: "Request expired" });
-        }
-
-        // 🔐 Anti-replay (nonce)
-        const nonceAccepted = await consumeNonce(nonce, hashedLVN); // 🔥 tied to user
-        if (!nonceAccepted) {
-            await logSecurityEvent("REPLAY_ATTACK", req, { hashedLVN, nonce });
-            return res.status(409).json({ error: "Duplicate request detected." });
-        }
-
-        // 🔍 Validate selections
-        let validatedSelections;
-        try {
-            validatedSelections = await validateSelections(selections);
-        } catch (e) {
-            await createAlert("tamper", "critical", "Tampered Vote", e.message, { selections });
-            return res.status(400).json({ error: e.message });
-        }
-
-        // ⚙️ Get system state
-        const [settings, rtdbStatusSnap] = await Promise.all([
-            db.collection("settings").doc("electionStatus").get(),
-            rtdb.ref("status").once("value")
-        ]);
-
-        const rtdbStatus = rtdbStatusSnap.val() || {};
-        const isLive = rtdbStatus.isLive === true;
-        const isQueue = rtdbStatus.isQueue === true;
-
-        if (!isLive) {
+        if (liveSystemStatus.isLive !== true) {
             return res.status(403).json({ error: "Election closed." });
         }
 
-        const electionData = settings.exists ? settings.data() : {};
-
-        // ⏱ End time check
-        if (electionData.endTime && Date.now() > electionData.endTime.toMillis()) {
+        if (liveSystemStatus.endTime && Date.now() > Number(liveSystemStatus.endTime)) {
             return res.status(403).json({ error: "Voting period ended." });
         }
 
-        // 👤 Voter validation
+        const nonceAccepted = await consumeNonce(nonce, hashedLVN);
+
+        if (!nonceAccepted) {
+            return res.status(409).json({ error: "Duplicate request detected." });
+        }
+
+        const validatedSelections = await validateSelections(selections);
+
         const voterRef = db.collection("voters").doc(hashedLVN);
-        const voterSnap = await voterRef.get();
-
-        if (!voterSnap.exists) {
-            return res.status(403).json({ error: "Voter not found." });
-        }
-
-        if (voterSnap.data().hasVoted) {
-            return res.status(403).json({ error: "Already voted." });
-        }
-
-        // 🔁 Queue validation (FIRST PASS)
-        if (isQueue) {
-            const userSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
-
-            if (!userSnap.exists()) {
-                return res.status(403).json({ error: "You are not in the queue." });
-            }
-
-            if (userSnap.val().status !== 'active') {
-                return res.status(403).json({ error: "Please wait for your turn." });
-            }
-        }
-
-        // 🔗 Refs
-        const CHAIN_DOC = db.collection("_meta").doc("chain_head");
-        const AGG_REF = db.collection("aggregates").doc("dashboard");
+        const chainRef = db.collection("_meta").doc("chain_head");
 
         const voteResult = await db.runTransaction(async (t) => {
-            const voterDoc = await t.get(voterRef);
-            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
-            if (voterDoc.data().hasVoted) throw new Error("ALREADY_VOTED");
+            const [voterDoc, chainDoc] = await Promise.all([
+                t.get(voterRef),
+                t.get(chainRef)
+            ]);
 
-            const chainDoc = await t.get(CHAIN_DOC);
-            const aggDoc = await t.get(AGG_REF);
-
-            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
-            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
-
-            // 🔥 HASH CHAIN VALIDATION
-            if (chainDoc.exists) {
-                const expectedPrevHash = chainDoc.data().hash;
-                const expectedSequence = (chainDoc.data().count || 0) + 1;
-
-                if (prevHash !== expectedPrevHash) {
-                    throw new Error("CHAIN_MISMATCH");
-                }
-
-                if (prevCount + 1 !== expectedSequence) {
-                    throw new Error("INVALID_SEQUENCE");
-                }
+            if (!voterDoc.exists) {
+                throw new Error("VOTER_NOT_FOUND");
             }
 
-            // 🔁 Queue validation (SECOND PASS inside critical section)
-            if (isQueue) {
-                const queueSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once('value');
+            if (voterDoc.data().hasVoted === true) {
+                throw new Error("ALREADY_VOTED");
+            }
 
-                if (!queueSnap.exists() || queueSnap.val().status !== 'active') {
+            if (liveSystemStatus.isQueue === true) {
+                const queueSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once("value");
+
+                if (!queueSnap.exists() || queueSnap.val().status !== "active") {
                     throw new Error("QUEUE_NOT_ACTIVE");
                 }
             }
 
-            const randomSalt = crypto.randomBytes(32).toString("hex");
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
 
-            const payload = JSON.stringify({
-                voter_hash: hashedLVN,
-                selections: validatedSelections,
-                timestamp: Date.now()
-            });
-
-            const receipt = crypto.createHash("sha256")
-                .update(payload + randomSalt)
-                .digest("hex");
-
-            // 🔒 Receipt uniqueness
-            const receiptCheck = await db.collection("votes")
-                .where("receipt", "==", receipt)
-                .limit(1)
-                .get();
-
-            if (!receiptCheck.empty) {
-                throw new Error("DUPLICATE_RECEIPT");
-            }
-
-            const verificationCode = crypto.createHash("sha256")
-                .update(receipt + stableStringify(validatedSelections))
-                .digest("hex")
-                .substring(0, 12);
+            const receipt = crypto.randomBytes(32).toString("hex");
 
             const currentHash = crypto.createHash("sha256")
                 .update(receipt + prevHash + stableStringify(validatedSelections))
@@ -3147,7 +3166,6 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
             const voteRef = db.collection("votes").doc();
 
-            // 🗳️ Save vote
             t.set(voteRef, {
                 selections: validatedSelections,
                 grade: String(grade),
@@ -3155,110 +3173,76 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
                 receipt,
                 hash: currentHash,
                 prevHash,
-                salt: randomSalt,
                 sequence: prevCount + 1
             });
 
-            // 👤 Update voter
             t.update(voterRef, {
                 hasVoted: true,
                 votedAt: admin.firestore.FieldValue.serverTimestamp(),
                 receipt
             });
 
-            // 🔗 Update chain
-            t.set(CHAIN_DOC, {
+            t.set(chainRef, {
                 hash: currentHash,
                 count: prevCount + 1
             });
 
-            // ⚡ Aggregates
-            const agg = aggDoc.exists ? aggDoc.data() : {
-                stats: { total: 0, voted: 0, grades: {} },
-                leaderboard: {}
+            return {
+                receipt,
+                hash: currentHash
             };
-
-            const g = String(grade);
-            agg.stats.voted = (agg.stats.voted || 0) + 1;
-
-            if (!agg.stats.grades[g]) {
-                agg.stats.grades[g] = { total: 0, voted: 0, missed: 0 };
-            }
-
-            agg.stats.grades[g].voted++;
-
-            for (const pos in validatedSelections) {
-                const selected = Array.isArray(validatedSelections[pos])
-                    ? validatedSelections[pos]
-                    : [validatedSelections[pos]];
-
-                if (!agg.leaderboard[pos]) {
-                    agg.leaderboard[pos] = {};
-                }
-
-                selected.forEach(cid => {
-                    agg.leaderboard[pos][cid] =
-                        (agg.leaderboard[pos][cid] || 0) + 1;
-                });
-            }
-
-            if (agg.stats.total > 0) {
-                agg.stats.percentage =
-                    ((agg.stats.voted / agg.stats.total) * 100).toFixed(1);
-            }
-
-            agg.lastUpdated = admin.firestore.FieldValue.serverTimestamp();
-            t.set(AGG_REF, agg, { merge: true });
-
-            return { receipt, currentHash, prevHash, verificationCode };
         });
 
-        // ✅ Respond
+        await updateVoterStatusInRTDB(hashedLVN, {
+            hasVoted: true,
+            isMissed: false,
+            integrityStatus: "VALID"
+        });
+
+        incrementDashboardMemory(validatedSelections, grade);
+        await saveAggregateDashboard();
+
         res.json({
             success: true,
             receipt: voteResult.receipt,
-            verificationCode: voteResult.verificationCode,
-            hash: voteResult.currentHash,
-            prevHash: voteResult.prevHash
+            hash: voteResult.hash
         });
 
-        // 🔄 Queue advancement (async)
-        if (isQueue) {
+        if (liveSystemStatus.isQueue === true) {
             setImmediate(async () => {
                 try {
-                    const gradeKey = `sessionG${grade}`;
-                    const queueRef = rtdb.ref(`queue/${gradeKey}`);
+                    const queueRef = rtdb.ref(`queue/sessionG${grade}`);
 
                     await queueRef.transaction(current => {
                         if (!current || !current.users) return current;
 
                         delete current.users[hashedLVN];
 
-                        let newActiveCount = 0;
-                        let nextUserId = null;
-                        let lowestPosition = Infinity;
+                        let active = 0;
+                        let nextUser = null;
+                        let lowest = Infinity;
 
                         for (const [uid, data] of Object.entries(current.users)) {
-                            if (data.status === 'active') {
-                                newActiveCount++;
-                            } else if (data.status === 'waiting' && data.position < lowestPosition) {
-                                nextUserId = uid;
-                                lowestPosition = data.position;
+                            if (data.status === "active") active++;
+
+                            if (data.status === "waiting" && data.position < lowest) {
+                                lowest = data.position;
+                                nextUser = uid;
                             }
                         }
 
-                        if (nextUserId && newActiveCount < current.maxActive) {
-                            current.users[nextUserId].status = 'active';
-                            newActiveCount++;
+                        if (nextUser && active < current.maxActive) {
+                            current.users[nextUser].status = "active";
+                            active++;
                         }
 
-                        current.activeCount = newActiveCount;
+                        current.activeCount = active;
 
                         return current;
                     });
 
-                } catch (err) {
-                    console.error("Queue cleanup failed:", err);
+                } catch (e) {
+                    console.error("Queue cleanup failed:", e);
                 }
             });
         }
@@ -3266,20 +3250,16 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
     } catch (e) {
         console.error("Vote error:", e);
 
-        if (e.message === "CHAIN_MISMATCH" || e.message === "INVALID_SEQUENCE") {
-            return res.status(500).json({ error: "Vote chain integrity error." });
+        if (e.message === "ALREADY_VOTED") {
+            return res.status(403).json({ error: "Already voted." });
         }
 
         if (e.message === "QUEUE_NOT_ACTIVE") {
-            return res.status(403).json({ error: "Queue status changed. Try again." });
+            return res.status(403).json({ error: "Please wait for your turn." });
         }
 
-        if (e.message === "DUPLICATE_RECEIPT") {
-            return res.status(409).json({ error: "Duplicate vote detected." });
-        }
-
-        res.status(500).json({
-            error: "System failed to record vote. Please notify a facilitator."
+        return res.status(500).json({
+            error: "System failed to record vote."
         });
     }
 });
@@ -3447,31 +3427,31 @@ app.get("/admin/voters", async (req, res) => {
     try {
         if (VotersStaticCache.data.length === 0) {
             while (VotersStaticCache.isLoading) {
-                await new Promise(r => setTimeout(r, 50));
+                await new Promise(r => setTimeout(r, 25));
             }
+
             if (VotersStaticCache.data.length === 0) {
                 await loadVotersStaticCache();
             }
         }
 
-        // ── 1. Parse query parameters ─────────────────────────────────────────
         const page = Math.max(1, parseInt(req.query.page || "1", 10));
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "50", 10)));
-        const gradeFilter = sanitizeInput(req.query.grade || "ALL");
-        const searchQuery = sanitizeInput((req.query.search || "").toLowerCase().trim());
 
-        // ── 2. Filter on static cache (O(n) over in-memory array, no I/O) ────
+        const gradeFilter = sanitizeInput(req.query.grade || "ALL");
+        const search = sanitizeInput((req.query.search || "").toLowerCase().trim());
+
         let filtered = VotersStaticCache.data;
 
-        if (gradeFilter && gradeFilter !== "ALL") {
-            filtered = filtered.filter(v => String(v.grade).trim() === String(gradeFilter).trim());
+        if (gradeFilter !== "ALL") {
+            filtered = filtered.filter(v => String(v.grade) === String(gradeFilter));
         }
 
-        if (searchQuery) {
+        if (search) {
             filtered = filtered.filter(v =>
-                (v.name || "").toLowerCase().includes(searchQuery) ||
-                (v.lvn || "").toLowerCase().includes(searchQuery) ||
-                (v.section || "").toLowerCase().includes(searchQuery)
+                (v.name || "").toLowerCase().includes(search) ||
+                (v.lvn || "").toLowerCase().includes(search) ||
+                (v.section || "").toLowerCase().includes(search)
             );
         }
 
@@ -3479,29 +3459,26 @@ app.get("/admin/voters", async (req, res) => {
         const totalPages = Math.ceil(total / limit) || 1;
         const safePage = Math.min(page, totalPages);
         const start = (safePage - 1) * limit;
-        const pageSlice = filtered.slice(start, start + limit);
+        const slice = filtered.slice(start, start + limit);
 
-        const statusSnap = await rtdb.ref("voterStatus").once("value");
-        const statusMap = await getVoterStatusCache();
+        const voters = slice.map(v => {
+            const s = LiveVoterStatus[v.id] || {};
 
-        // ── 4. Merge static + dynamic data ────────────────────────────────────
-        const voters = pageSlice.map(voter => {
-            const s = statusMap[voter.id] || {};
             return {
-                id: voter.id,
-                lvn: voter.lvn,
-                name: voter.name,
-                grade: voter.grade,
-                section: voter.section,
-                code: voter.accessCode,
-                hasVoted: s.hasVoted ?? false,
-                isMissed: s.isMissed ?? false,
-                integrityStatus: s.integrityStatus ?? "PENDING",
-                addedAt: voter.addedAt,
+                id: v.id,
+                lvn: v.lvn,
+                name: v.name,
+                grade: v.grade,
+                section: v.section,
+                code: v.accessCode,
+                hasVoted: s.hasVoted === true,
+                isMissed: s.isMissed === true,
+                integrityStatus: s.integrityStatus || "PENDING",
+                addedAt: v.addedAt
             };
         });
 
-        res.json({
+        return res.json({
             voters,
             pagination: {
                 page: safePage,
@@ -3509,14 +3486,17 @@ app.get("/admin/voters", async (req, res) => {
                 total,
                 totalPages,
                 hasNext: safePage < totalPages,
-                hasPrev: safePage > 1,
+                hasPrev: safePage > 1
             },
-            cacheAge: VotersStaticCache.lastUpdated,
+            cacheAge: VotersStaticCache.lastUpdated
         });
 
     } catch (e) {
         console.error("GET /admin/voters error:", e);
-        res.status(500).json({ error: "Failed to fetch voters" });
+
+        return res.status(500).json({
+            error: "Failed to fetch voters"
+        });
     }
 });
 
@@ -4584,7 +4564,7 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
         );
 
         const textResponse = response.data?.choices?.[0]?.message?.content;
-        
+
         if (!textResponse) {
             const rawResponse = JSON.stringify(response.data);
             throw new Error(`Empty response from Kimi. Raw response: "${rawResponse.substring(0, 500)}"`);
@@ -4638,7 +4618,7 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
 
         // Extract AI response text from various error shapes
         let aiResponseText = 'No response text available';
-        
+
         if (error.response?.data?.choices?.[0]?.message?.content) {
             aiResponseText = error.response.data.choices[0].message.content;
         } else if (error.response?.data?.error?.message) {
