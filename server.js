@@ -3749,28 +3749,69 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 app.post("/admin/voters/delete", async (req, res) => {
     try {
         const lvn = sanitizeInput(req.body.lvn || '');
-        if (!lvn) return res.status(400).json({ error: "LVN required" });
-        const hashedLVN = hashLVN(lvn);
-        const voterRef = db.collection("voters").doc(hashedLVN);
-        const voterSnap = await voterRef.get();
-        if (!voterSnap.exists) return res.status(404).json({ error: "Voter not found." });
-        const voterData = voterSnap.data();
-        if (voterData.hasVoted) {
-            await voterRef.update({
-                _deleted: true,
-                _deletedAt: admin.firestore.FieldValue.serverTimestamp(),
-                name: "[REMOVED]",
-                lvn: admin.firestore.FieldValue.delete(),
-                code: admin.firestore.FieldValue.delete(),
+
+        if (!lvn) {
+            return res.status(400).json({
+                error: "LVN required"
             });
-            await logAdminAction(req, "VOTER_SOFT_DELETE", { lvn: "***", reason: "Has voted — receipt preserved" });
-            return res.json({ success: true, note: "Voter soft-deleted. Vote record remains intact for integrity." });
         }
+
+        const hashedLVN = hashLVN(lvn);
+
+        const voterRef = db.collection("voters").doc(hashedLVN);
+        const statusRef = rtdb.ref(`voterStatus/${hashedLVN}`);
+
+        const voterSnap = await voterRef.get();
+
+        if (!voterSnap.exists) {
+            return res.status(404).json({
+                error: "Voter not found."
+            });
+        }
+
+        const voterData = voterSnap.data() || {};
+
+        // 🔥 Check both Firestore + RTDB live status
+        const liveSnap = await statusRef.once("value");
+        const liveStatus = liveSnap.val() || {};
+
+        const alreadyVoted =
+            voterData.hasVoted === true ||
+            liveStatus.hasVoted === true;
+
+        // 🚫 Block deletion if already voted
+        if (alreadyVoted) {
+            return res.status(409).json({
+                error:
+                    "Cannot remove a voter that has already been voted. " +
+                    "If you want to change details proceed on " +
+                    "https://currentLinktheUserwason/tools/system/admin/utilities/changeDetails.html"
+            });
+        }
+
+        // ✅ Safe delete (not voted)
         await voterRef.delete();
-        await logAdminAction(req, "VOTER_DELETE", { lvn: "***" });
-        res.json({ success: true });
+
+        // Remove RTDB live status if exists
+        await statusRef.remove();
+
+        // Refresh static cache
+        await invalidateVotersCache();
+
+        await logAdminAction(req, "VOTER_DELETE", {
+            lvn: "***"
+        });
+
+        return res.json({
+            success: true
+        });
+
     } catch (e) {
-        res.status(500).json({ error: "Delete failed" });
+        console.error("Delete voter failed:", e);
+
+        return res.status(500).json({
+            error: "Delete failed"
+        });
     }
 });
 
