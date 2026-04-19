@@ -445,8 +445,8 @@ async function loadVotersStaticCache() {
 
             voters.push({
                 id: doc.id,
-                lvnMasked: `\u2022\u2022\u2022\u2022${last4}`,  
-                lvnLast4: last4,                                   
+                lvnMasked: `\u2022\u2022\u2022\u2022${last4}`,
+                lvnLast4: last4,
                 name: v.name || "",
                 grade: v.grade || "",
                 section: v.section || "",
@@ -1594,20 +1594,20 @@ function hashLVN(lvn) {
 
 const _LVN_ENC_KEY = crypto.scryptSync(
     LVN_ENCRYPTION_KEY,
-    'tsf-lvn-enc-salt-v1', 
-    32                       
+    'tsf-lvn-enc-salt-v1',
+    32
 );
 
 function encryptLVN(lvn) {
     if (!lvn) return null;
     try {
-        const iv = crypto.randomBytes(12);           
+        const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', _LVN_ENC_KEY, iv);
         const ciphertext = Buffer.concat([
             cipher.update(String(lvn).trim(), 'utf8'),
             cipher.final()
         ]);
-        const authTag = cipher.getAuthTag();           
+        const authTag = cipher.getAuthTag();
         return [
             iv.toString('hex'),
             authTag.toString('hex'),
@@ -1933,7 +1933,9 @@ async function refreshLocalResults() {
             grades: {}
         };
 
-        const voters = VotersStaticCache.data;
+        const voters = Array.isArray(VotersStaticCache.data)
+            ? VotersStaticCache.data
+            : [];
 
         for (const voter of voters) {
             const grade = String(voter.grade || "Unknown");
@@ -1949,7 +1951,7 @@ async function refreshLocalResults() {
             stats.total++;
             stats.grades[grade].total++;
 
-            const live = LiveVoterStatus[voter.id] || {};
+            const live = LiveVoterStatus?.[voter.id] || {};
 
             if (live.hasVoted === true) {
                 stats.voted++;
@@ -1969,8 +1971,10 @@ async function refreshLocalResults() {
 
         const leaderboard = {};
 
-        for (const position of Object.keys(GlobalCache.candidates)) {
-            const list = GlobalCache.candidates[position] || [];
+        for (const position of Object.keys(GlobalCache.candidates || {})) {
+            const list = Array.isArray(GlobalCache.candidates[position])
+                ? GlobalCache.candidates[position]
+                : [];
 
             leaderboard[position] = list.map(candidate => ({
                 id: String(candidate.id),
@@ -1984,23 +1988,36 @@ async function refreshLocalResults() {
 
         if (
             GlobalCache.dashboard &&
-            GlobalCache.dashboard.leaderboard
+            GlobalCache.dashboard.leaderboard &&
+            typeof GlobalCache.dashboard.leaderboard === "object"
         ) {
             const oldBoard = GlobalCache.dashboard.leaderboard;
 
             for (const position of Object.keys(leaderboard)) {
-                const oldMap = oldBoard[position] || [];
+                const oldRaw = oldBoard[position];
 
-                leaderboard[position].forEach(item => {
-                    const found = oldMap.find(
-                        x => String(x.id) === String(item.id)
-                    );
+                const oldList = Array.isArray(oldRaw)
+                    ? oldRaw
+                    : [];
+
+                const oldLookup = new Map();
+
+                for (const row of oldList) {
+                    oldLookup.set(String(row.id), row);
+                }
+
+                for (const item of leaderboard[position]) {
+                    const found = oldLookup.get(String(item.id));
 
                     if (found) {
-                        item.votes = found.votes || 0;
-                        item.breakdown = found.breakdown || {};
+                        item.votes = Number(found.votes || 0);
+                        item.breakdown =
+                            found.breakdown &&
+                                typeof found.breakdown === "object"
+                                ? found.breakdown
+                                : {};
                     }
-                });
+                }
             }
         }
 
@@ -2011,7 +2028,7 @@ async function refreshLocalResults() {
         }
 
         GlobalCache.dashboard = {
-            isLive: liveSystemStatus.isLive === true,
+            isLive: liveSystemStatus?.isLive === true,
             stats,
             leaderboard
         };
@@ -3664,8 +3681,8 @@ app.post("/admin/voters/add", async (req, res) => {
                 const voterRef = db.collection("voters").doc(hashedLVN);
                 batch.set(voterRef, {
                     lvn: lvn,
-                    lvnEncrypted: encryptLVN(lvn), 
-                    lvnLast4: lvn.slice(-4),  
+                    lvnEncrypted: encryptLVN(lvn),
+                    lvnLast4: lvn.slice(-4),
                     name: cleanName,
                     grade: targetGrade,
                     section: section.toUpperCase(),
@@ -3835,8 +3852,8 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
             batch.set(voterRef, {
                 lvn: lvn,
-                lvnEncrypted: encryptLVN(lvn), 
-                lvnLast4: lvn.slice(-4),  
+                lvnEncrypted: encryptLVN(lvn),
+                lvnLast4: lvn.slice(-4),
                 name: cleanName,
                 nameKey: cleanName,
                 grade: targetGrade,
@@ -3884,7 +3901,7 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
 app.post("/admin/voters/delete", async (req, res) => {
     try {
-        const rawId  = sanitizeInput(req.body.id  || '');
+        const rawId = sanitizeInput(req.body.id || '');
         const rawLvn = sanitizeInput(req.body.lvn || '');
 
         let docId;
@@ -3898,7 +3915,7 @@ app.post("/admin/voters/delete", async (req, res) => {
             return res.status(400).json({ error: "Voter ID required." });
         }
 
-        const voterRef  = db.collection("voters").doc(docId);
+        const voterRef = db.collection("voters").doc(docId);
         const statusRef = rtdb.ref(`voterStatus/${docId}`);
 
         const voterSnap = await voterRef.get();
@@ -3907,7 +3924,7 @@ app.post("/admin/voters/delete", async (req, res) => {
         }
 
         const voterData = voterSnap.data() || {};
-        const liveSnap  = await statusRef.once("value");
+        const liveSnap = await statusRef.once("value");
         const liveStatus = liveSnap.val() || {};
 
         const alreadyVoted =
@@ -3942,7 +3959,7 @@ app.post("/admin/voters/delete", async (req, res) => {
 
 app.post("/admin/voters/reset", async (req, res) => {
     try {
-        const rawId  = sanitizeInput(req.body.id  || '');
+        const rawId = sanitizeInput(req.body.id || '');
         const rawLvn = sanitizeInput(req.body.lvn || '');
 
         let docId;
