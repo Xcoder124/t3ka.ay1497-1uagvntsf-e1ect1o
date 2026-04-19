@@ -14,12 +14,14 @@ const VOTE_SIGN_SECRET = process.env.VOTE_SIGN_SECRET;
 if (!VOTE_SIGN_SECRET) {
     throw new Error("VOTE_SIGN_SECRET is required");
 }
-
 const BACKUP_SECRET = process.env.BACKUP_SECRET;
 if (!BACKUP_SECRET) {
     throw new Error("BACKUP_SECRET is required");
 }
-
+const LVN_ENCRYPTION_KEY = process.env.LVN_ENCRYPTION_KEY;
+if (!LVN_ENCRYPTION_KEY) {
+    throw new Error("LVN_ENCRYPTION_KEY is required.");
+}
 const axios = require("axios");
 const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
@@ -87,34 +89,23 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
         "https://adesportstorres-v2.web.app"
     ];
 
-app.use(cors({
+app.options('*', cors({
     origin: function (origin, callback) {
-        // Allow requests with no origin (mobile apps, curl, server-to-server)
         if (!origin) return callback(null, true);
-
-        // Clean the origin (remove trailing spaces, normalize)
         const cleanOrigin = origin.trim();
-
-        // Check if origin matches allowed list
         const isAllowed = allowedOrigins.some(allowed =>
             cleanOrigin === allowed || cleanOrigin.startsWith(allowed + '/')
         );
-
         if (isAllowed) {
-            // Return the specific origin, not true (required for credentials)
             callback(null, cleanOrigin);
         } else {
-            console.warn(`[CORS BLOCKED] Origin: ${cleanOrigin}`);
             callback(new Error("CORS Policy: Origin not allowed"), false);
         }
     },
     credentials: true,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "x-ai-service-key"],
-    exposedHeaders: ["set-cookie"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "x-csrf-token", "X-Admin-Key", "x-ai-service-key"]
 }));
-
-app.options('*', cors());
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
 app.use((req, res, next) => {
@@ -166,6 +157,8 @@ function markDashboardDirty() {
     dashboardDirty = true;
 }
 let LiveVoterStatus = {};
+let lastAggregateRebuildAt = 0;
+const AGGREGATE_REBUILD_COOLDOWN_MS = 5 * 60 * 1000;
 
 rtdb.ref("voterStatus").on("value", (snap) => {
     LiveVoterStatus = snap.val() || {};
@@ -213,7 +206,7 @@ setInterval(async () => {
 
 }, 30000);
 
-async function validateSelections(selections) {
+async function validateSelections(selections, grade) {
     let candidateMap = GlobalCache.candidates;
 
     if (!candidateMap || Object.keys(candidateMap).length === 0) {
@@ -225,15 +218,24 @@ async function validateSelections(selections) {
         }
     }
 
+    const allowedRepPosition = getAllowedRepPositionForGrade(grade);
+
     const validated = {};
 
     for (const [position, options] of Object.entries(candidateMap)) {
 
         if (selections[position] === undefined) continue;
 
-        // 🔐 Ensure valid position
         if (!GlobalCache.candidateHashMap[position]) {
             throw new Error(`Invalid position ${position}`);
+        }
+
+        if (MULTI_POSITIONS.includes(position)) {
+            if (!allowedRepPosition || position !== allowedRepPosition) {
+                throw new Error(
+                    `Grade ${grade} voters are not authorised to vote for position ${position}.`
+                );
+            }
         }
 
         const selected = selections[position];
@@ -434,26 +436,25 @@ async function loadVotersStaticCache() {
     try {
         console.log('[CACHE] Loading voters static cache from Firestore...');
 
-        // ONE full-collection read — amortised across all future admin page loads.
-        // ~2700 docs × ~4 fields ≈ very cheap on Blaze.
         const snap = await db.collection("voters").get();
 
         const voters = [];
         snap.forEach(doc => {
             const v = doc.data();
+            const last4 = v.lvnLast4 || (v.lvn ? String(v.lvn).slice(-4) : '????');
+
             voters.push({
-                id: doc.id,                               // hashedLVN — RTDB key
-                lvn: v.lvn || null,                       // raw LVN — admin operations
+                id: doc.id,
+                lvnMasked: `\u2022\u2022\u2022\u2022${last4}`,  
+                lvnLast4: last4,                                   
                 name: v.name || "",
                 grade: v.grade || "",
                 section: v.section || "",
-                // Decrypt once at cache-load time rather than per-request
-                accessCode: v.code ? (decryptAccessCode(v.codeHash) || "ERROR") : null,
+                codeHash: v.codeHash || null,
                 addedAt: v.addedAt ? v.addedAt.toDate().toISOString() : null,
             });
         });
 
-        // Pre-sort by grade → name so slices come out ordered without re-sorting
         voters.sort((a, b) => {
             const gDiff = parseInt(a.grade) - parseInt(b.grade);
             if (gDiff !== 0) return gDiff;
@@ -513,7 +514,7 @@ function requireAIServiceOnly(req, res, next) {
     // Set AI context
     req.user = {
         uid: 'AI_SERVICE',
-        role: 'admin',
+        role: 'ai_service',
         isAIService: true
     };
 
@@ -565,6 +566,29 @@ async function saveAggregateDashboard() {
     } catch (e) {
         console.error("Save aggregate failed:", e);
         return false;
+    }
+}
+
+function incrementDashboardMemory(selections, grade) {
+    if (!GlobalCache.dashboard?.leaderboard) return;
+
+    for (const [position, raw] of Object.entries(selections || {})) {
+        const ids = Array.isArray(raw) ? raw : [raw];
+
+        const list = GlobalCache.dashboard.leaderboard[position];
+        if (!Array.isArray(list)) continue;
+
+        for (const id of ids) {
+            const row = list.find(x => String(x.id) === String(id));
+            if (!row) continue;
+
+            row.votes = (row.votes || 0) + 1;
+
+            const key = `votes_${grade}`;
+            row.breakdown[key] = (row.breakdown[key] || 0) + 1;
+        }
+
+        list.sort((a, b) => (b.votes || 0) - (a.votes || 0));
     }
 }
 
@@ -1568,6 +1592,52 @@ function hashLVN(lvn) {
         .digest("hex");
 }
 
+const _LVN_ENC_KEY = crypto.scryptSync(
+    LVN_ENCRYPTION_KEY,
+    'tsf-lvn-enc-salt-v1', 
+    32                       
+);
+
+function encryptLVN(lvn) {
+    if (!lvn) return null;
+    try {
+        const iv = crypto.randomBytes(12);           
+        const cipher = crypto.createCipheriv('aes-256-gcm', _LVN_ENC_KEY, iv);
+        const ciphertext = Buffer.concat([
+            cipher.update(String(lvn).trim(), 'utf8'),
+            cipher.final()
+        ]);
+        const authTag = cipher.getAuthTag();           
+        return [
+            iv.toString('hex'),
+            authTag.toString('hex'),
+            ciphertext.toString('hex')
+        ].join(':');
+    } catch (e) {
+        console.error('[LVN ENCRYPT] Failed:', e.message);
+        return null;
+    }
+}
+
+function decryptLVN(encryptedBlob) {
+    if (!encryptedBlob || typeof encryptedBlob !== 'string') return null;
+    try {
+        const parts = encryptedBlob.split(':');
+        if (parts.length !== 3) return null;
+        const [ivHex, authTagHex, ciphertextHex] = parts;
+        const iv = Buffer.from(ivHex, 'hex');
+        const authTag = Buffer.from(authTagHex, 'hex');
+        const ciphertext = Buffer.from(ciphertextHex, 'hex');
+        if (iv.length !== 12 || authTag.length !== 16) return null;
+        const decipher = crypto.createDecipheriv('aes-256-gcm', _LVN_ENC_KEY, iv);
+        decipher.setAuthTag(authTag);
+        const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+        return plaintext.toString('utf8');
+    } catch (e) {
+        return null;
+    }
+}
+
 // --- GRADE-LEVEL REP VOTING RULE ---
 function getAllowedRepPositionForGrade(grade) {
     const g = parseInt(String(grade), 10);
@@ -1618,6 +1688,15 @@ const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: "Too many admin requests. Please try again later." },
+});
+
+const revealLvnLimiter = rateLimit({
+    windowMs: 60 * 1000,     // 1 minute window
+    max: 10,                  // max 20 reveals/min per IP (rare, on-demand use only)
+    message: { error: "Too many LVN reveal requests. Please slow down." },
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.ip,
 });
 
 const adminLoginLimiter = rateLimit({
@@ -1688,6 +1767,7 @@ async function checkAbuse(ip) {
         const logs = await db.collection("security_logs")
             .where("ip", "==", ip)
             .where("timestamp", ">", admin.firestore.Timestamp.fromMillis(Date.now() - 60000))
+            .limit(12)
             .get();
 
         if (logs.size > 10) {
@@ -2120,12 +2200,6 @@ async function purgeElectionData() {
     await deleteCollectionInBatches(securityLogsRef);
 }
 
-// --- CACHE INIT MIDDLEWARE ---
-app.use(async (req, res, next) => {
-    await ensureSystemReady();
-    next();
-});
-
 let initPromise = null;
 
 async function ensureSystemReady() {
@@ -2308,6 +2382,7 @@ async function detectVotingAnomalies(req, voterId) {
         const deviceId = req.headers["user-agent"] || "unknown";
         const deviceVotes = await db.collection("votes")
             .where("device", "==", deviceId)
+            .limit(6)
             .get();
 
         const uniqueVoters = new Set();
@@ -2396,19 +2471,22 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         isValidPass = await bcrypt.compare(password, process.env.ADMIN_HASH);
     }
 
-    // ✅ GATE: reject before any token is issued
     if (!isValidUser || !isValidPass) {
         await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { username });
-        // Constant-time delay prevents timing oracle on username enumeration
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
     const adminJti = crypto.randomBytes(16).toString("hex");
+    // Generate CSRF token — embedded in JWT, returned in body for the admin panel to store
+    // and attach as X-CSRF-Token header on every mutation request.
+    const adminCsrfToken = crypto.randomBytes(32).toString('hex');
+
     const token = jwt.sign({
         uid: process.env.ADMIN_USER,
         role: "admin",
         jti: adminJti,
+        csrfToken: adminCsrfToken,
         iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "1h" });
 
@@ -2422,7 +2500,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
 
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
 
-    res.json({ success: true });
+    res.json({ success: true, csrfToken: adminCsrfToken });
 });
 
 app.post("/admin/logout", async (req, res) => {
@@ -2696,7 +2774,7 @@ async function verifyHashChain(votesSnapParam = null) {
             } else {
                 // 🔐 Verify current hash only if prevHash is valid
                 const expectedHash = crypto.createHash("sha256")
-                    .update(vote.receipt + vote.prevHash)
+                    .update(vote.receipt + vote.prevHash + stableStringify(vote.selections || {}))
                     .digest("hex");
 
                 if (vote.hash !== expectedHash) {
@@ -2745,7 +2823,7 @@ async function monitorIntegrity() {
         );
     }
 }
-setInterval(monitorIntegrity, 5 * 60 * 1000);
+setInterval(monitorIntegrity, 30 * 60 * 1000);
 
 app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, res) => {
     try {
@@ -2919,7 +2997,6 @@ app.post("/verify", loginLimiter, async (req, res) => {
             success: true,
             name: d.name,
             grade: d.grade,
-            token: sessionToken,
             csrfToken,
             isQueue,
             ...(isQueue && { queueKey: hashedLVN })
@@ -3128,7 +3205,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
             return res.status(409).json({ error: "Duplicate request detected." });
         }
 
-        const validatedSelections = await validateSelections(selections);
+        const validatedSelections = await validateSelections(selections, grade);
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const chainRef = db.collection("_meta").doc("chain_head");
@@ -3200,7 +3277,7 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
         });
 
         incrementDashboardMemory(validatedSelections, grade);
-        await saveAggregateDashboard();
+        markDashboardDirty();
 
         res.json({
             success: true,
@@ -3354,10 +3431,22 @@ async function rebuildAggregates() {
 }
 
 setInterval(async () => {
-    const result = await verifyAggregateConsistency();
+    try {
+        const result = await verifyAggregateConsistency();
 
-    if (!result.valid) {
-        await rebuildAggregates();
+        if (!result.valid) {
+            const now = Date.now();
+            if (now - lastAggregateRebuildAt < AGGREGATE_REBUILD_COOLDOWN_MS) {
+                // Mismatch is likely a dirty-window artefact from an in-flight vote.
+                // Do not rebuild until cooldown expires.
+                return;
+            }
+            lastAggregateRebuildAt = now;
+            console.log('[AGGREGATE] Mismatch confirmed after cooldown — rebuilding...');
+            await rebuildAggregates();
+        }
+    } catch (e) {
+        console.error('[AGGREGATE] Consistency check error:', e);
     }
 }, 60000);
 
@@ -3421,7 +3510,13 @@ app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, 
 });
 
 // --- ADMIN ROUTES ---
-app.use("/admin", requireAuth, requireRole("admin"), adminLimiter);
+app.use("/admin", requireAuth, requireRole("admin"), adminLimiter, (req, res, next) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        if (req.path === '/logout') return next();
+        return verifyCSRF(req, res, next);
+    }
+    next();
+});
 
 app.get("/admin/voters", async (req, res) => {
     try {
@@ -3429,7 +3524,6 @@ app.get("/admin/voters", async (req, res) => {
             while (VotersStaticCache.isLoading) {
                 await new Promise(r => setTimeout(r, 25));
             }
-
             if (VotersStaticCache.data.length === 0) {
                 await loadVotersStaticCache();
             }
@@ -3450,7 +3544,7 @@ app.get("/admin/voters", async (req, res) => {
         if (search) {
             filtered = filtered.filter(v =>
                 (v.name || "").toLowerCase().includes(search) ||
-                (v.lvn || "").toLowerCase().includes(search) ||
+                (v.lvnLast4 || "").toLowerCase().includes(search) ||  // search by last 4 digits
                 (v.section || "").toLowerCase().includes(search)
             );
         }
@@ -3463,14 +3557,17 @@ app.get("/admin/voters", async (req, res) => {
 
         const voters = slice.map(v => {
             const s = LiveVoterStatus[v.id] || {};
+            const accessCode = v.codeHash
+                ? (decryptAccessCode(v.codeHash) || "ERROR")
+                : null;
 
             return {
                 id: v.id,
-                lvn: v.lvn,
+                lvnMasked: v.lvnMasked,          // "••••1234" — no plaintext LVN
                 name: v.name,
                 grade: v.grade,
                 section: v.section,
-                code: v.accessCode,
+                code: accessCode,
                 hasVoted: s.hasVoted === true,
                 isMissed: s.isMissed === true,
                 integrityStatus: s.integrityStatus || "PENDING",
@@ -3493,10 +3590,7 @@ app.get("/admin/voters", async (req, res) => {
 
     } catch (e) {
         console.error("GET /admin/voters error:", e);
-
-        return res.status(500).json({
-            error: "Failed to fetch voters"
-        });
+        return res.status(500).json({ error: "Failed to fetch voters" });
     }
 });
 
@@ -3570,6 +3664,8 @@ app.post("/admin/voters/add", async (req, res) => {
                 const voterRef = db.collection("voters").doc(hashedLVN);
                 batch.set(voterRef, {
                     lvn: lvn,
+                    lvnEncrypted: encryptLVN(lvn), 
+                    lvnLast4: lvn.slice(-4),  
                     name: cleanName,
                     grade: targetGrade,
                     section: section.toUpperCase(),
@@ -3596,6 +3692,64 @@ app.post("/admin/voters/add", async (req, res) => {
         res.json({ success: true, message: `Processed ${names.length}. Promoted/Updated: ${updatedCount}, New: ${addedCount}`, accessCode: accessCode });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+app.get("/admin/voters/reveal-lvn/:id", revealLvnLimiter, async (req, res) => {
+    try {
+        const id = sanitizeInput(req.params.id || '');
+
+        // Voter doc IDs are 64-char lowercase hex strings (hashedLVN)
+        if (!id || !/^[a-f0-9]{64}$/.test(id)) {
+            return res.status(400).json({ error: "Invalid voter ID." });
+        }
+
+        const voterRef = db.collection("voters").doc(id);
+        const voterSnap = await voterRef.get();
+
+        if (!voterSnap.exists) {
+            return res.status(404).json({ error: "Voter not found." });
+        }
+
+        const data = voterSnap.data();
+        let lvn = null;
+        let source = 'unknown';
+
+        // ── Primary path: decrypt from encrypted blob ──
+        if (data.lvnEncrypted) {
+            lvn = decryptLVN(data.lvnEncrypted);
+            if (!lvn) {
+                // Decryption failure (bad key or corrupt blob) — never fall through
+                console.error(`[REVEAL] Decryption failed for voter ${id}`);
+                return res.status(500).json({
+                    error: "LVN decryption failed. Check LVN_ENCRYPTION_KEY or contact developer."
+                });
+            }
+            source = 'encrypted';
+        }
+
+        // ── Legacy fallback: plaintext lvn field (old docs pre-migration) ──
+        if (!lvn && data.lvn) {
+            lvn = data.lvn;
+            source = 'plaintext_legacy';
+        }
+
+        if (!lvn) {
+            return res.status(404).json({ error: "LVN not available for this voter." });
+        }
+
+        // Audit — log the action but NEVER log the plaintext LVN value itself
+        await logAdminAction(req, "ADMIN_REVEAL_LVN", {
+            voterId: id,
+            voterName: data.name || "Unknown",
+            source,
+        });
+
+        return res.json({ lvn });
+
+    } catch (e) {
+        console.error("[REVEAL LVN] Unexpected error:", e);
+        return res.status(500).json({ error: "Failed to reveal LVN." });
     }
 });
 
@@ -3681,6 +3835,8 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
             batch.set(voterRef, {
                 lvn: lvn,
+                lvnEncrypted: encryptLVN(lvn), 
+                lvnLast4: lvn.slice(-4),  
                 name: cleanName,
                 nameKey: cleanName,
                 grade: targetGrade,
@@ -3728,81 +3884,78 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
 app.post("/admin/voters/delete", async (req, res) => {
     try {
-        const lvn = sanitizeInput(req.body.lvn || '');
+        const rawId  = sanitizeInput(req.body.id  || '');
+        const rawLvn = sanitizeInput(req.body.lvn || '');
 
-        if (!lvn) {
-            return res.status(400).json({
-                error: "LVN required"
-            });
+        let docId;
+        if (rawId && /^[a-f0-9]{64}$/.test(rawId)) {
+            // Preferred: caller passes the voter doc ID directly (hashedLVN)
+            docId = rawId;
+        } else if (rawLvn) {
+            // Legacy fallback: hash the provided LVN
+            docId = hashLVN(rawLvn);
+        } else {
+            return res.status(400).json({ error: "Voter ID required." });
         }
 
-        const hashedLVN = hashLVN(lvn);
-
-        const voterRef = db.collection("voters").doc(hashedLVN);
-        const statusRef = rtdb.ref(`voterStatus/${hashedLVN}`);
+        const voterRef  = db.collection("voters").doc(docId);
+        const statusRef = rtdb.ref(`voterStatus/${docId}`);
 
         const voterSnap = await voterRef.get();
-
         if (!voterSnap.exists) {
-            return res.status(404).json({
-                error: "Voter not found."
-            });
+            return res.status(404).json({ error: "Voter not found." });
         }
 
         const voterData = voterSnap.data() || {};
-
-        // 🔥 Check both Firestore + RTDB live status
-        const liveSnap = await statusRef.once("value");
+        const liveSnap  = await statusRef.once("value");
         const liveStatus = liveSnap.val() || {};
 
         const alreadyVoted =
             voterData.hasVoted === true ||
             liveStatus.hasVoted === true;
 
-        // 🚫 Block deletion if already voted
         if (alreadyVoted) {
             return res.status(409).json({
                 error:
-                    "Cannot remove a voter that has already been voted. " +
+                    "Cannot remove a voter that has already voted. " +
                     "If you want to change details proceed on " +
                     "https://currentLinktheUserwason/tools/system/admin/utilities/changeDetails.html"
             });
         }
 
-        // ✅ Safe delete (not voted)
         await voterRef.delete();
-
-        // Remove RTDB live status if exists
         await statusRef.remove();
-
-        // Refresh static cache
         await invalidateVotersCache();
 
         await logAdminAction(req, "VOTER_DELETE", {
-            lvn: "***"
+            voterId: docId,
+            voterName: voterData.name || "Unknown"
         });
 
-        return res.json({
-            success: true
-        });
+        return res.json({ success: true });
 
     } catch (e) {
         console.error("Delete voter failed:", e);
-
-        return res.status(500).json({
-            error: "Delete failed"
-        });
+        return res.status(500).json({ error: "Delete failed" });
     }
 });
 
 app.post("/admin/voters/reset", async (req, res) => {
     try {
-        const lvn = sanitizeInput(req.body.lvn || '');
-        if (!lvn) return res.status(400).json({ error: "LVN required" });
-        const hashedLVN = hashLVN(lvn);
+        const rawId  = sanitizeInput(req.body.id  || '');
+        const rawLvn = sanitizeInput(req.body.lvn || '');
+
+        let docId;
+        if (rawId && /^[a-f0-9]{64}$/.test(rawId)) {
+            docId = rawId;
+        } else if (rawLvn) {
+            docId = hashLVN(rawLvn);
+        } else {
+            return res.status(400).json({ error: "Voter ID required." });
+        }
 
         await db.runTransaction(async (t) => {
-            const voterRef = db.collection("voters").doc(hashedLVN);
+            const voterRef = db.collection("voters").doc(docId);
             const voterSnap = await t.get(voterRef);
             if (!voterSnap.exists) throw new Error("VOTER_NOT_FOUND");
 
@@ -3812,8 +3965,6 @@ app.post("/admin/voters/reset", async (req, res) => {
             if (receipt) {
                 const voteSnap = await db.collection("votes")
                     .where("receipt", "==", receipt).limit(1).get();
-
-                // Step 2 — delete it inside the transaction using the known ref
                 if (!voteSnap.empty) {
                     t.delete(voteSnap.docs[0].ref);
                 }
@@ -3826,16 +3977,18 @@ app.post("/admin/voters/reset", async (req, res) => {
             });
         });
 
-        await logAdminAction(req, "VOTER_RESET", { lvn: "***" });
+        await logAdminAction(req, "VOTER_RESET", {
+            voterId: docId
+        });
         res.json({ success: true });
+
     } catch (e) {
         res.status(500).json({ error: "Reset failed" });
     }
 });
 
 
-
-app.post("/admin/purge", async (req, res) => {
+app.post("/admin/purge", requireAdminKey, async (req, res) => {
     try {
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
@@ -3882,7 +4035,7 @@ app.post("/admin/purge", async (req, res) => {
     }
 });
 
-app.post("/admin/restore", async (req, res) => {
+app.post("/admin/restore", requireAdminKey, async (req, res) => {
     try {
         const { backupUrl, backupHash } = req.body;
 
@@ -4148,7 +4301,7 @@ app.post("/admin/delete", async (req, res) => {
     }
 });
 
-app.post("/admin/election/reset", async (req, res) => {
+app.post("/admin/election/reset", requireAdminKey, async (req, res) => {
     const confirmation = sanitizeInput(req.body.confirmation || '');
     if (confirmation !== "DELETE ELECTION DATA") return res.status(403).json({ error: "Security Mismatch." });
     try {
@@ -4768,6 +4921,20 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-});
+(async () => {
+    try {
+        console.log("🔄 Initializing system cache...");
+
+        await ensureSystemReady();
+
+        console.log("✅ System cache ready");
+
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+        });
+
+    } catch (err) {
+        console.error("❌ Startup initialization failed:", err);
+        process.exit(1);
+    }
+})();
