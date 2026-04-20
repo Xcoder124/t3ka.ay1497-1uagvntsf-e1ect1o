@@ -2318,6 +2318,78 @@ app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => 
     }
 });
 
+app.post("/admin/correct-name", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const { lvn, newName, reason } = req.body;
+
+        if (!lvn || !newName) {
+            return res.status(400).json({
+                error: "LVN and newName are required."
+            });
+        }
+
+        const cleanLVN = String(lvn).trim();
+        const cleanName = String(newName)
+            .trim()
+            .toUpperCase()
+            .replace(/\s+/g, " ");
+
+        // Search by LVN
+        const snap = await admin.firestore()
+            .collection("votersData")
+            .where("lvn", "==", cleanLVN)
+            .limit(1)
+            .get();
+
+        if (snap.empty) {
+            return res.status(404).json({
+                error: "LVN not found."
+            });
+        }
+
+        const doc = snap.docs[0];
+        const oldData = doc.data();
+        const oldName = oldData.name || "";
+
+        if (oldName === cleanName) {
+            return res.status(409).json({
+                error: "Name is already the same."
+            });
+        }
+
+        // Update only name
+        await doc.ref.update({
+            name: cleanName,
+            nameCorrectedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Audit log
+        await admin.firestore()
+            .collection("nameCorrections")
+            .add({
+                voterId: doc.id,
+                lvn: cleanLVN,
+                oldName,
+                newName: cleanName,
+                reason: reason || "Manual correction",
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+        return res.json({
+            success: true,
+            lvn: cleanLVN,
+            oldName,
+            newName: cleanName
+        });
+
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({
+            error: "Internal server error."
+        });
+    }
+});
+
 app.get("/admin/test-alert", requireAuth, requireRole("admin"), async (req, res) => {
     await alertManager.createAlert(
         'api_error',
