@@ -210,6 +210,99 @@ function markDashboardDirty() {
     dashboardDirty = true;
 }
 let LiveVoterStatus = {};
+const MOCK_CANDIDATES = [
+    {
+        position: "president",
+        options: [
+            { name: "Juan Dela Cruz", party: "UNITY", image: "", hash: "mock_president_aabbcc11" },
+            { name: "Maria Santos", party: "VISION", image: "", hash: "mock_president_ddeeff22" }
+        ]
+    },
+    {
+        position: "vp",
+        options: [
+            { name: "Carlos Reyes", party: "UNITY", image: "", hash: "mock_vp_aabbcc11" },
+            { name: "Ana Villanueva", party: "VISION", image: "", hash: "mock_vp_ddeeff22" }
+        ]
+    },
+    {
+        position: "secretary",
+        options: [
+            { name: "Liza Bautista", party: "UNITY", image: "", hash: "mock_sec_aabbcc11" },
+            { name: "Jose Torres", party: "VISION", image: "", hash: "mock_sec_ddeeff22" }
+        ]
+    },
+    {
+        position: "treasurer",
+        options: [
+            { name: "Grace Manalo", party: "UNITY", image: "", hash: "mock_tre_aabbcc11" },
+            { name: "Ben Flores", party: "VISION", image: "", hash: "mock_tre_ddeeff22" }
+        ]
+    },
+    {
+        position: "auditor",
+        options: [
+            { name: "Nina Cruz", party: "UNITY", image: "", hash: "mock_aud_aabbcc11" },
+            { name: "Ramon Soriano", party: "VISION", image: "", hash: "mock_aud_ddeeff22" }
+        ]
+    },
+    {
+        position: "pio",
+        options: [
+            { name: "Ella Mendoza", party: "UNITY", image: "", hash: "mock_pio_aabbcc11" },
+            { name: "Mark Tan", party: "VISION", image: "", hash: "mock_pio_ddeeff22" }
+        ]
+    },
+    {
+        position: "protocol",
+        options: [
+            { name: "Cleo Santos", party: "UNITY", image: "", hash: "mock_pro_aabbcc11" },
+            { name: "Felix Aquino", party: "VISION", image: "", hash: "mock_pro_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep7",
+        options: [
+            { name: "Kim Ramos", party: "UNITY", image: "", hash: "mock_rep7_aabbcc11" },
+            { name: "Leo Garcia", party: "VISION", image: "", hash: "mock_rep7_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep8",
+        options: [
+            { name: "Mia Dela Rosa", party: "UNITY", image: "", hash: "mock_rep8_aabbcc11" },
+            { name: "Sam Navarro", party: "VISION", image: "", hash: "mock_rep8_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep9",
+        options: [
+            { name: "Jay Domingo", party: "UNITY", image: "", hash: "mock_rep9_aabbcc11" },
+            { name: "Rosa Pascual", party: "VISION", image: "", hash: "mock_rep9_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep10",
+        options: [
+            { name: "Pia Castillo", party: "UNITY", image: "", hash: "mock_rep10_aabbcc11" },
+            { name: "Noel Esguerra", party: "VISION", image: "", hash: "mock_rep10_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep11",
+        options: [
+            { name: "Ria Evangelista", party: "UNITY", image: "", hash: "mock_rep11_aabbcc11" },
+            { name: "Dave Pangan", party: "VISION", image: "", hash: "mock_rep11_ddeeff22" }
+        ]
+    },
+    {
+        position: "rep12",
+        options: [
+            { name: "Ara Dizon", party: "UNITY", image: "", hash: "mock_rep12_aabbcc11" },
+            { name: "Ivan Lozano", party: "VISION", image: "", hash: "mock_rep12_ddeeff22" }
+        ]
+    }
+];
 let lastAggregateRebuildAt = 0;
 const AGGREGATE_REBUILD_COOLDOWN_MS = 5 * 60 * 1000;
 
@@ -602,22 +695,73 @@ async function loadAggregateDashboard() {
     }
 }
 
+function removeUndefined(obj) {
+    if (Array.isArray(obj)) {
+        return obj.map(removeUndefined);
+    }
+
+    if (obj && typeof obj === "object") {
+        const clean = {};
+
+        for (const key in obj) {
+            if (obj[key] !== undefined) {
+                clean[key] = removeUndefined(obj[key]);
+            }
+        }
+
+        return clean;
+    }
+
+    return obj;
+}
+
 async function saveAggregateDashboard() {
     try {
-        if (!GlobalCache.dashboard) return;
+        if (!GlobalCache?.dashboard) return false;
+        const cleanUndefined = (value) => {
+            if (Array.isArray(value)) {
+                return value
+                    .map(cleanUndefined)
+                    .filter(v => v !== undefined);
+            }
+
+            if (value && typeof value === "object") {
+                const obj = {};
+
+                for (const [key, val] of Object.entries(value)) {
+                    const cleaned = cleanUndefined(val);
+
+                    if (cleaned !== undefined) {
+                        obj[key] = cleaned;
+                    }
+                }
+
+                return obj;
+            }
+
+            return value === undefined ? undefined : value;
+        };
+
+        const payload = {
+            leaderboard: cleanUndefined(
+                GlobalCache.dashboard.leaderboard || {}
+            ),
+
+            stats: cleanUndefined(
+                GlobalCache.dashboard.stats || {}
+            ),
+
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
 
         await db.collection("aggregates")
             .doc("dashboard")
-            .set({
-                leaderboard: GlobalCache.dashboard.leaderboard || {},
-                stats: GlobalCache.dashboard.stats || {},
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
+            .set(payload, { merge: true });
 
         return true;
 
     } catch (e) {
-        console.error("Save aggregate failed:", e);
+        console.error("Save aggregate failed:", e?.message || e);
         return false;
     }
 }
@@ -2684,13 +2828,13 @@ app.get("/settings", async (req, res) => {
         const rtdbStatus = rtdbStatusSnap.val() || {};
         const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
+        const isMockElection = rtdbStatus.isMockElection === true;
 
         // All other fields (activeGrade, sessionTimer, endTime, etc.) still come from Firestore
         const statusData = statusDoc.exists ? statusDoc.data() : {};
         const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
 
-        // Spread Firestore data first, then override the two status fields with RTDB values
-        res.json({ ...config, ...statusData, isLive, isQueue });
+        res.json({ ...config, ...statusData, isLive, isQueue, isMockElection });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -2734,6 +2878,14 @@ app.get("/candidates", async (req, res) => {
         console.error("Candidates route error:", err);
         return res.status(500).json({ error: "Failed to load candidates" });
     }
+});
+
+app.get("/mock/candidates", (req, res) => {
+    if (liveSystemStatus.isMockElection !== true) {
+        return res.status(403).json({ error: "Mock mode is not currently active." });
+    }
+    res.set("Cache-Control", "no-store");
+    return res.json(MOCK_CANDIDATES);
 });
 
 app.get("/dashboard", (req, res) => {
@@ -3023,6 +3175,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const rtdbStatus = rtdbStatusSnap.val() || {};
         const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
+        const isMockElectionLogin = rtdbStatus.isMockElection === true;
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
@@ -3055,6 +3208,43 @@ app.post("/verify", loginLimiter, async (req, res) => {
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 method: "LOGIN_ATTEMPT"
             });
+
+            if (isMockElectionLogin) {
+                const csrfToken = crypto.randomBytes(32).toString('hex');
+                const jti = crypto.randomBytes(16).toString('hex');
+
+                const sessionToken = jwt.sign(
+                    {
+                        uid: hashedLVN,
+                        grade: d.grade,
+                        role: "voter",
+                        csrfToken,
+                        jti,
+                        isMockElection: true          // ← sentinel checked by /vote guard
+                    },
+                    SECRET,
+                    { expiresIn: "60m" }
+                );
+
+                res.cookie("__session", sessionToken, {
+                    httpOnly: true,
+                    secure: true,
+                    sameSite: "none",
+                    path: "/",
+                    maxAge: 60 * 60 * 1000
+                });
+
+                console.log(`[MOCK] ${hashedLVN.slice(0, 8)}... entered simulation`);
+
+                return res.json({
+                    success: true,
+                    name: d.name,
+                    grade: d.grade,
+                    csrfToken,
+                    isQueue: false,   // No queue in mock mode
+                    isMockElection: true
+                });
+            }
 
             const fakeToken = jwt.sign(
                 { uid: hashedLVN, grade: "12", role: "shadow_realm" },
@@ -3317,6 +3507,11 @@ function stableStringify(obj) {
 
 app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
     try {
+        if (req.user?.isMockElection === true || liveSystemStatus.isMockElection === true) {
+            return res.status(403).json({
+                error: "Live voting disabled during mock election."
+            });
+        }
         const hashedLVN = req.user.uid;
         const grade = req.user.grade;
         const { selections, timestamp, nonce } = req.body;
