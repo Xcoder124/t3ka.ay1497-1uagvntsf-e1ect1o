@@ -210,6 +210,7 @@ const STRICT_PROTOCOLS_CACHE_TTL_MS = 30 * 1000;
 const strictProtocolsCache = {
     settings: null,
     devices: null,
+    tokens: null,
     loadedAt: 0
 };
 let dashboardDirty = false;
@@ -505,6 +506,7 @@ function getRepresentativeFirstName(name = '') {
 function invalidateStrictProtocolsCache() {
     strictProtocolsCache.settings = null;
     strictProtocolsCache.devices = null;
+    strictProtocolsCache.tokens = null;
     strictProtocolsCache.loadedAt = 0;
 }
 
@@ -563,6 +565,50 @@ async function getActiveWhitelistedDevices(forceRefresh = false) {
     strictProtocolsCache.devices = devices;
     strictProtocolsCache.loadedAt = now;
     return devices;
+}
+
+async function getPendingWhitelistTokens(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && strictProtocolsCache.tokens && (now - strictProtocolsCache.loadedAt) < STRICT_PROTOCOLS_CACHE_TTL_MS) {
+        return strictProtocolsCache.tokens;
+    }
+
+    const snap = await db.collection("whitelist_tokens")
+        .where("revoked", "==", false)
+        .get();
+
+    const tokens = [];
+    snap.forEach((doc) => {
+        const data = doc.data() || {};
+        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+        const activationLimit = Number(data.activationLimit || 1);
+        const activationCount = Number(data.activationCount || 0);
+        const isUsable = activationCount < activationLimit;
+
+        if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date() || !isUsable) {
+            return;
+        }
+
+        tokens.push({
+            id: doc.id,
+            tokenHash: doc.id,
+            tokenPreview: data.tokenPreview || "----...----",
+            representativeName: data.representativeName || "Unknown Representative",
+            representativeFirstName: data.representativeFirstName || getRepresentativeFirstName(data.representativeName),
+            gradeLevel: data.gradeLevel || "",
+            badgeType: data.badgeType || "trusted_student_device",
+            useFor: data.useFor || "extra_devices",
+            activationLimit,
+            activationCount,
+            expiresAt: expiresAt.toISOString(),
+            createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : null
+        });
+    });
+
+    tokens.sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
+    strictProtocolsCache.tokens = tokens;
+    strictProtocolsCache.loadedAt = now;
+    return tokens;
 }
 
 // ============================================
@@ -5031,6 +5077,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             expiresAt: expiresAt.toISOString()
         });
 
+        invalidateStrictProtocolsCache();
+
         res.json({
             success: true,
             token: rawToken,
@@ -5052,20 +5100,108 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
 
 app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (req, res) => {
     try {
-        const [strictSettings, devices] = await Promise.all([
+        const [strictSettings, devices, pendingTokens] = await Promise.all([
             getStrictProtocolSettings(false),
-            getActiveWhitelistedDevices(false)
+            getActiveWhitelistedDevices(false),
+            getPendingWhitelistTokens(false)
         ]);
+
+        const entries = [
+            ...pendingTokens.map((token) => ({
+                type: "token",
+                id: token.id,
+                representativeName: token.representativeName,
+                representativeFirstName: token.representativeFirstName,
+                deviceName: `${token.representativeFirstName} Device`,
+                tokenPreview: token.tokenPreview,
+                deviceIp: "Awaiting activation",
+                badgeType: token.badgeType,
+                expiresAt: token.expiresAt,
+                status: "Pending Activation"
+            })),
+            ...devices.map((device) => ({
+                type: "device",
+                id: device.id,
+                representativeName: device.representativeName,
+                deviceName: device.deviceName,
+                tokenPreview: device.tokenPreview,
+                deviceIp: device.deviceIp,
+                badgeType: device.badgeType,
+                expiresAt: device.expiresAt,
+                status: "Active"
+            }))
+        ].sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
 
         res.json({
             success: true,
             maxDevices: strictSettings.maxDevices,
             activeCount: devices.length,
-            devices
+            entries
         });
     } catch (e) {
         console.error("[WHITELIST DEVICES]", e);
         res.status(500).json({ error: "Failed to load whitelisted devices." });
+    }
+});
+
+app.post("/admin/whitelist/revoke", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const kind = sanitizeInput(req.body.kind || '');
+        const id = sanitizeInput(req.body.id || '');
+
+        if (!kind || !id || !["token", "device"].includes(kind)) {
+            return res.status(400).json({ error: "A valid whitelist record is required." });
+        }
+
+        if (kind === "token") {
+            const tokenRef = db.collection("whitelist_tokens").doc(id);
+            const tokenSnap = await tokenRef.get();
+            if (!tokenSnap.exists) {
+                return res.status(404).json({ error: "Whitelist token not found." });
+            }
+
+            await tokenRef.set({
+                revoked: true,
+                status: "revoked",
+                revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+                revokedBy: req.user?.uid || "admin"
+            }, { merge: true });
+
+            await logAdminAction(req, "REVOKE_WHITELIST_TOKEN", { tokenHash: id });
+        } else {
+            const deviceRef = db.collection("activated_devices").doc(id);
+            const deviceSnap = await deviceRef.get();
+            if (!deviceSnap.exists) {
+                return res.status(404).json({ error: "Activated device not found." });
+            }
+
+            const deviceData = deviceSnap.data() || {};
+            await deviceRef.set({
+                revoked: true,
+                revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+                revokedBy: req.user?.uid || "admin"
+            }, { merge: true });
+
+            if (deviceData.tokenHash) {
+                await db.collection("whitelist_tokens").doc(deviceData.tokenHash).set({
+                    revoked: true,
+                    status: "revoked",
+                    revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    revokedBy: req.user?.uid || "admin"
+                }, { merge: true });
+            }
+
+            await logAdminAction(req, "REVOKE_WHITELIST_DEVICE", {
+                deviceId: id,
+                tokenHash: deviceData.tokenHash || null
+            });
+        }
+
+        invalidateStrictProtocolsCache();
+        res.json({ success: true });
+    } catch (e) {
+        console.error("[WHITELIST REVOKE]", e);
+        res.status(500).json({ error: "Failed to revoke whitelist entry." });
     }
 });
 
@@ -5227,11 +5363,6 @@ app.post("/activate/:token", async (req, res) => {
             };
         });
 
-        return res.json({
-            success: true,
-            ...responsePayload
-        });
-
         strictProtocolsCache.devices = Array.isArray(strictProtocolsCache.devices)
             ? [
                 ...strictProtocolsCache.devices.filter(device => device.id !== deviceFingerprint),
@@ -5249,7 +5380,15 @@ app.post("/activate/:token", async (req, res) => {
                 }
             ].sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt))
             : null;
+        strictProtocolsCache.tokens = Array.isArray(strictProtocolsCache.tokens)
+            ? strictProtocolsCache.tokens.filter(token => token.tokenHash !== tokenHash)
+            : null;
         strictProtocolsCache.loadedAt = Date.now();
+
+        return res.json({
+            success: true,
+            ...responsePayload
+        });
 
     } catch (e) {
         const status = failureCode || 500;
