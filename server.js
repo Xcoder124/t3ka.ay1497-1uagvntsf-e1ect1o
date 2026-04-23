@@ -445,6 +445,30 @@ function generateVoteSignature(selections, timestamp, nonce) {
         .digest("hex");
 }
 
+function toBase64Url(buffer) {
+    return buffer.toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+}
+
+function hashWhitelistToken(rawToken) {
+    return crypto.createHash("sha256").update(rawToken).digest("hex");
+}
+
+function getManilaDateKey(date) {
+    return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Manila",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).format(date);
+}
+
+function buildWhitelistToken() {
+    return `TSF-WL-${toBase64Url(crypto.randomBytes(32))}`;
+}
+
 // ============================================
 // 🔐 ANTI-REPLAY: FIRESTORE-BACKED NONCE STORE
 // ============================================
@@ -4778,6 +4802,115 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: "Failed to update election status" });
+    }
+});
+
+app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const representativeName = sanitizeInput(req.body.representativeName || '');
+        const gradeLevel = sanitizeInput(String(req.body.gradeLevel || ''));
+        const useFor = sanitizeInput(req.body.useFor || '');
+        const badgeType = sanitizeInput(req.body.badgeType || '');
+        const expiresAtRaw = req.body.expiresAt;
+
+        const allowedGrades = new Set(["7", "8", "9", "10", "11", "12"]);
+        const allowedBadgeTypes = new Set(["trusted_student_device", "facility_voting_device"]);
+
+        if (!representativeName) {
+            return res.status(400).json({ error: "Representative name is required." });
+        }
+
+        if (!allowedGrades.has(gradeLevel)) {
+            return res.status(400).json({ error: "A valid grade level from G7 to G12 is required." });
+        }
+
+        if (useFor !== "extra_devices") {
+            return res.status(400).json({ error: "Whitelist tokens may only be issued for extra devices." });
+        }
+
+        if (!allowedBadgeTypes.has(badgeType)) {
+            return res.status(400).json({ error: "A valid badge type is required." });
+        }
+
+        const expiresAt = new Date(expiresAtRaw);
+        if (Number.isNaN(expiresAt.getTime())) {
+            return res.status(400).json({ error: "A valid token expiration time is required." });
+        }
+
+        const now = new Date();
+        const maxExpiry = new Date(now.getTime() + (5 * 60 * 60 * 1000));
+
+        if (expiresAt <= now) {
+            return res.status(400).json({ error: "Token expiration must be in the future." });
+        }
+
+        if (expiresAt > maxExpiry) {
+            return res.status(400).json({ error: "Token expiration cannot exceed a 5-hour validity window." });
+        }
+
+        if (getManilaDateKey(expiresAt) !== getManilaDateKey(now)) {
+            return res.status(400).json({ error: "Token expiration must remain within the current calendar day." });
+        }
+
+        const rawToken = buildWhitelistToken();
+        const tokenHash = hashWhitelistToken(rawToken);
+        const tokenPreview = `${rawToken.slice(0, 4)}...${rawToken.slice(-4)}`;
+
+        await db.collection("whitelist_tokens").doc(tokenHash).set({
+            tokenHash,
+            tokenPreview,
+            representativeName,
+            gradeLevel,
+            useFor,
+            badgeType,
+            status: "active",
+            revoked: false,
+            queueBypass: true,
+            queueBypassOnly: true,
+            activationLimit: 1,
+            activationCount: 0,
+            assignedRepresentative: {
+                name: representativeName,
+                gradeLevel
+            },
+            policy: {
+                validDuringElectionHours: true,
+                expiresAutomatically: true,
+                singleActivationOnly: true,
+                queueBypassOnly: true
+            },
+            createdBy: req.user?.uid || "admin",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            activatedAt: null,
+            lastUsedAt: null,
+            expiresAt: admin.firestore.Timestamp.fromDate(expiresAt)
+        });
+
+        await logAdminAction(req, "CREATE_WHITELIST_TOKEN", {
+            tokenPreview,
+            representativeName,
+            gradeLevel,
+            useFor,
+            badgeType,
+            activationLimit: 1,
+            expiresAt: expiresAt.toISOString()
+        });
+
+        res.json({
+            success: true,
+            token: rawToken,
+            tokenPreview,
+            representativeName,
+            gradeLevel,
+            useFor,
+            badgeType,
+            expiresAt: expiresAt.toISOString(),
+            activationLimit: 1
+        });
+
+    } catch (e) {
+        console.error("[WHITELIST TOKEN CREATE]", e);
+        res.status(500).json({ error: "Failed to create whitelist token." });
     }
 });
 
