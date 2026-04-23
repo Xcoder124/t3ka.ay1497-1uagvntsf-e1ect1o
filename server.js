@@ -469,6 +469,27 @@ function buildWhitelistToken() {
     return `TSF-WL-${toBase64Url(crypto.randomBytes(32))}`;
 }
 
+function getAssistedDeviceFingerprint(req) {
+    const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return crypto.createHash("sha256")
+        .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
+        .digest("hex");
+}
+
+function describeClientDevice(userAgent = '') {
+    const ua = String(userAgent || '');
+
+    if (/iphone/i.test(ua)) return "Apple iPhone";
+    if (/ipad/i.test(ua)) return "Apple iPad";
+    if (/samsung/i.test(ua)) return "Samsung Mobile Device";
+    if (/vivo/i.test(ua)) return "vivo Mobile Device";
+    if (/oppo/i.test(ua)) return "OPPO Mobile Device";
+    if (/huawei/i.test(ua)) return "Huawei Mobile Device";
+    if (/android/i.test(ua)) return "Android Mobile Device";
+
+    return "Representative Device";
+}
+
 // ============================================
 // 🔐 ANTI-REPLAY: FIRESTORE-BACKED NONCE STORE
 // ============================================
@@ -3167,14 +3188,14 @@ app.post("/verify", loginLimiter, async (req, res) => {
 
         const hashedLVN = hashLVN(lvn);
 
-        const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
-
-        const deviceFingerprint = crypto.createHash("sha256")
-            .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
-            .digest("hex");
+        const deviceFingerprint = getAssistedDeviceFingerprint(req);
 
         const deviceRef = db.collection("device_tracking").doc(deviceFingerprint);
-        const deviceSnap = await deviceRef.get();
+        const assistedDeviceRef = db.collection("activated_devices").doc(deviceFingerprint);
+        const [deviceSnap, assistedDeviceSnap] = await Promise.all([
+            deviceRef.get(),
+            assistedDeviceRef.get()
+        ]);
 
         if (deviceSnap.exists) {
             const usedLvns = deviceSnap.data().lvns || [];
@@ -3200,6 +3221,15 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
         const isMockElectionLogin = rtdbStatus.isMockElection === true;
+        const assistedDeviceData = assistedDeviceSnap.exists ? (assistedDeviceSnap.data() || {}) : null;
+        const assistedDeviceExpiry = assistedDeviceData?.expiresAt?.toDate ? assistedDeviceData.expiresAt.toDate() : new Date(assistedDeviceData?.expiresAt || 0);
+        const hasQueueBypassDevice =
+            assistedDeviceData &&
+            assistedDeviceData.revoked !== true &&
+            assistedDeviceData.queueBypass === true &&
+            assistedDeviceExpiry instanceof Date &&
+            !Number.isNaN(assistedDeviceExpiry.getTime()) &&
+            assistedDeviceExpiry > new Date();
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
@@ -3316,7 +3346,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
 
         // isQueue already derived from RTDB above
-        if (isQueue) {
+        if (isQueue && !hasQueueBypassDevice) {
             await joinQueue(hashedLVN, d.grade || activeGrade);
         }
 
@@ -3354,8 +3384,10 @@ app.post("/verify", loginLimiter, async (req, res) => {
             name: d.name,
             grade: d.grade,
             csrfToken,
-            isQueue,
-            ...(isQueue && { queueKey: hashedLVN })
+            isQueue: isQueue && !hasQueueBypassDevice,
+            queueBypass: hasQueueBypassDevice,
+            assistedDevice: hasQueueBypassDevice,
+            ...(isQueue && !hasQueueBypassDevice && { queueKey: hashedLVN })
         });
 
     } catch (e) {
@@ -4911,6 +4943,146 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
     } catch (e) {
         console.error("[WHITELIST TOKEN CREATE]", e);
         res.status(500).json({ error: "Failed to create whitelist token." });
+    }
+});
+
+app.post("/activate/:token", async (req, res) => {
+    let failureCode = 500;
+
+    try {
+        const rawToken = String(req.params.token || '').trim();
+        if (!rawToken) {
+            failureCode = 404;
+            throw new Error("Token not found.");
+        }
+
+        const tokenHash = hashWhitelistToken(rawToken);
+        const tokenRef = db.collection("whitelist_tokens").doc(tokenHash);
+        const deviceFingerprint = getAssistedDeviceFingerprint(req);
+        const deviceRef = db.collection("activated_devices").doc(deviceFingerprint);
+        const deviceIp = req.ip || req.headers["x-forwarded-for"] || "Unknown";
+        const deviceName = describeClientDevice(req.headers["user-agent"] || "");
+
+        let responsePayload = null;
+
+        await db.runTransaction(async (tx) => {
+            const [tokenSnap, deviceSnap] = await Promise.all([
+                tx.get(tokenRef),
+                tx.get(deviceRef)
+            ]);
+
+            if (!tokenSnap.exists) {
+                failureCode = 404;
+                throw new Error("Token not found.");
+            }
+
+            const tokenData = tokenSnap.data() || {};
+            const expiresAt = tokenData.expiresAt?.toDate ? tokenData.expiresAt.toDate() : new Date(tokenData.expiresAt);
+            const now = new Date();
+
+            if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime())) {
+                failureCode = 410;
+                throw new Error("Token is no longer valid.");
+            }
+
+            const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
+            const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
+            const isExistingActivationValid =
+                existingDevice &&
+                existingDevice.tokenHash === tokenHash &&
+                existingDevice.revoked !== true &&
+                existingExpiry instanceof Date &&
+                !Number.isNaN(existingExpiry.getTime()) &&
+                existingExpiry > now;
+
+            if (isExistingActivationValid) {
+                responsePayload = {
+                    activated: true,
+                    alreadyActive: true,
+                    queueBypass: existingDevice.queueBypass === true,
+                    tokenPreview: tokenData.tokenPreview,
+                    representativeName: tokenData.representativeName,
+                    gradeLevel: tokenData.gradeLevel,
+                    badgeType: tokenData.badgeType,
+                    useFor: tokenData.useFor,
+                    activatedAt: existingDevice.activatedAt?.toDate ? existingDevice.activatedAt.toDate().toISOString() : null,
+                    expiresAt: existingExpiry.toISOString(),
+                    deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
+                    deviceIp: existingDevice.deviceIp || deviceIp,
+                    deviceName: existingDevice.deviceName || deviceName
+                };
+                return;
+            }
+
+            if (tokenData.revoked === true) {
+                failureCode = 403;
+                throw new Error("This activation token has been revoked.");
+            }
+
+            if (expiresAt <= now) {
+                failureCode = 410;
+                throw new Error("This activation token has already expired.");
+            }
+
+            const activationLimit = Number(tokenData.activationLimit || 1);
+            const activationCount = Number(tokenData.activationCount || 0);
+
+            if (activationCount >= activationLimit) {
+                failureCode = 403;
+                throw new Error("This activation token has already reached its activation limit.");
+            }
+
+            tx.set(deviceRef, {
+                deviceFingerprint,
+                deviceName,
+                deviceIp,
+                representativeName: tokenData.representativeName,
+                representativeGradeLevel: tokenData.gradeLevel,
+                tokenHash,
+                tokenPreview: tokenData.tokenPreview,
+                badgeType: tokenData.badgeType,
+                useFor: tokenData.useFor,
+                queueBypass: true,
+                revoked: false,
+                activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastValidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                expiresAt: tokenData.expiresAt,
+                source: "whitelist_token"
+            }, { merge: true });
+
+            const nextActivationCount = activationCount + 1;
+            tx.update(tokenRef, {
+                activationCount: nextActivationCount,
+                activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
+                status: nextActivationCount >= activationLimit ? "consumed" : "active"
+            });
+
+            responsePayload = {
+                activated: true,
+                alreadyActive: false,
+                queueBypass: true,
+                tokenPreview: tokenData.tokenPreview,
+                representativeName: tokenData.representativeName,
+                gradeLevel: tokenData.gradeLevel,
+                badgeType: tokenData.badgeType,
+                useFor: tokenData.useFor,
+                activatedAt: now.toISOString(),
+                expiresAt: expiresAt.toISOString(),
+                deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
+                deviceIp,
+                deviceName
+            };
+        });
+
+        return res.json({
+            success: true,
+            ...responsePayload
+        });
+
+    } catch (e) {
+        const status = failureCode || 500;
+        return res.status(status).json({ error: e.message || "Activation failed." });
     }
 });
 
