@@ -4688,6 +4688,7 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
         const activeGrade = req.body.activeGrade;
         const isLive = req.body.isLive;
         const isQueue = req.body.isQueue;
+        const isMockElection = req.body.isMockElection;
 
         const firestoreUpdate = {};
         const rtdbUpdates = {};
@@ -4701,6 +4702,10 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
 
         if (typeof isQueue === 'boolean') {
             rtdbUpdates["status/isQueue"] = isQueue;
+        }
+
+        if (typeof isMockElection === 'boolean') {
+            rtdbUpdates["status/isMockElection"] = isMockElection;
         }
 
         // =========================
@@ -4743,6 +4748,10 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
             GlobalCache.dashboard.isQueue = isQueue;
         }
 
+        if (typeof isMockElection === 'boolean') {
+            GlobalCache.dashboard.isMockElection = isMockElection;
+        }
+
         if (activeGrade !== undefined) {
             GlobalCache.dashboard.activeGrade = activeGrade;
         }
@@ -4753,6 +4762,7 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
         await logAdminAction(req, "SET_ELECTION_SESSION", {
             isLive,
             isQueue,
+            isMockElection,
             activeGrade,
             voterTime
         });
@@ -4761,6 +4771,7 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
             success: true,
             isLive,
             isQueue,
+            isMockElection,
             activeGrade
         });
 
