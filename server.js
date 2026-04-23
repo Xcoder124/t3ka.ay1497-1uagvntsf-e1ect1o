@@ -204,6 +204,14 @@ let liveSystemStatus = {
     isQueue: false,
     endTime: null
 };
+const STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES = 30;
+const STRICT_PROTOCOLS_MAX_LIMIT = 60;
+const STRICT_PROTOCOLS_CACHE_TTL_MS = 30 * 1000;
+const strictProtocolsCache = {
+    settings: null,
+    devices: null,
+    loadedAt: 0
+};
 let dashboardDirty = false;
 let dashboardSaving = false;
 function markDashboardDirty() {
@@ -488,6 +496,73 @@ function describeClientDevice(userAgent = '') {
     if (/android/i.test(ua)) return "Android Mobile Device";
 
     return "Representative Device";
+}
+
+function getRepresentativeFirstName(name = '') {
+    return String(name || '').trim().split(/\s+/).filter(Boolean)[0] || 'Representative';
+}
+
+function invalidateStrictProtocolsCache() {
+    strictProtocolsCache.settings = null;
+    strictProtocolsCache.devices = null;
+    strictProtocolsCache.loadedAt = 0;
+}
+
+async function getStrictProtocolSettings(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && strictProtocolsCache.settings && (now - strictProtocolsCache.loadedAt) < STRICT_PROTOCOLS_CACHE_TTL_MS) {
+        return strictProtocolsCache.settings;
+    }
+
+    const snap = await db.collection("settings").doc("strictProtocols").get();
+    const data = snap.exists ? (snap.data() || {}) : {};
+    const maxDevicesRaw = Number(data.maxDevices);
+    const maxDevices = Number.isFinite(maxDevicesRaw)
+        ? Math.min(STRICT_PROTOCOLS_MAX_LIMIT, Math.max(1, maxDevicesRaw))
+        : STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES;
+
+    const settings = { maxDevices };
+    strictProtocolsCache.settings = settings;
+    strictProtocolsCache.loadedAt = now;
+    return settings;
+}
+
+async function getActiveWhitelistedDevices(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && strictProtocolsCache.devices && (now - strictProtocolsCache.loadedAt) < STRICT_PROTOCOLS_CACHE_TTL_MS) {
+        return strictProtocolsCache.devices;
+    }
+
+    const snap = await db.collection("activated_devices")
+        .where("revoked", "==", false)
+        .get();
+
+    const devices = [];
+    snap.forEach((doc) => {
+        const data = doc.data() || {};
+        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+        if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+            return;
+        }
+
+        devices.push({
+            id: doc.id,
+            deviceName: data.deviceName || "Representative Device",
+            representativeName: data.representativeName || "Unknown Representative",
+            representativeGradeLevel: data.representativeGradeLevel || "",
+            tokenPreview: data.tokenPreview || "----...----",
+            deviceIp: data.deviceIp || "Unknown",
+            badgeType: data.badgeType || "trusted_student_device",
+            queueBypass: data.queueBypass === true,
+            activatedAt: data.activatedAt?.toDate ? data.activatedAt.toDate().toISOString() : null,
+            expiresAt: expiresAt.toISOString()
+        });
+    });
+
+    devices.sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
+    strictProtocolsCache.devices = devices;
+    strictProtocolsCache.loadedAt = now;
+    return devices;
 }
 
 // ============================================
@@ -2863,9 +2938,10 @@ app.get("/admin/verify", requireAuth, requireRole("admin"), (req, res) => {
 app.get("/settings", async (req, res) => {
     try {
         // Fetch Firestore config docs and RTDB status in parallel
-        const [configDoc, statusDoc, rtdbStatusSnap] = await Promise.all([
+        const [configDoc, statusDoc, strictProtocolsDoc, rtdbStatusSnap] = await Promise.all([
             db.collection("settings").doc("config").get(),
             db.collection("settings").doc("electionStatus").get(),
+            db.collection("settings").doc("strictProtocols").get(),
             rtdb.ref("status").once("value")
         ]);
 
@@ -2878,8 +2954,9 @@ app.get("/settings", async (req, res) => {
         // All other fields (activeGrade, sessionTimer, endTime, etc.) still come from Firestore
         const statusData = statusDoc.exists ? statusDoc.data() : {};
         const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
+        const strictProtocols = strictProtocolsDoc.exists ? strictProtocolsDoc.data() : { maxDevices: STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES };
 
-        res.json({ ...config, ...statusData, isLive, isQueue, isMockElection });
+        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -4840,6 +4917,7 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
 app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const representativeName = sanitizeInput(req.body.representativeName || '');
+        const representativeFirstName = getRepresentativeFirstName(representativeName);
         const gradeLevel = sanitizeInput(String(req.body.gradeLevel || ''));
         const useFor = sanitizeInput(req.body.useFor || '');
         const badgeType = sanitizeInput(req.body.badgeType || '');
@@ -4884,6 +4962,28 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             return res.status(400).json({ error: "Token expiration must remain within the current calendar day." });
         }
 
+        const [strictSettings, activeDevices, usableTokensSnap] = await Promise.all([
+            getStrictProtocolSettings(true),
+            getActiveWhitelistedDevices(true),
+            db.collection("whitelist_tokens")
+                .where("revoked", "==", false)
+                .get()
+        ]);
+
+        const usableTokenCount = usableTokensSnap.docs.reduce((count, doc) => {
+            const tokenData = doc.data() || {};
+            const tokenExpiresAt = tokenData.expiresAt?.toDate ? tokenData.expiresAt.toDate() : new Date(tokenData.expiresAt || 0);
+            const withinWindow = tokenExpiresAt instanceof Date && !Number.isNaN(tokenExpiresAt.getTime()) && tokenExpiresAt > now;
+            const belowLimit = Number(tokenData.activationCount || 0) < Number(tokenData.activationLimit || 1);
+            return (withinWindow && belowLimit) ? count + 1 : count;
+        }, 0);
+
+        if ((activeDevices.length + usableTokenCount) >= strictSettings.maxDevices) {
+            return res.status(400).json({
+                error: `Whitelist limit reached. Maximum assisted-device capacity is ${strictSettings.maxDevices}.`
+            });
+        }
+
         const rawToken = buildWhitelistToken();
         const tokenHash = hashWhitelistToken(rawToken);
         const tokenPreview = `${rawToken.slice(0, 4)}...${rawToken.slice(-4)}`;
@@ -4892,6 +4992,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             tokenHash,
             tokenPreview,
             representativeName,
+            representativeFirstName,
             gradeLevel,
             useFor,
             badgeType,
@@ -4903,6 +5004,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             activationCount: 0,
             assignedRepresentative: {
                 name: representativeName,
+                firstName: representativeFirstName,
                 gradeLevel
             },
             policy: {
@@ -4921,6 +5023,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
         await logAdminAction(req, "CREATE_WHITELIST_TOKEN", {
             tokenPreview,
             representativeName,
+            representativeFirstName,
             gradeLevel,
             useFor,
             badgeType,
@@ -4933,6 +5036,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             token: rawToken,
             tokenPreview,
             representativeName,
+            representativeFirstName,
             gradeLevel,
             useFor,
             badgeType,
@@ -4943,6 +5047,53 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
     } catch (e) {
         console.error("[WHITELIST TOKEN CREATE]", e);
         res.status(500).json({ error: "Failed to create whitelist token." });
+    }
+});
+
+app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const [strictSettings, devices] = await Promise.all([
+            getStrictProtocolSettings(false),
+            getActiveWhitelistedDevices(false)
+        ]);
+
+        res.json({
+            success: true,
+            maxDevices: strictSettings.maxDevices,
+            activeCount: devices.length,
+            devices
+        });
+    } catch (e) {
+        console.error("[WHITELIST DEVICES]", e);
+        res.status(500).json({ error: "Failed to load whitelisted devices." });
+    }
+});
+
+app.post("/admin/strict-protocols/settings", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const maxDevicesRaw = Number(req.body.maxDevices);
+        if (!Number.isFinite(maxDevicesRaw) || maxDevicesRaw < 1 || maxDevicesRaw > STRICT_PROTOCOLS_MAX_LIMIT) {
+            return res.status(400).json({ error: `Maximum devices must be between 1 and ${STRICT_PROTOCOLS_MAX_LIMIT}.` });
+        }
+
+        const maxDevices = Math.floor(maxDevicesRaw);
+
+        await db.collection("settings").doc("strictProtocols").set({
+            maxDevices,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: req.user?.uid || "admin"
+        }, { merge: true });
+
+        invalidateStrictProtocolsCache();
+        await logAdminAction(req, "UPDATE_STRICT_PROTOCOLS", { maxDevices });
+
+        res.json({
+            success: true,
+            maxDevices
+        });
+    } catch (e) {
+        console.error("[STRICT PROTOCOLS SETTINGS]", e);
+        res.status(500).json({ error: "Failed to update strict protocol settings." });
     }
 });
 
@@ -4961,7 +5112,6 @@ app.post("/activate/:token", async (req, res) => {
         const deviceFingerprint = getAssistedDeviceFingerprint(req);
         const deviceRef = db.collection("activated_devices").doc(deviceFingerprint);
         const deviceIp = req.ip || req.headers["x-forwarded-for"] || "Unknown";
-        const deviceName = describeClientDevice(req.headers["user-agent"] || "");
 
         let responsePayload = null;
 
@@ -4987,6 +5137,7 @@ app.post("/activate/:token", async (req, res) => {
 
             const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
             const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
+            const fallbackDeviceName = `${getRepresentativeFirstName(tokenData.representativeFirstName || tokenData.representativeName)} Device`;
             const isExistingActivationValid =
                 existingDevice &&
                 existingDevice.tokenHash === tokenHash &&
@@ -5009,7 +5160,7 @@ app.post("/activate/:token", async (req, res) => {
                     expiresAt: existingExpiry.toISOString(),
                     deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
                     deviceIp: existingDevice.deviceIp || deviceIp,
-                    deviceName: existingDevice.deviceName || deviceName
+                    deviceName: existingDevice.deviceName || fallbackDeviceName
                 };
                 return;
             }
@@ -5026,6 +5177,7 @@ app.post("/activate/:token", async (req, res) => {
 
             const activationLimit = Number(tokenData.activationLimit || 1);
             const activationCount = Number(tokenData.activationCount || 0);
+            const deviceName = fallbackDeviceName;
 
             if (activationCount >= activationLimit) {
                 failureCode = 403;
@@ -5079,6 +5231,25 @@ app.post("/activate/:token", async (req, res) => {
             success: true,
             ...responsePayload
         });
+
+        strictProtocolsCache.devices = Array.isArray(strictProtocolsCache.devices)
+            ? [
+                ...strictProtocolsCache.devices.filter(device => device.id !== deviceFingerprint),
+                {
+                    id: deviceFingerprint,
+                    deviceName: responsePayload.deviceName,
+                    representativeName: responsePayload.representativeName,
+                    representativeGradeLevel: responsePayload.gradeLevel,
+                    tokenPreview: responsePayload.tokenPreview,
+                    deviceIp: responsePayload.deviceIp,
+                    badgeType: responsePayload.badgeType,
+                    queueBypass: responsePayload.queueBypass,
+                    activatedAt: responsePayload.activatedAt,
+                    expiresAt: responsePayload.expiresAt
+                }
+            ].sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt))
+            : null;
+        strictProtocolsCache.loadedAt = Date.now();
 
     } catch (e) {
         const status = failureCode || 500;
