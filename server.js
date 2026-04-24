@@ -3008,6 +3008,45 @@ app.get("/settings", async (req, res) => {
     }
 });
 
+app.get("/assisted-device/status", async (req, res) => {
+    try {
+        const deviceFingerprint = getAssistedDeviceFingerprint(req);
+        const deviceSnap = await db.collection("activated_devices").doc(deviceFingerprint).get();
+
+        if (!deviceSnap.exists) {
+            return res.json({ active: false });
+        }
+
+        const data = deviceSnap.data() || {};
+        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+        const now = new Date();
+        const isActive =
+            data.revoked !== true &&
+            expiresAt instanceof Date &&
+            !Number.isNaN(expiresAt.getTime()) &&
+            expiresAt > now;
+
+        if (!isActive) {
+            return res.json({ active: false });
+        }
+
+        return res.json({
+            active: true,
+            queueBypass: data.queueBypass === true,
+            tokenPreview: data.tokenPreview || "----...----",
+            representativeName: data.representativeName || "Unknown Representative",
+            gradeLevel: data.representativeGradeLevel || "",
+            badgeType: data.badgeType || "trusted_student_device",
+            useFor: data.useFor || "",
+            deviceName: data.deviceName || "Representative Device",
+            expiresAt: expiresAt.toISOString()
+        });
+    } catch (e) {
+        console.error("[ASSISTED DEVICE STATUS]", e);
+        return res.status(500).json({ error: "Failed to load assisted device status." });
+    }
+});
+
 function normalizeName(name) {
     return String(name)
         .trim()
@@ -3510,6 +3549,10 @@ app.post("/verify", loginLimiter, async (req, res) => {
             isQueue: isQueue && !hasQueueBypassDevice,
             queueBypass: hasQueueBypassDevice,
             assistedDevice: hasQueueBypassDevice,
+            assistedDeviceExpiresAt: hasQueueBypassDevice ? assistedDeviceExpiry.toISOString() : null,
+            assistedDeviceTokenPreview: hasQueueBypassDevice ? (assistedDeviceData.tokenPreview || "----...----") : null,
+            assistedDeviceBadgeType: hasQueueBypassDevice ? (assistedDeviceData.badgeType || "trusted_student_device") : null,
+            assistedDeviceUseFor: hasQueueBypassDevice ? (assistedDeviceData.useFor || "") : null,
             ...(isQueue && !hasQueueBypassDevice && { queueKey: hashedLVN })
         });
 
