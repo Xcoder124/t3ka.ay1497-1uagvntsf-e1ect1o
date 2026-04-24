@@ -524,6 +524,11 @@ function buildWhitelistToken() {
     return `TSF-WL-${toBase64Url(crypto.randomBytes(32))}`;
 }
 
+const WHITELIST_USE_EXTRA_DEVICES = "extra_devices";
+const WHITELIST_USE_PC_VOTING_SESSION = "pc_voting_session";
+const BADGE_TRUSTED_STUDENT_DEVICE = "trusted_student_device";
+const BADGE_FACILITY_VOTING_DEVICE = "facility_voting_device";
+
 function getAssistedDeviceFingerprint(req) {
     const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
     return crypto.createHash("sha256")
@@ -600,7 +605,8 @@ async function getActiveWhitelistedDevices(forceRefresh = false) {
             representativeGradeLevel: data.representativeGradeLevel || "",
             tokenPreview: data.tokenPreview || "----...----",
             deviceIp: data.deviceIp || "Unknown",
-            badgeType: data.badgeType || "trusted_student_device",
+            badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
+            useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
             queueBypass: data.queueBypass === true,
             activatedAt: data.activatedAt?.toDate ? data.activatedAt.toDate().toISOString() : null,
             expiresAt: expiresAt.toISOString()
@@ -642,8 +648,8 @@ async function getPendingWhitelistTokens(forceRefresh = false) {
             representativeName: data.representativeName || "Unknown Representative",
             representativeFirstName: data.representativeFirstName || getRepresentativeFirstName(data.representativeName),
             gradeLevel: data.gradeLevel || "",
-            badgeType: data.badgeType || "trusted_student_device",
-            useFor: data.useFor || "extra_devices",
+            badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
+            useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
             activationLimit,
             activationCount,
             expiresAt: expiresAt.toISOString(),
@@ -3090,9 +3096,12 @@ app.get("/assisted-device/status", async (req, res) => {
             tokenPreview: data.tokenPreview || "----...----",
             representativeName: data.representativeName || "Unknown Representative",
             gradeLevel: data.representativeGradeLevel || "",
-            badgeType: data.badgeType || "trusted_student_device",
+            badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
             useFor: data.useFor || "",
             deviceName: data.deviceName || "Representative Device",
+            pcVotingSession:
+                data.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
+                data.useFor === WHITELIST_USE_PC_VOTING_SESSION,
             expiresAt: expiresAt.toISOString()
         });
     } catch (e) {
@@ -5084,7 +5093,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
         const expiresAtRaw = req.body.expiresAt;
 
         const allowedGrades = new Set(["7", "8", "9", "10", "11", "12"]);
-        const allowedBadgeTypes = new Set(["trusted_student_device", "facility_voting_device"]);
+        const allowedBadgeTypes = new Set([BADGE_TRUSTED_STUDENT_DEVICE, BADGE_FACILITY_VOTING_DEVICE]);
+        const allowedUseFor = new Set([WHITELIST_USE_EXTRA_DEVICES, WHITELIST_USE_PC_VOTING_SESSION]);
 
         if (!representativeName) {
             return res.status(400).json({ error: "Representative name is required." });
@@ -5094,12 +5104,18 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             return res.status(400).json({ error: "A valid grade level from G7 to G12 is required." });
         }
 
-        if (useFor !== "extra_devices") {
-            return res.status(400).json({ error: "Whitelist tokens may only be issued for extra devices." });
+        if (!allowedUseFor.has(useFor)) {
+            return res.status(400).json({ error: "A valid whitelist privilege is required." });
         }
 
         if (!allowedBadgeTypes.has(badgeType)) {
             return res.status(400).json({ error: "A valid badge type is required." });
+        }
+
+        if (useFor === WHITELIST_USE_PC_VOTING_SESSION && badgeType !== BADGE_FACILITY_VOTING_DEVICE) {
+            return res.status(400).json({
+                error: "PC Voting Session privilege is only allowed for Facility Voting Device tokens."
+            });
         }
 
         const expiresAt = new Date(expiresAtRaw);
@@ -5109,16 +5125,19 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
 
         const now = new Date();
         const maxExpiry = new Date(now.getTime() + (5 * 60 * 60 * 1000));
+        const hasExtendedPcSessionExpiry =
+            useFor === WHITELIST_USE_PC_VOTING_SESSION &&
+            badgeType === BADGE_FACILITY_VOTING_DEVICE;
 
         if (expiresAt <= now) {
             return res.status(400).json({ error: "Token expiration must be in the future." });
         }
 
-        if (expiresAt > maxExpiry) {
+        if (!hasExtendedPcSessionExpiry && expiresAt > maxExpiry) {
             return res.status(400).json({ error: "Token expiration cannot exceed a 5-hour validity window." });
         }
 
-        if (getManilaDateKey(expiresAt) !== getManilaDateKey(now)) {
+        if (!hasExtendedPcSessionExpiry && getManilaDateKey(expiresAt) !== getManilaDateKey(now)) {
             return res.status(400).json({ error: "Token expiration must remain within the current calendar day." });
         }
 
@@ -5160,6 +5179,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             revoked: false,
             queueBypass: true,
             queueBypassOnly: true,
+            pcVotingSession: useFor === WHITELIST_USE_PC_VOTING_SESSION,
             activationLimit: 1,
             activationCount: 0,
             assignedRepresentative: {
@@ -5171,7 +5191,9 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
                 validDuringElectionHours: true,
                 expiresAutomatically: true,
                 singleActivationOnly: true,
-                queueBypassOnly: true
+                queueBypassOnly: true,
+                pcVotingSession: useFor === WHITELIST_USE_PC_VOTING_SESSION,
+                extendedExpiryAllowed: hasExtendedPcSessionExpiry
             },
             createdBy: req.user?.uid || "admin",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5230,6 +5252,7 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 tokenPreview: token.tokenPreview,
                 deviceIp: "Awaiting activation",
                 badgeType: token.badgeType,
+                useFor: token.useFor,
                 expiresAt: token.expiresAt,
                 status: "Pending Activation"
             })),
@@ -5241,6 +5264,7 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 tokenPreview: device.tokenPreview,
                 deviceIp: device.deviceIp,
                 badgeType: device.badgeType,
+                useFor: device.useFor,
                 expiresAt: device.expiresAt,
                 status: "Active"
             }))
@@ -5404,7 +5428,7 @@ app.post("/activate/:token", async (req, res) => {
                     tokenPreview: tokenData.tokenPreview,
                     representativeName: tokenData.representativeName,
                     gradeLevel: tokenData.gradeLevel,
-                    badgeType: tokenData.badgeType,
+                    badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                     useFor: tokenData.useFor,
                     activatedAt: existingDevice.activatedAt?.toDate ? existingDevice.activatedAt.toDate().toISOString() : null,
                     expiresAt: existingExpiry.toISOString(),
@@ -5442,8 +5466,8 @@ app.post("/activate/:token", async (req, res) => {
                 representativeGradeLevel: tokenData.gradeLevel,
                 tokenHash,
                 tokenPreview: tokenData.tokenPreview,
-                badgeType: tokenData.badgeType,
-                useFor: tokenData.useFor,
+                badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
+                useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                 queueBypass: true,
                 revoked: false,
                 activatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5467,8 +5491,8 @@ app.post("/activate/:token", async (req, res) => {
                 tokenPreview: tokenData.tokenPreview,
                 representativeName: tokenData.representativeName,
                 gradeLevel: tokenData.gradeLevel,
-                badgeType: tokenData.badgeType,
-                useFor: tokenData.useFor,
+                badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
+                useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                 activatedAt: now.toISOString(),
                 expiresAt: expiresAt.toISOString(),
                 deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
@@ -5488,6 +5512,7 @@ app.post("/activate/:token", async (req, res) => {
                     tokenPreview: responsePayload.tokenPreview,
                     deviceIp: responsePayload.deviceIp,
                     badgeType: responsePayload.badgeType,
+                    useFor: responsePayload.useFor,
                     queueBypass: responsePayload.queueBypass,
                     activatedAt: responsePayload.activatedAt,
                     expiresAt: responsePayload.expiresAt
