@@ -5412,13 +5412,15 @@ app.post("/activate/:token", async (req, res) => {
             const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
             const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
             const fallbackDeviceName = `${getRepresentativeFirstName(tokenData.representativeFirstName || tokenData.representativeName)} Device`;
-            const isExistingActivationValid =
+            const isExistingDeviceActive =
                 existingDevice &&
-                existingDevice.tokenHash === tokenHash &&
                 existingDevice.revoked !== true &&
                 existingExpiry instanceof Date &&
                 !Number.isNaN(existingExpiry.getTime()) &&
                 existingExpiry > now;
+            const isExistingActivationValid =
+                isExistingDeviceActive &&
+                existingDevice.tokenHash === tokenHash;
 
             if (isExistingActivationValid) {
                 responsePayload = {
@@ -5437,6 +5439,11 @@ app.post("/activate/:token", async (req, res) => {
                     deviceName: existingDevice.deviceName || fallbackDeviceName
                 };
                 return;
+            }
+
+            if (isExistingDeviceActive) {
+                failureCode = 403;
+                throw new Error("This device already has an active activation token. Wait until the current privilege expires or revoke it from Strict Protocols before activating another token.");
             }
 
             if (tokenData.revoked === true) {
