@@ -660,6 +660,8 @@ setInterval(async () => {
     } catch (e) { console.error("Expiry check error:", e); }
 }, 1200000);
 
+const QUEUE_MAX_ACTIVE = 70;
+
 async function joinQueue(userId, grade) {
     const gradeKey = `sessionG${grade}`;
     const queueRef = rtdb.ref(`queue/${gradeKey}`);
@@ -667,12 +669,13 @@ async function joinQueue(userId, grade) {
     await queueRef.transaction(current => {
         current = current || {
             activeCount: 0,
-            maxActive: 50,  // 50 voters per grade at a time
+            maxActive: QUEUE_MAX_ACTIVE,
             lastPosition: 0,
             users: {}
         };
 
         if (!current.users) current.users = {};
+        current.maxActive = QUEUE_MAX_ACTIVE;
 
         // If user already exists and is done, don't re-add
         if (current.users[userId] && current.users[userId].status === 'done') {
@@ -705,13 +708,18 @@ async function joinQueue(userId, grade) {
     });
 }
 
-function calculateETA(position, currentServing, maxActive = 100, avgTime = 5) {
-    // peopleAhead = how many slots are still ahead of this user's position
-    const peopleAhead = Math.max(0, position - currentServing);
+function calculateETA(position, currentServing, maxActive = QUEUE_MAX_ACTIVE, avgTime = 5) {
+    const effectiveLimit = Math.max(1, Number(maxActive) || QUEUE_MAX_ACTIVE);
 
-    if (peopleAhead <= 0) return "You're next!";
+    if (position <= effectiveLimit || currentServing < effectiveLimit) {
+        return "It's your turn!";
+    }
 
-    const batches = Math.ceil(peopleAhead / maxActive);
+    const peopleAhead = Math.max(0, position - effectiveLimit);
+
+    if (peopleAhead <= 0) return "It's your turn!";
+
+    const batches = Math.ceil(peopleAhead / effectiveLimit);
     return `${batches * avgTime} mins`;
 }
 
@@ -3601,7 +3609,7 @@ setInterval(async () => {
                         }
                     }
 
-                    await queueRef.update({ activeCount: newActiveCount });
+                    await queueRef.update({ activeCount: newActiveCount, maxActive: QUEUE_MAX_ACTIVE });
                     console.log(`📊 ${gradeKey} activeCount recalculated: ${newActiveCount}`);
                 }
             }
@@ -3851,6 +3859,8 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
                     await queueRef.transaction(current => {
                         if (!current || !current.users) return current;
+
+                        current.maxActive = QUEUE_MAX_ACTIVE;
 
                         delete current.users[hashedLVN];
 
