@@ -528,6 +528,7 @@ const WHITELIST_USE_EXTRA_DEVICES = "extra_devices";
 const WHITELIST_USE_PC_VOTING_SESSION = "pc_voting_session";
 const BADGE_TRUSTED_STUDENT_DEVICE = "trusted_student_device";
 const BADGE_FACILITY_VOTING_DEVICE = "facility_voting_device";
+const WHITELIST_TOKEN_ACTIVATION_TTL_MS = 2 * 60 * 60 * 1000;
 
 function getAssistedDeviceFingerprint(req) {
     const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -650,9 +651,12 @@ async function getPendingWhitelistTokens(forceRefresh = false) {
             gradeLevel: data.gradeLevel || "",
             badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
             useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
+            privilegeDurationMs: Number(data.privilegeDurationMs || 0),
+            requestedPrivilegeExpiresAt: data.requestedPrivilegeExpiresAt?.toDate ? data.requestedPrivilegeExpiresAt.toDate().toISOString() : null,
             activationLimit,
             activationCount,
             expiresAt: expiresAt.toISOString(),
+            tokenExpiresAt: expiresAt.toISOString(),
             createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : null
         });
     });
@@ -5118,28 +5122,31 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             });
         }
 
-        const expiresAt = new Date(expiresAtRaw);
-        if (Number.isNaN(expiresAt.getTime())) {
-            return res.status(400).json({ error: "A valid token expiration time is required." });
+        const requestedPrivilegeExpiresAt = new Date(expiresAtRaw);
+        if (Number.isNaN(requestedPrivilegeExpiresAt.getTime())) {
+            return res.status(400).json({ error: "A valid privilege expiration time is required." });
         }
 
         const now = new Date();
         const maxExpiry = new Date(now.getTime() + (5 * 60 * 60 * 1000));
+        const tokenExpiresAt = new Date(now.getTime() + WHITELIST_TOKEN_ACTIVATION_TTL_MS);
         const hasExtendedPcSessionExpiry =
             useFor === WHITELIST_USE_PC_VOTING_SESSION &&
             badgeType === BADGE_FACILITY_VOTING_DEVICE;
 
-        if (expiresAt <= now) {
-            return res.status(400).json({ error: "Token expiration must be in the future." });
+        if (requestedPrivilegeExpiresAt <= now) {
+            return res.status(400).json({ error: "Privilege expiration must be in the future." });
         }
 
-        if (!hasExtendedPcSessionExpiry && expiresAt > maxExpiry) {
-            return res.status(400).json({ error: "Token expiration cannot exceed a 5-hour validity window." });
+        if (!hasExtendedPcSessionExpiry && requestedPrivilegeExpiresAt > maxExpiry) {
+            return res.status(400).json({ error: "Privilege expiration cannot exceed a 5-hour validity window." });
         }
 
-        if (!hasExtendedPcSessionExpiry && getManilaDateKey(expiresAt) !== getManilaDateKey(now)) {
-            return res.status(400).json({ error: "Token expiration must remain within the current calendar day." });
+        if (!hasExtendedPcSessionExpiry && getManilaDateKey(requestedPrivilegeExpiresAt) !== getManilaDateKey(now)) {
+            return res.status(400).json({ error: "Privilege expiration must remain within the current calendar day." });
         }
+
+        const privilegeDurationMs = requestedPrivilegeExpiresAt.getTime() - now.getTime();
 
         const [strictSettings, activeDevices, usableTokensSnap] = await Promise.all([
             getStrictProtocolSettings(true),
@@ -5180,6 +5187,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             queueBypass: true,
             queueBypassOnly: true,
             pcVotingSession: useFor === WHITELIST_USE_PC_VOTING_SESSION,
+            privilegeDurationMs,
+            requestedPrivilegeExpiresAt: admin.firestore.Timestamp.fromDate(requestedPrivilegeExpiresAt),
             activationLimit: 1,
             activationCount: 0,
             assignedRepresentative: {
@@ -5199,7 +5208,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             activatedAt: null,
             lastUsedAt: null,
-            expiresAt: admin.firestore.Timestamp.fromDate(expiresAt)
+            expiresAt: admin.firestore.Timestamp.fromDate(tokenExpiresAt)
         });
 
         await logAdminAction(req, "CREATE_WHITELIST_TOKEN", {
@@ -5210,7 +5219,9 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             useFor,
             badgeType,
             activationLimit: 1,
-            expiresAt: expiresAt.toISOString()
+            tokenExpiresAt: tokenExpiresAt.toISOString(),
+            requestedPrivilegeExpiresAt: requestedPrivilegeExpiresAt.toISOString(),
+            privilegeDurationMs
         });
 
         invalidateStrictProtocolsCache();
@@ -5224,7 +5235,10 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             gradeLevel,
             useFor,
             badgeType,
-            expiresAt: expiresAt.toISOString(),
+            expiresAt: tokenExpiresAt.toISOString(),
+            tokenExpiresAt: tokenExpiresAt.toISOString(),
+            requestedPrivilegeExpiresAt: requestedPrivilegeExpiresAt.toISOString(),
+            privilegeDurationMs,
             activationLimit: 1
         });
 
@@ -5401,13 +5415,8 @@ app.post("/activate/:token", async (req, res) => {
             }
 
             const tokenData = tokenSnap.data() || {};
-            const expiresAt = tokenData.expiresAt?.toDate ? tokenData.expiresAt.toDate() : new Date(tokenData.expiresAt);
+            const tokenExpiresAt = tokenData.expiresAt?.toDate ? tokenData.expiresAt.toDate() : new Date(tokenData.expiresAt);
             const now = new Date();
-
-            if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime())) {
-                failureCode = 410;
-                throw new Error("Token is no longer valid.");
-            }
 
             const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
             const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
@@ -5431,7 +5440,7 @@ app.post("/activate/:token", async (req, res) => {
                     representativeName: tokenData.representativeName,
                     gradeLevel: tokenData.gradeLevel,
                     badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
-                    useFor: tokenData.useFor,
+                    useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                     activatedAt: existingDevice.activatedAt?.toDate ? existingDevice.activatedAt.toDate().toISOString() : null,
                     expiresAt: existingExpiry.toISOString(),
                     deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
@@ -5446,19 +5455,30 @@ app.post("/activate/:token", async (req, res) => {
                 throw new Error("This device already has an active activation token. Wait until the current privilege expires or revoke it from Strict Protocols before activating another token.");
             }
 
+            if (!(tokenExpiresAt instanceof Date) || Number.isNaN(tokenExpiresAt.getTime())) {
+                failureCode = 410;
+                throw new Error("Token is no longer valid.");
+            }
+
             if (tokenData.revoked === true) {
                 failureCode = 403;
                 throw new Error("This activation token has been revoked.");
             }
 
-            if (expiresAt <= now) {
+            if (tokenExpiresAt <= now) {
                 failureCode = 410;
-                throw new Error("This activation token has already expired.");
+                throw new Error("This activation token has expired because it was not activated within 2 hours.");
             }
 
             const activationLimit = Number(tokenData.activationLimit || 1);
             const activationCount = Number(tokenData.activationCount || 0);
             const deviceName = fallbackDeviceName;
+            const privilegeDurationMs = Number(tokenData.privilegeDurationMs || 0);
+            if (!Number.isFinite(privilegeDurationMs) || privilegeDurationMs <= 0) {
+                failureCode = 410;
+                throw new Error("Token is no longer valid.");
+            }
+            const deviceExpiresAt = new Date(now.getTime() + privilegeDurationMs);
 
             if (activationCount >= activationLimit) {
                 failureCode = 403;
@@ -5479,7 +5499,7 @@ app.post("/activate/:token", async (req, res) => {
                 revoked: false,
                 activatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastValidatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                expiresAt: tokenData.expiresAt,
+                expiresAt: admin.firestore.Timestamp.fromDate(deviceExpiresAt),
                 source: "whitelist_token"
             }, { merge: true });
 
@@ -5501,7 +5521,7 @@ app.post("/activate/:token", async (req, res) => {
                 badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                 useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                 activatedAt: now.toISOString(),
-                expiresAt: expiresAt.toISOString(),
+                expiresAt: deviceExpiresAt.toISOString(),
                 deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
                 deviceIp,
                 deviceName
