@@ -219,6 +219,26 @@ function markDashboardDirty() {
     dashboardDirty = true;
 }
 let LiveVoterStatus = {};
+const POSITION_TITLES = {
+    president: "President",
+    vp: "Vice President",
+    secretary: "Secretary",
+    treasurer: "Treasurer",
+    auditor: "Auditor",
+    pio: "P.I.O",
+    protocol: "Protocol Officer",
+    rep7: "Grade 7 Representative",
+    rep8: "Grade 8 Representative",
+    rep9: "Grade 9 Representative",
+    rep10: "Grade 10 Representative",
+    rep11: "Grade 11 Representative",
+    rep12: "Grade 12 Representative"
+};
+
+function getPositionTitle(position) {
+    return POSITION_TITLES[position] || position;
+}
+
 const MOCK_CANDIDATES = [
     {
         position: "president",
@@ -376,21 +396,36 @@ async function validateSelections(selections, grade) {
     const allowedRepPosition = getAllowedRepPositionForGrade(grade);
 
     const validated = {};
+    const missingPositions = [];
+
+    for (const position of Object.keys(selections)) {
+        if (!Object.prototype.hasOwnProperty.call(candidateMap, position)) {
+            throw new Error(`Invalid position ${position}`);
+        }
+    }
 
     for (const [position, options] of Object.entries(candidateMap)) {
+        const hasCandidates = Array.isArray(options) && options.length > 0;
+        const isRepPosition = MULTI_POSITIONS.includes(position);
+
+        if (isRepPosition && (!allowedRepPosition || position !== allowedRepPosition)) {
+            if (selections[position] !== undefined) {
+                throw new Error(
+                    `Grade ${grade} voters are not authorised to vote for ${getPositionTitle(position)}.`
+                );
+            }
+            continue;
+        }
+
+        if (hasCandidates && selections[position] === undefined) {
+            missingPositions.push(getPositionTitle(position));
+            continue;
+        }
 
         if (selections[position] === undefined) continue;
 
         if (!GlobalCache.candidateHashMap[position]) {
             throw new Error(`Invalid position ${position}`);
-        }
-
-        if (MULTI_POSITIONS.includes(position)) {
-            if (!allowedRepPosition || position !== allowedRepPosition) {
-                throw new Error(
-                    `Grade ${grade} voters are not authorised to vote for position ${position}.`
-                );
-            }
         }
 
         const selected = selections[position];
@@ -399,19 +434,26 @@ async function validateSelections(selections, grade) {
             .map(s => String(s).trim());
 
         if (selectedArray.length === 0) {
-            throw new Error(`No selection provided for ${position}`);
+            throw new Error(`Please vote for ${getPositionTitle(position)}.`);
         }
 
         if (!MULTI_POSITIONS.includes(position) && selectedArray.length > 1) {
-            throw new Error(`Multiple selections not allowed for ${position}`);
+            throw new Error(`Multiple selections are not allowed for ${getPositionTitle(position)}.`);
         }
 
         if (selectedArray.length > options.length) {
-            throw new Error(`Too many selections for ${position}`);
+            throw new Error(`Too many selections for ${getPositionTitle(position)}.`);
         }
 
         if (new Set(selectedArray).size !== selectedArray.length) {
-            throw new Error(`Duplicate selections for ${position}`);
+            throw new Error(`Duplicate selections for ${getPositionTitle(position)}.`);
+        }
+
+        if (MULTI_POSITIONS.includes(position)) {
+            const requiredCount = options.length >= 2 ? 2 : 1;
+            if (selectedArray.length !== requiredCount) {
+                throw new Error(`Please vote for ${getPositionTitle(position)} (${requiredCount} candidate${requiredCount > 1 ? "s" : ""}).`);
+            }
         }
 
         const resolved = selectedArray.map(sel => {
@@ -432,6 +474,10 @@ async function validateSelections(selections, grade) {
         validated[position] = MULTI_POSITIONS.includes(position)
             ? resolved
             : resolved[0];
+    }
+
+    if (missingPositions.length > 0) {
+        throw new Error(`Please vote for ${missingPositions.join(", ")}.`);
     }
 
     return validated;
@@ -3464,6 +3510,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
                     success: true,
                     name: d.name,
                     grade: d.grade,
+                    section: d.section || "",
                     csrfToken,
                     isQueue: false,   // No queue in mock mode
                     isMockElection: true
@@ -3479,6 +3526,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
             return res.json({
                 name: "JOHN DOE (TEST)",
                 grade: "12",
+                section: "TEST",
                 token: fakeToken,
                 csrfToken: ""
             });
@@ -3553,6 +3601,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
             success: true,
             name: d.name,
             grade: d.grade,
+            section: d.section || "",
             csrfToken,
             isQueue: isQueue && !hasQueueBypassDevice,
             queueBypass: hasQueueBypassDevice,
@@ -3902,6 +3951,18 @@ app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, as
 
         if (e.message === "QUEUE_NOT_ACTIVE") {
             return res.status(403).json({ error: "Please wait for your turn." });
+        }
+
+        if (
+            /^Please vote for /.test(e.message) ||
+            /not authorised to vote for/.test(e.message) ||
+            /Multiple selections are not allowed/.test(e.message) ||
+            /Too many selections/.test(e.message) ||
+            /Duplicate selections/.test(e.message) ||
+            /Invalid candidate/.test(e.message) ||
+            /Invalid position/.test(e.message)
+        ) {
+            return res.status(400).json({ error: e.message });
         }
 
         return res.status(500).json({
