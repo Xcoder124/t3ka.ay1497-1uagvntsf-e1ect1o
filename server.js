@@ -109,7 +109,10 @@ const corsOptions = {
         "X-CSRF-Token",
         "x-csrf-token",
         "X-Admin-Key",
-        "x-ai-service-key"
+        "x-ai-service-key",
+        "X-TSF-Client-Surface",
+        "X-TSF-Device-Class",
+        "X-TSF-PC-Device-ID"
     ]
 };
 
@@ -530,11 +533,210 @@ const BADGE_TRUSTED_STUDENT_DEVICE = "trusted_student_device";
 const BADGE_FACILITY_VOTING_DEVICE = "facility_voting_device";
 const WHITELIST_TOKEN_ACTIVATION_TTL_MS = 2 * 60 * 60 * 1000;
 
-function getAssistedDeviceFingerprint(req) {
+function normalizeClientIp(value = '') {
+    const raw = String(value || '').split(',')[0].trim();
+    if (!raw) return "Unknown";
+    return raw.replace(/^::ffff:/, '');
+}
+
+function getClientIp(req) {
+    return normalizeClientIp(
+        req.headers["cf-connecting-ip"] ||
+        req.headers["x-real-ip"] ||
+        req.headers["x-forwarded-for"] ||
+        req.ip ||
+        ""
+    );
+}
+
+function getVotingPcDeviceId(req) {
+    const raw = String(req.headers["x-tsf-pc-device-id"] || '').trim();
+    return /^[A-Za-z0-9_-]{16,96}$/.test(raw) ? raw : "";
+}
+
+function buildAssistedDeviceFingerprint(req, pcDeviceId = "") {
     const ua = (req.headers["user-agent"] || "").replace(/\s+/g, " ").trim().toLowerCase();
     return crypto.createHash("sha256")
-        .update(`${ua}|${req.headers['sec-ch-ua'] || ''}`)
+        .update(`${ua}|${req.headers['sec-ch-ua'] || ''}|${pcDeviceId ? `pc:${pcDeviceId}` : "legacy"}`)
         .digest("hex");
+}
+
+function getAssistedDeviceFingerprint(req) {
+    return buildAssistedDeviceFingerprint(req, getVotingPcDeviceId(req));
+}
+
+function getAssistedDeviceFingerprintCandidates(req) {
+    const primary = getAssistedDeviceFingerprint(req);
+    const legacy = buildAssistedDeviceFingerprint(req);
+    return Array.from(new Set([primary, legacy]));
+}
+
+function isLikelyPcDeviceRequest(req) {
+    const ua = String(req.headers["user-agent"] || "");
+    const platform = String(req.headers["sec-ch-ua-platform"] || "");
+    const mobileHint = String(req.headers["sec-ch-ua-mobile"] || "").includes("?1");
+    const mobileUa = /iphone|ipad|ipod|android|mobile|tablet|silk|kindle|playbook|windows phone/i.test(ua);
+    const desktopUa = /windows nt|macintosh|x11|linux x86_64|cros|chrome os/i.test(ua);
+    const desktopPlatform = /windows|macos|macintosh|linux|chrome os/i.test(platform);
+    return !mobileHint && !mobileUa && (desktopUa || desktopPlatform);
+}
+
+function isVotingPcSurfaceRequest(req) {
+    return String(req.headers["x-tsf-client-surface"] || "").trim().toLowerCase() === "votepc";
+}
+
+function isVotingPcDeviceRequest(req) {
+    return isVotingPcSurfaceRequest(req) &&
+        String(req.headers["x-tsf-device-class"] || "").trim().toLowerCase() === "pc" &&
+        !!getVotingPcDeviceId(req) &&
+        isLikelyPcDeviceRequest(req);
+}
+
+function isPcVotingSessionRecord(data = {}) {
+    return data.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
+        data.useFor === WHITELIST_USE_PC_VOTING_SESSION;
+}
+
+function isActiveAssistedDeviceData(data, expiresAt, req) {
+    if (!data || data.revoked === true) return false;
+    if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+        return false;
+    }
+
+    if (!isPcVotingSessionRecord(data)) return true;
+
+    const recordIp = normalizeClientIp(data.deviceIp || data.sharedIpScope || "");
+    const requestIp = getClientIp(req);
+    const recognizedVotingPc = data.pcVotingDevice === true ||
+        data.source === "whitelist_token" ||
+        data.source === "shared_pc_ip_session";
+
+    return recognizedVotingPc &&
+        isVotingPcDeviceRequest(req) &&
+        recordIp !== "Unknown" &&
+        requestIp !== "Unknown" &&
+        recordIp === requestIp;
+}
+
+function buildAssistedDeviceStatusPayload(data, expiresAt) {
+    return {
+        active: true,
+        queueBypass: data.queueBypass === true,
+        tokenPreview: data.tokenPreview || "----...----",
+        representativeName: data.representativeName || "Unknown Representative",
+        gradeLevel: data.representativeGradeLevel || "",
+        badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
+        useFor: data.useFor || "",
+        deviceName: data.deviceName || "Representative Device",
+        pcVotingSession: isPcVotingSessionRecord(data),
+        applyToOtherPcDevicesOnSameIp: data.applyToOtherPcDevicesOnSameIp === true,
+        expiresAt: expiresAt.toISOString()
+    };
+}
+
+async function findSharedPcVotingSessionForRequest(req) {
+    if (!isVotingPcDeviceRequest(req)) return null;
+
+    const deviceIp = getClientIp(req);
+    if (!deviceIp || deviceIp === "Unknown") return null;
+
+    const snap = await db.collection("activated_devices")
+        .where("deviceIp", "==", deviceIp)
+        .get();
+
+    const now = new Date();
+    const candidates = [];
+
+    snap.forEach((doc) => {
+        const data = doc.data() || {};
+        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+        const active =
+            data.revoked !== true &&
+            data.applyToOtherPcDevicesOnSameIp === true &&
+            isPcVotingSessionRecord(data) &&
+            data.pcVotingDevice !== false &&
+            expiresAt instanceof Date &&
+            !Number.isNaN(expiresAt.getTime()) &&
+            expiresAt > now;
+
+        if (active) {
+            candidates.push({ id: doc.id, data, expiresAt });
+        }
+    });
+
+    candidates.sort((a, b) => b.expiresAt - a.expiresAt);
+    return candidates[0] || null;
+}
+
+async function materializeSharedPcVotingSessionForRequest(req) {
+    const sourceSession = await findSharedPcVotingSessionForRequest(req);
+    if (!sourceSession) return null;
+
+    const deviceFingerprint = getAssistedDeviceFingerprint(req);
+    if (deviceFingerprint === sourceSession.id) {
+        return sourceSession;
+    }
+
+    const deviceRef = db.collection("activated_devices").doc(deviceFingerprint);
+    const deviceSnap = await deviceRef.get();
+    const existingData = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
+    const existingExpiry = existingData?.expiresAt?.toDate ? existingData.expiresAt.toDate() : new Date(existingData?.expiresAt || 0);
+
+    if (isActiveAssistedDeviceData(existingData, existingExpiry, req)) {
+        return { id: deviceFingerprint, data: existingData, expiresAt: existingExpiry };
+    }
+
+    if (existingData && existingData.revoked !== true && existingExpiry instanceof Date && !Number.isNaN(existingExpiry.getTime()) && existingExpiry > new Date()) {
+        return null;
+    }
+
+    const strictSettings = await getStrictProtocolSettings(false);
+    const activeDevices = await getActiveWhitelistedDevices(true);
+    if (!activeDevices.some(device => device.id === deviceFingerprint) && activeDevices.length >= strictSettings.maxDevices) {
+        console.warn("[SHARED PC SESSION] Strict protocol device capacity reached.");
+        return null;
+    }
+
+    const sourceData = sourceSession.data;
+    const deviceIp = getClientIp(req);
+    const representativeName = sourceData.representativeName || "Unknown Representative";
+    const sharedDeviceName = `${getRepresentativeFirstName(representativeName)} Shared Voting PC`;
+    const sharedData = {
+        deviceFingerprint,
+        deviceName: sharedDeviceName,
+        deviceIp,
+        representativeName,
+        representativeGradeLevel: sourceData.representativeGradeLevel || sourceData.gradeLevel || "",
+        tokenHash: sourceData.tokenHash,
+        tokenPreview: sourceData.tokenPreview || "----...----",
+        badgeType: BADGE_FACILITY_VOTING_DEVICE,
+        useFor: WHITELIST_USE_PC_VOTING_SESSION,
+        queueBypass: true,
+        revoked: false,
+        pcVotingDevice: true,
+        clientSurface: "votePC",
+        source: "shared_pc_ip_session",
+        parentDeviceFingerprint: sourceSession.id,
+        sharedIpScope: deviceIp,
+        applyToOtherPcDevicesOnSameIp: true,
+        activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastValidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: admin.firestore.Timestamp.fromDate(sourceSession.expiresAt)
+    };
+
+    await deviceRef.set(sharedData, { merge: true });
+    invalidateStrictProtocolsCache();
+
+    return {
+        id: deviceFingerprint,
+        data: {
+            ...sharedData,
+            activatedAt: new Date(),
+            lastValidatedAt: new Date(),
+            expiresAt: admin.firestore.Timestamp.fromDate(sourceSession.expiresAt)
+        },
+        expiresAt: sourceSession.expiresAt
+    };
 }
 
 function describeClientDevice(userAgent = '') {
@@ -547,6 +749,7 @@ function describeClientDevice(userAgent = '') {
     if (/oppo/i.test(ua)) return "OPPO Mobile Device";
     if (/huawei/i.test(ua)) return "Huawei Mobile Device";
     if (/android/i.test(ua)) return "Android Mobile Device";
+    if (/windows nt|macintosh|x11|linux x86_64|cros|chrome os/i.test(ua)) return "Voting PC Device";
 
     return "Representative Device";
 }
@@ -609,6 +812,9 @@ async function getActiveWhitelistedDevices(forceRefresh = false) {
             badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
             useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
             queueBypass: data.queueBypass === true,
+            pcVotingDevice: data.pcVotingDevice === true,
+            applyToOtherPcDevicesOnSameIp: data.applyToOtherPcDevicesOnSameIp === true,
+            source: data.source || "whitelist_token",
             activatedAt: data.activatedAt?.toDate ? data.activatedAt.toDate().toISOString() : null,
             expiresAt: expiresAt.toISOString()
         });
@@ -653,6 +859,7 @@ async function getPendingWhitelistTokens(forceRefresh = false) {
             useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
             privilegeDurationMs: Number(data.privilegeDurationMs || 0),
             requestedPrivilegeExpiresAt: data.requestedPrivilegeExpiresAt?.toDate ? data.requestedPrivilegeExpiresAt.toDate().toISOString() : null,
+            applyToOtherPcDevicesOnSameIp: data.applyToOtherPcDevicesOnSameIp === true,
             activationLimit,
             activationCount,
             expiresAt: expiresAt.toISOString(),
@@ -3074,40 +3281,25 @@ app.get("/settings", async (req, res) => {
 
 app.get("/assisted-device/status", async (req, res) => {
     try {
-        const deviceFingerprint = getAssistedDeviceFingerprint(req);
-        const deviceSnap = await db.collection("activated_devices").doc(deviceFingerprint).get();
+        const deviceFingerprints = getAssistedDeviceFingerprintCandidates(req);
 
-        if (!deviceSnap.exists) {
-            return res.json({ active: false });
+        for (const deviceFingerprint of deviceFingerprints) {
+            const deviceSnap = await db.collection("activated_devices").doc(deviceFingerprint).get();
+            if (!deviceSnap.exists) continue;
+            const data = deviceSnap.data() || {};
+            const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+
+            if (isActiveAssistedDeviceData(data, expiresAt, req)) {
+                return res.json(buildAssistedDeviceStatusPayload(data, expiresAt));
+            }
         }
 
-        const data = deviceSnap.data() || {};
-        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
-        const now = new Date();
-        const isActive =
-            data.revoked !== true &&
-            expiresAt instanceof Date &&
-            !Number.isNaN(expiresAt.getTime()) &&
-            expiresAt > now;
-
-        if (!isActive) {
-            return res.json({ active: false });
+        const sharedSession = await materializeSharedPcVotingSessionForRequest(req);
+        if (sharedSession) {
+            return res.json(buildAssistedDeviceStatusPayload(sharedSession.data, sharedSession.expiresAt));
         }
 
-        return res.json({
-            active: true,
-            queueBypass: data.queueBypass === true,
-            tokenPreview: data.tokenPreview || "----...----",
-            representativeName: data.representativeName || "Unknown Representative",
-            gradeLevel: data.representativeGradeLevel || "",
-            badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
-            useFor: data.useFor || "",
-            deviceName: data.deviceName || "Representative Device",
-            pcVotingSession:
-                data.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
-                data.useFor === WHITELIST_USE_PC_VOTING_SESSION,
-            expiresAt: expiresAt.toISOString()
-        });
+        return res.json({ active: false });
     } catch (e) {
         console.error("[ASSISTED DEVICE STATUS]", e);
         return res.status(500).json({ error: "Failed to load assisted device status." });
@@ -3418,12 +3610,13 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const hashedLVN = hashLVN(lvn);
 
         const deviceFingerprint = getAssistedDeviceFingerprint(req);
+        const assistedDeviceFingerprints = getAssistedDeviceFingerprintCandidates(req);
 
         const deviceRef = db.collection("device_tracking").doc(deviceFingerprint);
-        const assistedDeviceRef = db.collection("activated_devices").doc(deviceFingerprint);
-        const [deviceSnap, assistedDeviceSnap] = await Promise.all([
+        const assistedDeviceRefs = assistedDeviceFingerprints.map((fingerprint) => db.collection("activated_devices").doc(fingerprint));
+        const [deviceSnap, ...assistedDeviceSnaps] = await Promise.all([
             deviceRef.get(),
-            assistedDeviceRef.get()
+            ...assistedDeviceRefs.map((ref) => ref.get())
         ]);
 
         if (deviceSnap.exists) {
@@ -3450,15 +3643,28 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isLive = rtdbStatus.isLive === true;
         const isQueue = rtdbStatus.isQueue === true;
         const isMockElectionLogin = rtdbStatus.isMockElection === true;
-        const assistedDeviceData = assistedDeviceSnap.exists ? (assistedDeviceSnap.data() || {}) : null;
-        const assistedDeviceExpiry = assistedDeviceData?.expiresAt?.toDate ? assistedDeviceData.expiresAt.toDate() : new Date(assistedDeviceData?.expiresAt || 0);
-        const hasQueueBypassDevice =
-            assistedDeviceData &&
-            assistedDeviceData.revoked !== true &&
-            assistedDeviceData.queueBypass === true &&
-            assistedDeviceExpiry instanceof Date &&
-            !Number.isNaN(assistedDeviceExpiry.getTime()) &&
-            assistedDeviceExpiry > new Date();
+        let assistedDeviceData = null;
+        let assistedDeviceExpiry = new Date(0);
+        for (const assistedDeviceSnap of assistedDeviceSnaps) {
+            if (!assistedDeviceSnap.exists) continue;
+            const candidateData = assistedDeviceSnap.data() || {};
+            const candidateExpiry = candidateData.expiresAt?.toDate ? candidateData.expiresAt.toDate() : new Date(candidateData.expiresAt || 0);
+            if (candidateData.queueBypass === true && isActiveAssistedDeviceData(candidateData, candidateExpiry, req)) {
+                assistedDeviceData = candidateData;
+                assistedDeviceExpiry = candidateExpiry;
+                break;
+            }
+        }
+        let hasQueueBypassDevice = !!assistedDeviceData;
+
+        if (!hasQueueBypassDevice) {
+            const sharedSession = await materializeSharedPcVotingSessionForRequest(req);
+            if (sharedSession?.data?.queueBypass === true) {
+                assistedDeviceData = sharedSession.data;
+                assistedDeviceExpiry = sharedSession.expiresAt;
+                hasQueueBypassDevice = true;
+            }
+        }
 
         const voterRef = db.collection("voters").doc(hashedLVN);
         const voterSnap = await voterRef.get();
@@ -5094,6 +5300,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
         const gradeLevel = sanitizeInput(String(req.body.gradeLevel || ''));
         const useFor = sanitizeInput(req.body.useFor || '');
         const badgeType = sanitizeInput(req.body.badgeType || '');
+        const applyToOtherPcDevicesOnSameIp = req.body.applyToOtherPcDevicesOnSameIp === true;
         const expiresAtRaw = req.body.expiresAt;
 
         const allowedGrades = new Set(["7", "8", "9", "10", "11", "12"]);
@@ -5119,6 +5326,15 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
         if (useFor === WHITELIST_USE_PC_VOTING_SESSION && badgeType !== BADGE_FACILITY_VOTING_DEVICE) {
             return res.status(400).json({
                 error: "PC Voting Session privilege is only allowed for Facility Voting Device tokens."
+            });
+        }
+
+        if (applyToOtherPcDevicesOnSameIp && (
+            useFor !== WHITELIST_USE_PC_VOTING_SESSION ||
+            badgeType !== BADGE_FACILITY_VOTING_DEVICE
+        )) {
+            return res.status(400).json({
+                error: "Shared school Wi-Fi/IP access is only allowed for Facility Voting Device PC Voting Session tokens."
             });
         }
 
@@ -5187,6 +5403,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             queueBypass: true,
             queueBypassOnly: true,
             pcVotingSession: useFor === WHITELIST_USE_PC_VOTING_SESSION,
+            applyToOtherPcDevicesOnSameIp,
             privilegeDurationMs,
             requestedPrivilegeExpiresAt: admin.firestore.Timestamp.fromDate(requestedPrivilegeExpiresAt),
             activationLimit: 1,
@@ -5202,6 +5419,9 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
                 singleActivationOnly: true,
                 queueBypassOnly: true,
                 pcVotingSession: useFor === WHITELIST_USE_PC_VOTING_SESSION,
+                applyToOtherPcDevicesOnSameIp,
+                limitedToVotingPcDevices: applyToOtherPcDevicesOnSameIp,
+                requiresSameSchoolIp: applyToOtherPcDevicesOnSameIp,
                 extendedExpiryAllowed: hasExtendedPcSessionExpiry
             },
             createdBy: req.user?.uid || "admin",
@@ -5218,6 +5438,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             gradeLevel,
             useFor,
             badgeType,
+            applyToOtherPcDevicesOnSameIp,
             activationLimit: 1,
             tokenExpiresAt: tokenExpiresAt.toISOString(),
             requestedPrivilegeExpiresAt: requestedPrivilegeExpiresAt.toISOString(),
@@ -5235,6 +5456,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             gradeLevel,
             useFor,
             badgeType,
+            applyToOtherPcDevicesOnSameIp,
             expiresAt: tokenExpiresAt.toISOString(),
             tokenExpiresAt: tokenExpiresAt.toISOString(),
             requestedPrivilegeExpiresAt: requestedPrivilegeExpiresAt.toISOString(),
@@ -5267,6 +5489,7 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 deviceIp: "Awaiting activation",
                 badgeType: token.badgeType,
                 useFor: token.useFor,
+                applyToOtherPcDevicesOnSameIp: token.applyToOtherPcDevicesOnSameIp === true,
                 expiresAt: token.expiresAt,
                 status: "Pending Activation"
             })),
@@ -5279,6 +5502,9 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 deviceIp: device.deviceIp,
                 badgeType: device.badgeType,
                 useFor: device.useFor,
+                applyToOtherPcDevicesOnSameIp: device.applyToOtherPcDevicesOnSameIp === true,
+                pcVotingDevice: device.pcVotingDevice === true,
+                source: device.source || "whitelist_token",
                 expiresAt: device.expiresAt,
                 status: "Active"
             }))
@@ -5328,18 +5554,37 @@ app.post("/admin/whitelist/revoke", requireAuth, requireRole("admin"), async (re
             }
 
             const deviceData = deviceSnap.data() || {};
-            await deviceRef.set({
+            const revokedAt = admin.firestore.FieldValue.serverTimestamp();
+            const revokedBy = req.user?.uid || "admin";
+            const revokeUpdate = {
                 revoked: true,
-                revokedAt: admin.firestore.FieldValue.serverTimestamp(),
-                revokedBy: req.user?.uid || "admin"
-            }, { merge: true });
+                revokedAt,
+                revokedBy
+            };
+
+            if (deviceData.tokenHash) {
+                const relatedDevicesSnap = await db.collection("activated_devices")
+                    .where("tokenHash", "==", deviceData.tokenHash)
+                    .get();
+                const batch = db.batch();
+                relatedDevicesSnap.forEach((doc) => {
+                    const relatedData = doc.data() || {};
+                    if (relatedData.revoked !== true) {
+                        batch.set(doc.ref, revokeUpdate, { merge: true });
+                    }
+                });
+                batch.set(deviceRef, revokeUpdate, { merge: true });
+                await batch.commit();
+            } else {
+                await deviceRef.set(revokeUpdate, { merge: true });
+            }
 
             if (deviceData.tokenHash) {
                 await db.collection("whitelist_tokens").doc(deviceData.tokenHash).set({
                     revoked: true,
                     status: "revoked",
-                    revokedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    revokedBy: req.user?.uid || "admin"
+                    revokedAt,
+                    revokedBy
                 }, { merge: true });
             }
 
@@ -5399,7 +5644,7 @@ app.post("/activate/:token", async (req, res) => {
         const tokenRef = db.collection("whitelist_tokens").doc(tokenHash);
         const deviceFingerprint = getAssistedDeviceFingerprint(req);
         const deviceRef = db.collection("activated_devices").doc(deviceFingerprint);
-        const deviceIp = req.ip || req.headers["x-forwarded-for"] || "Unknown";
+        const deviceIp = getClientIp(req);
 
         let responsePayload = null;
 
@@ -5417,6 +5662,9 @@ app.post("/activate/:token", async (req, res) => {
             const tokenData = tokenSnap.data() || {};
             const tokenExpiresAt = tokenData.expiresAt?.toDate ? tokenData.expiresAt.toDate() : new Date(tokenData.expiresAt);
             const now = new Date();
+            const tokenIsPcVotingSession =
+                tokenData.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
+                tokenData.useFor === WHITELIST_USE_PC_VOTING_SESSION;
 
             const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
             const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
@@ -5431,7 +5679,17 @@ app.post("/activate/:token", async (req, res) => {
                 isExistingDeviceActive &&
                 existingDevice.tokenHash === tokenHash;
 
+            if (tokenIsPcVotingSession && (!isLikelyPcDeviceRequest(req) || !getVotingPcDeviceId(req))) {
+                failureCode = 403;
+                throw new Error("PC Voting Session tokens can only be activated from a recognized PC voting device.");
+            }
+
             if (isExistingActivationValid) {
+                if (tokenIsPcVotingSession && normalizeClientIp(existingDevice.deviceIp || "") !== deviceIp) {
+                    failureCode = 403;
+                    throw new Error("This PC Voting Session token is restricted to the school Wi-Fi/IP address where it was activated.");
+                }
+
                 responsePayload = {
                     activated: true,
                     alreadyActive: true,
@@ -5441,6 +5699,7 @@ app.post("/activate/:token", async (req, res) => {
                     gradeLevel: tokenData.gradeLevel,
                     badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                     useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
+                    applyToOtherPcDevicesOnSameIp: tokenData.applyToOtherPcDevicesOnSameIp === true,
                     activatedAt: existingDevice.activatedAt?.toDate ? existingDevice.activatedAt.toDate().toISOString() : null,
                     expiresAt: existingExpiry.toISOString(),
                     deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
@@ -5495,6 +5754,10 @@ app.post("/activate/:token", async (req, res) => {
                 tokenPreview: tokenData.tokenPreview,
                 badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                 useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
+                applyToOtherPcDevicesOnSameIp: tokenData.applyToOtherPcDevicesOnSameIp === true,
+                pcVotingDevice: tokenIsPcVotingSession,
+                clientSurface: tokenIsPcVotingSession ? "activate" : "activation",
+                sharedIpScope: tokenIsPcVotingSession && tokenData.applyToOtherPcDevicesOnSameIp === true ? deviceIp : null,
                 queueBypass: true,
                 revoked: false,
                 activatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5520,6 +5783,7 @@ app.post("/activate/:token", async (req, res) => {
                 gradeLevel: tokenData.gradeLevel,
                 badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                 useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
+                applyToOtherPcDevicesOnSameIp: tokenData.applyToOtherPcDevicesOnSameIp === true,
                 activatedAt: now.toISOString(),
                 expiresAt: deviceExpiresAt.toISOString(),
                 deviceFingerprintPreview: `${deviceFingerprint.slice(0, 6)}...${deviceFingerprint.slice(-6)}`,
@@ -5540,6 +5804,8 @@ app.post("/activate/:token", async (req, res) => {
                     deviceIp: responsePayload.deviceIp,
                     badgeType: responsePayload.badgeType,
                     useFor: responsePayload.useFor,
+                    applyToOtherPcDevicesOnSameIp: responsePayload.applyToOtherPcDevicesOnSameIp === true,
+                    pcVotingDevice: responsePayload.useFor === WHITELIST_USE_PC_VOTING_SESSION,
                     queueBypass: responsePayload.queueBypass,
                     activatedAt: responsePayload.activatedAt,
                     expiresAt: responsePayload.expiresAt
