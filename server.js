@@ -531,6 +531,8 @@ const WHITELIST_USE_EXTRA_DEVICES = "extra_devices";
 const WHITELIST_USE_PC_VOTING_SESSION = "pc_voting_session";
 const BADGE_TRUSTED_STUDENT_DEVICE = "trusted_student_device";
 const BADGE_FACILITY_VOTING_DEVICE = "facility_voting_device";
+const FACULTY_GRADE_LEVEL = "Faculty";
+const FACULTY_DEVICE_NAME_PREFIX = "TSF Faculty Device";
 const WHITELIST_TOKEN_ACTIVATION_TTL_MS = 2 * 60 * 60 * 1000;
 
 function normalizeClientIp(value = '') {
@@ -605,6 +607,80 @@ function getSharedPcDeviceLimit(data = {}) {
     return Math.max(1, Math.floor(rawLimit));
 }
 
+function isFacultyGradeLevel(value = "") {
+    return String(value || "").trim().toLowerCase() === FACULTY_GRADE_LEVEL.toLowerCase();
+}
+
+function buildFacultyDeviceName(number) {
+    return `${FACULTY_DEVICE_NAME_PREFIX} ${number}`;
+}
+
+function extractFacultyDeviceNumber(data = {}) {
+    const numeric = Number(data.facultyDeviceNumber);
+    if (Number.isInteger(numeric) && numeric > 0) return numeric;
+
+    const label = `${data.representativeName || ""} ${data.deviceName || ""}`;
+    const match = label.match(/TSF Faculty Device\s+(\d+)/i);
+    return match ? Number(match[1]) : null;
+}
+
+function getNextFacultyDeviceNumberFromSnapshot(snapshot, now = new Date()) {
+    const used = new Set();
+
+    snapshot.forEach((doc) => {
+        const data = doc.data() || {};
+        const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+        const active =
+            data.revoked !== true &&
+            expiresAt instanceof Date &&
+            !Number.isNaN(expiresAt.getTime()) &&
+            expiresAt > now;
+        const looksFaculty =
+            isFacultyGradeLevel(data.representativeGradeLevel || data.gradeLevel) ||
+            /^TSF Faculty Device\s+\d+/i.test(String(data.representativeName || data.deviceName || ""));
+
+        if (!active || !looksFaculty) return;
+
+        const number = extractFacultyDeviceNumber(data);
+        if (Number.isInteger(number) && number > 0) used.add(number);
+    });
+
+    let next = 1;
+    while (used.has(next)) next += 1;
+    return next;
+}
+
+async function buildFacultyDeviceIdentityForTransaction(tx, now = new Date()) {
+    const activeDevicesQuery = db.collection("activated_devices").where("revoked", "==", false);
+    const activeDevicesSnap = await tx.get(activeDevicesQuery);
+    const facultyDeviceNumber = getNextFacultyDeviceNumberFromSnapshot(activeDevicesSnap, now);
+    const label = buildFacultyDeviceName(facultyDeviceNumber);
+
+    return {
+        facultyDeviceNumber,
+        representativeName: label,
+        representativeFirstName: "TSF",
+        deviceName: label
+    };
+}
+
+function getNextFacultyDeviceNumberFromActiveDevices(devices = []) {
+    const used = new Set();
+    devices.forEach((device) => {
+        const looksFaculty =
+            isFacultyGradeLevel(device.representativeGradeLevel || device.gradeLevel) ||
+            /^TSF Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""));
+        if (!looksFaculty) return;
+
+        const number = extractFacultyDeviceNumber(device);
+        if (Number.isInteger(number) && number > 0) used.add(number);
+    });
+
+    let next = 1;
+    while (used.has(next)) next += 1;
+    return next;
+}
+
 function isActiveAssistedDeviceData(data, expiresAt, req) {
     if (!data || data.revoked === true) return false;
     if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
@@ -633,6 +709,7 @@ function buildAssistedDeviceStatusPayload(data, expiresAt) {
         tokenPreview: data.tokenPreview || "----...----",
         representativeName: data.representativeName || "Unknown Representative",
         gradeLevel: data.representativeGradeLevel || "",
+        facultyDeviceNumber: extractFacultyDeviceNumber(data),
         badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
         useFor: data.useFor || "",
         deviceName: data.deviceName || "Representative Device",
@@ -712,8 +789,12 @@ async function materializeSharedPcVotingSessionForRequest(req) {
     if (!sourceData.tokenHash || sharedPcDeviceLimit < 2) return null;
 
     const deviceIp = getClientIp(req);
+    const representativeGradeLevel = sourceData.representativeGradeLevel || sourceData.gradeLevel || "";
+    const isFacultyDeviceToken = isFacultyGradeLevel(representativeGradeLevel);
     const representativeName = sourceData.representativeName || "Unknown Representative";
-    const sharedDeviceName = `${getRepresentativeFirstName(representativeName)} Shared Voting PC`;
+    const sharedDeviceName = isFacultyDeviceToken
+        ? representativeName
+        : `${getRepresentativeFirstName(representativeName)} Shared Voting PC`;
     const activeDevicesForSharedToken = activeDevices.filter((device) =>
         device.tokenHash === sourceData.tokenHash &&
         normalizeClientIp(device.deviceIp || "") === deviceIp &&
@@ -732,7 +813,8 @@ async function materializeSharedPcVotingSessionForRequest(req) {
         deviceName: sharedDeviceName,
         deviceIp,
         representativeName,
-        representativeGradeLevel: sourceData.representativeGradeLevel || sourceData.gradeLevel || "",
+        representativeGradeLevel,
+        facultyDeviceNumber: isFacultyDeviceToken ? extractFacultyDeviceNumber(sourceData) : null,
         tokenHash: sourceData.tokenHash,
         tokenPreview: sourceData.tokenPreview || "----...----",
         badgeType: BADGE_FACILITY_VOTING_DEVICE,
@@ -784,10 +866,24 @@ async function materializeSharedPcVotingSessionForRequest(req) {
             return;
         }
 
-        const currentFingerprints = Array.isArray(tokenData.sharedPcActivatedDeviceFingerprints)
-            ? tokenData.sharedPcActivatedDeviceFingerprints.filter(Boolean)
-            : [];
-        const countedFingerprints = new Set(currentFingerprints);
+        const activeTokenDevicesSnap = await tx.get(
+            db.collection("activated_devices").where("tokenHash", "==", sourceData.tokenHash)
+        );
+        const countedFingerprints = new Set();
+        const transactionNow = new Date();
+        activeTokenDevicesSnap.forEach((doc) => {
+            const data = doc.data() || {};
+            const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt || 0);
+            const active =
+                data.revoked !== true &&
+                normalizeClientIp(data.deviceIp || "") === deviceIp &&
+                data.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
+                data.useFor === WHITELIST_USE_PC_VOTING_SESSION &&
+                expiresAt instanceof Date &&
+                !Number.isNaN(expiresAt.getTime()) &&
+                expiresAt > transactionNow;
+            if (active) countedFingerprints.add(doc.id);
+        });
         countedFingerprints.add(sourceSession.id);
 
         if (!countedFingerprints.has(deviceFingerprint) && countedFingerprints.size >= transactionLimit) {
@@ -795,6 +891,13 @@ async function materializeSharedPcVotingSessionForRequest(req) {
         }
 
         sharedData.sharedPcDeviceLimit = transactionLimit;
+
+        if (isFacultyDeviceToken) {
+            const facultyIdentity = await buildFacultyDeviceIdentityForTransaction(tx, new Date());
+            sharedData.deviceName = facultyIdentity.deviceName;
+            sharedData.representativeName = facultyIdentity.representativeName;
+            sharedData.facultyDeviceNumber = facultyIdentity.facultyDeviceNumber;
+        }
 
         tx.set(deviceRef, sharedData, { merge: true });
         tx.set(tokenRef, {
@@ -893,6 +996,7 @@ async function getActiveWhitelistedDevices(forceRefresh = false) {
             deviceName: data.deviceName || "Representative Device",
             representativeName: data.representativeName || "Unknown Representative",
             representativeGradeLevel: data.representativeGradeLevel || "",
+            facultyDeviceNumber: extractFacultyDeviceNumber(data),
             tokenHash: data.tokenHash || "",
             tokenPreview: data.tokenPreview || "----...----",
             deviceIp: data.deviceIp || "Unknown",
@@ -943,6 +1047,9 @@ async function getPendingWhitelistTokens(forceRefresh = false) {
             representativeName: data.representativeName || "Unknown Representative",
             representativeFirstName: data.representativeFirstName || getRepresentativeFirstName(data.representativeName),
             gradeLevel: data.gradeLevel || "",
+            facultyDeviceNumber: Number.isInteger(Number(data.facultyDeviceNumberPreview)) && Number(data.facultyDeviceNumberPreview) > 0
+                ? Number(data.facultyDeviceNumberPreview)
+                : extractFacultyDeviceNumber(data),
             badgeType: data.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
             useFor: data.useFor || WHITELIST_USE_EXTRA_DEVICES,
             privilegeDurationMs: Number(data.privilegeDurationMs || 0),
@@ -3916,6 +4023,9 @@ app.post("/verify", loginLimiter, async (req, res) => {
             assistedDevice: hasQueueBypassDevice,
             assistedDeviceExpiresAt: hasQueueBypassDevice ? assistedDeviceExpiry.toISOString() : null,
             assistedDeviceTokenPreview: hasQueueBypassDevice ? (assistedDeviceData.tokenPreview || "----...----") : null,
+            assistedDeviceName: hasQueueBypassDevice ? (assistedDeviceData.deviceName || "Representative Device") : null,
+            assistedDeviceRepresentativeName: hasQueueBypassDevice ? (assistedDeviceData.representativeName || "Unknown Representative") : null,
+            assistedDeviceFacultyDeviceNumber: hasQueueBypassDevice ? extractFacultyDeviceNumber(assistedDeviceData) : null,
             assistedDeviceBadgeType: hasQueueBypassDevice ? (assistedDeviceData.badgeType || "trusted_student_device") : null,
             assistedDeviceUseFor: hasQueueBypassDevice ? (assistedDeviceData.useFor || "") : null,
             assistedDeviceSharedPcLimit: hasQueueBypassDevice && assistedDeviceData.applyToOtherPcDevicesOnSameIp === true ? getSharedPcDeviceLimit(assistedDeviceData) : null,
@@ -5385,25 +5495,26 @@ app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (re
 
 app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (req, res) => {
     try {
-        const representativeName = sanitizeInput(req.body.representativeName || '');
-        const representativeFirstName = getRepresentativeFirstName(representativeName);
+        let representativeName = sanitizeInput(req.body.representativeName || '');
+        let representativeFirstName = getRepresentativeFirstName(representativeName);
         const gradeLevel = sanitizeInput(String(req.body.gradeLevel || ''));
         const useFor = sanitizeInput(req.body.useFor || '');
         const badgeType = sanitizeInput(req.body.badgeType || '');
         const applyToOtherPcDevicesOnSameIp = req.body.applyToOtherPcDevicesOnSameIp === true;
         const sharedPcDeviceLimitRaw = Number(req.body.sharedPcDeviceLimit);
         const expiresAtRaw = req.body.expiresAt;
+        const isFacultyDeviceToken = isFacultyGradeLevel(gradeLevel);
 
-        const allowedGrades = new Set(["7", "8", "9", "10", "11", "12"]);
+        const allowedGrades = new Set(["7", "8", "9", "10", "11", "12", FACULTY_GRADE_LEVEL]);
         const allowedBadgeTypes = new Set([BADGE_TRUSTED_STUDENT_DEVICE, BADGE_FACILITY_VOTING_DEVICE]);
         const allowedUseFor = new Set([WHITELIST_USE_EXTRA_DEVICES, WHITELIST_USE_PC_VOTING_SESSION]);
 
-        if (!representativeName) {
+        if (!representativeName && !isFacultyDeviceToken) {
             return res.status(400).json({ error: "Representative name is required." });
         }
 
         if (!allowedGrades.has(gradeLevel)) {
-            return res.status(400).json({ error: "A valid grade level from G7 to G12 is required." });
+            return res.status(400).json({ error: "A valid grade level from G7 to G12 or Faculty is required." });
         }
 
         if (!allowedUseFor.has(useFor)) {
@@ -5492,6 +5603,14 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             });
         }
 
+        const facultyDeviceNumberPreview = isFacultyDeviceToken
+            ? getNextFacultyDeviceNumberFromActiveDevices(activeDevices)
+            : null;
+        if (isFacultyDeviceToken) {
+            representativeName = buildFacultyDeviceName(facultyDeviceNumberPreview);
+            representativeFirstName = "TSF";
+        }
+
         const rawToken = buildWhitelistToken();
         const tokenHash = hashWhitelistToken(rawToken);
         const tokenPreview = `${rawToken.slice(0, 4)}...${rawToken.slice(-4)}`;
@@ -5502,6 +5621,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             representativeName,
             representativeFirstName,
             gradeLevel,
+            facultyDeviceToken: isFacultyDeviceToken,
+            facultyDeviceNumberPreview,
             useFor,
             badgeType,
             status: "active",
@@ -5518,7 +5639,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             assignedRepresentative: {
                 name: representativeName,
                 firstName: representativeFirstName,
-                gradeLevel
+                gradeLevel,
+                facultyDeviceNumberPreview
             },
             policy: {
                 validDuringElectionHours: true,
@@ -5544,6 +5666,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             representativeName,
             representativeFirstName,
             gradeLevel,
+            facultyDeviceToken: isFacultyDeviceToken,
+            facultyDeviceNumberPreview,
             useFor,
             badgeType,
             applyToOtherPcDevicesOnSameIp,
@@ -5563,6 +5687,8 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             representativeName,
             representativeFirstName,
             gradeLevel,
+            facultyDeviceToken: isFacultyDeviceToken,
+            facultyDeviceNumberPreview,
             useFor,
             badgeType,
             applyToOtherPcDevicesOnSameIp,
@@ -5594,7 +5720,11 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 id: token.id,
                 representativeName: token.representativeName,
                 representativeFirstName: token.representativeFirstName,
-                deviceName: `${token.representativeFirstName} Device`,
+                gradeLevel: token.gradeLevel,
+                facultyDeviceNumber: token.facultyDeviceNumber || null,
+                deviceName: isFacultyGradeLevel(token.gradeLevel)
+                    ? token.representativeName
+                    : `${token.representativeFirstName} Device`,
                 tokenPreview: token.tokenPreview,
                 deviceIp: "Awaiting activation",
                 badgeType: token.badgeType,
@@ -5608,6 +5738,9 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
                 type: "device",
                 id: device.id,
                 representativeName: device.representativeName,
+                representativeGradeLevel: device.representativeGradeLevel,
+                gradeLevel: device.representativeGradeLevel,
+                facultyDeviceNumber: device.facultyDeviceNumber || null,
                 deviceName: device.deviceName,
                 tokenPreview: device.tokenPreview,
                 deviceIp: device.deviceIp,
@@ -5622,10 +5755,18 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
             }))
         ].sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
 
+        const activeFacultyDeviceCount = devices.filter((device) =>
+            isFacultyGradeLevel(device.representativeGradeLevel) ||
+            /^TSF Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""))
+        ).length;
+        const nextFacultyDeviceNumber = getNextFacultyDeviceNumberFromActiveDevices(devices);
+
         res.json({
             success: true,
             maxDevices: strictSettings.maxDevices,
             activeCount: devices.length,
+            activeFacultyDeviceCount,
+            nextFacultyDeviceNumber,
             entries
         });
     } catch (e) {
@@ -5673,8 +5814,22 @@ app.post("/admin/whitelist/revoke", requireAuth, requireRole("admin"), async (re
                 revokedAt,
                 revokedBy
             };
+            const isSharedPcSessionDevice =
+                !!deviceData.tokenHash &&
+                deviceData.applyToOtherPcDevicesOnSameIp === true &&
+                isPcVotingSessionRecord(deviceData);
 
-            if (deviceData.tokenHash) {
+            if (isSharedPcSessionDevice) {
+                const batch = db.batch();
+                batch.set(deviceRef, revokeUpdate, { merge: true });
+                batch.set(db.collection("whitelist_tokens").doc(deviceData.tokenHash), {
+                    sharedPcActivatedDeviceFingerprints: admin.firestore.FieldValue.arrayRemove(id),
+                    sharedPcLastRevokedAt: revokedAt,
+                    sharedPcLastRevokedDeviceId: id,
+                    revokedBy
+                }, { merge: true });
+                await batch.commit();
+            } else if (deviceData.tokenHash) {
                 const relatedDevicesSnap = await db.collection("activated_devices")
                     .where("tokenHash", "==", deviceData.tokenHash)
                     .get();
@@ -5691,7 +5846,7 @@ app.post("/admin/whitelist/revoke", requireAuth, requireRole("admin"), async (re
                 await deviceRef.set(revokeUpdate, { merge: true });
             }
 
-            if (deviceData.tokenHash) {
+            if (deviceData.tokenHash && !isSharedPcSessionDevice) {
                 await db.collection("whitelist_tokens").doc(deviceData.tokenHash).set({
                     revoked: true,
                     status: "revoked",
@@ -5702,7 +5857,8 @@ app.post("/admin/whitelist/revoke", requireAuth, requireRole("admin"), async (re
 
             await logAdminAction(req, "REVOKE_WHITELIST_DEVICE", {
                 deviceId: id,
-                tokenHash: deviceData.tokenHash || null
+                tokenHash: deviceData.tokenHash || null,
+                sharedPcSessionDeviceOnly: isSharedPcSessionDevice
             });
         }
 
@@ -5777,6 +5933,8 @@ app.post("/activate/:token", async (req, res) => {
             const tokenIsPcVotingSession =
                 tokenData.badgeType === BADGE_FACILITY_VOTING_DEVICE &&
                 tokenData.useFor === WHITELIST_USE_PC_VOTING_SESSION;
+            const tokenGradeLevel = tokenData.gradeLevel || "";
+            const tokenIsFacultyDevice = isFacultyGradeLevel(tokenGradeLevel);
 
             const existingDevice = deviceSnap.exists ? (deviceSnap.data() || {}) : null;
             const existingExpiry = existingDevice?.expiresAt?.toDate ? existingDevice.expiresAt.toDate() : new Date(existingDevice?.expiresAt || 0);
@@ -5807,8 +5965,9 @@ app.post("/activate/:token", async (req, res) => {
                     alreadyActive: true,
                     queueBypass: existingDevice.queueBypass === true,
                     tokenPreview: tokenData.tokenPreview,
-                    representativeName: tokenData.representativeName,
-                    gradeLevel: tokenData.gradeLevel,
+                    representativeName: existingDevice.representativeName || tokenData.representativeName,
+                    gradeLevel: existingDevice.representativeGradeLevel || tokenData.gradeLevel,
+                    facultyDeviceNumber: extractFacultyDeviceNumber(existingDevice),
                     badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                     useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                     applyToOtherPcDevicesOnSameIp: tokenData.applyToOtherPcDevicesOnSameIp === true,
@@ -5844,7 +6003,6 @@ app.post("/activate/:token", async (req, res) => {
 
             const activationLimit = Number(tokenData.activationLimit || 1);
             const activationCount = Number(tokenData.activationCount || 0);
-            const deviceName = fallbackDeviceName;
             const privilegeDurationMs = Number(tokenData.privilegeDurationMs || 0);
             if (!Number.isFinite(privilegeDurationMs) || privilegeDurationMs <= 0) {
                 failureCode = 410;
@@ -5857,12 +6015,26 @@ app.post("/activate/:token", async (req, res) => {
                 throw new Error("This activation token has already reached its activation limit.");
             }
 
+            let activatedRepresentativeName = tokenData.representativeName || "Unknown Representative";
+            let activatedRepresentativeFirstName = tokenData.representativeFirstName || getRepresentativeFirstName(activatedRepresentativeName);
+            let deviceName = tokenIsFacultyDevice ? activatedRepresentativeName : fallbackDeviceName;
+            let facultyDeviceNumber = tokenIsFacultyDevice ? extractFacultyDeviceNumber(tokenData) : null;
+
+            if (tokenIsFacultyDevice) {
+                const facultyIdentity = await buildFacultyDeviceIdentityForTransaction(tx, now);
+                activatedRepresentativeName = facultyIdentity.representativeName;
+                activatedRepresentativeFirstName = facultyIdentity.representativeFirstName;
+                deviceName = facultyIdentity.deviceName;
+                facultyDeviceNumber = facultyIdentity.facultyDeviceNumber;
+            }
+
             tx.set(deviceRef, {
                 deviceFingerprint,
                 deviceName,
                 deviceIp,
-                representativeName: tokenData.representativeName,
-                representativeGradeLevel: tokenData.gradeLevel,
+                representativeName: activatedRepresentativeName,
+                representativeGradeLevel: tokenGradeLevel,
+                facultyDeviceNumber,
                 tokenHash,
                 tokenPreview: tokenData.tokenPreview,
                 badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
@@ -5893,6 +6065,13 @@ app.post("/activate/:token", async (req, res) => {
                 tokenUpdate.sharedPcActivatedDeviceFingerprints = admin.firestore.FieldValue.arrayUnion(deviceFingerprint);
             }
 
+            if (tokenIsFacultyDevice) {
+                tokenUpdate.representativeName = activatedRepresentativeName;
+                tokenUpdate.representativeFirstName = activatedRepresentativeFirstName;
+                tokenUpdate.facultyDeviceNumberPreview = facultyDeviceNumber;
+                tokenUpdate.activatedFacultyDeviceNumber = facultyDeviceNumber;
+            }
+
             tx.update(tokenRef, tokenUpdate);
 
             responsePayload = {
@@ -5900,8 +6079,9 @@ app.post("/activate/:token", async (req, res) => {
                 alreadyActive: false,
                 queueBypass: true,
                 tokenPreview: tokenData.tokenPreview,
-                representativeName: tokenData.representativeName,
-                gradeLevel: tokenData.gradeLevel,
+                representativeName: activatedRepresentativeName,
+                gradeLevel: tokenGradeLevel,
+                facultyDeviceNumber,
                 badgeType: tokenData.badgeType || BADGE_TRUSTED_STUDENT_DEVICE,
                 useFor: tokenData.useFor || WHITELIST_USE_EXTRA_DEVICES,
                 applyToOtherPcDevicesOnSameIp: tokenData.applyToOtherPcDevicesOnSameIp === true,
@@ -5922,6 +6102,7 @@ app.post("/activate/:token", async (req, res) => {
                     deviceName: responsePayload.deviceName,
                     representativeName: responsePayload.representativeName,
                     representativeGradeLevel: responsePayload.gradeLevel,
+                    facultyDeviceNumber: responsePayload.facultyDeviceNumber || null,
                     tokenPreview: responsePayload.tokenPreview,
                     deviceIp: responsePayload.deviceIp,
                     badgeType: responsePayload.badgeType,
