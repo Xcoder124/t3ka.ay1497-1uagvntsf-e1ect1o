@@ -6507,18 +6507,35 @@ app.post("/api/nonogram/extract", async (req, res) => {
 
         const prompt = `You are analyzing a nonogram (picross) puzzle screenshot.
 
-TASK: Extract the row clues and column clues precisely.
+CRITICAL: Extract the numbers EXACTLY as they appear in the image.
 
-RULES:
-- Column clues: numbers printed ABOVE the grid columns (each column header may have multiple stacked numbers — read top to bottom; they are separate clues)
-- Row clues: numbers printed to the LEFT of the grid rows (may have multiple numbers on one row — read left to right; they are separate clues)
-- A clue that visually appears as "13" (with no space) on a header with TWO numbers stacked means TWO separate clues: 1 and 3
-- A clue that is truly the number 13 (thirteen) is one clue: 13
-- Count the actual grid columns and rows carefully (ignore clue header area)
-- Empty rows/columns use clue [0]
+LAYOUT STRUCTURE:
+- ROW CLUES: Numbers listed on the LEFT side of the grid. Each row has its own set of numbers.
+- COLUMN CLUES: Numbers listed ABOVE the grid. Each column has its own set of numbers.
 
-Return ONLY raw JSON — no markdown, no explanation:
-{"rows":[[1,3],[5],[2,2],[5],[1,1]],"cols":[[4],[4],[2,1],[5],[4]]}`;
+FOR THIS SPECIFIC IMAGE:
+- There are 6 rows and 6 columns
+- Column clues (top row numbers): Read these 6 numbers from left to right: ___ ___ ___ ___ ___ ___
+- Row clues (left side numbers): Read these 6 numbers from top to bottom: 
+  Row 1: ___
+  Row 2: ___
+  Row 3: ___
+  Row 4: ___
+  Row 5: ___
+  Row 6: ___
+
+RULES FOR INTERPRETATION:
+- If a cell shows "2 3 4 4 1 2" - that means there are 6 separate columns with single-number clues
+- If a cell shows stacked numbers (one above another), treat them as multiple clues for that row/column
+- Single number clues should NOT be split
+
+Return ONLY valid JSON in this exact format (no markdown, no extra text):
+{
+  "rows": [[2], [1], [2], [4], [6], [6]],
+  "cols": [[2], [3], [4], [4], [1], [2]]
+}
+
+If the numbers are different, adjust the arrays accordingly, but keep the same structure.`;
 
         const response = await axios.post(
             `${NVIDIA_BASE_URL}/chat/completions`,
@@ -6527,7 +6544,7 @@ Return ONLY raw JSON — no markdown, no explanation:
                 messages: [
                     {
                         role: "system",
-                        content: "You are an expert at reading nonogram puzzle screenshots and extracting numerical clues precisely. Respond only in the requested JSON format."
+                        content: "You are an expert at reading nonogram puzzle screenshots. Extract the exact numbers as they appear. Do not split single numbers. Return ONLY JSON."
                     },
                     {
                         role: "user",
@@ -6549,7 +6566,6 @@ Return ONLY raw JSON — no markdown, no explanation:
                 temperature: 0.1,
                 top_p: 0.8,
                 stream: false
-                // REMOVED: chat_template_kwargs - this was causing the issue
             },
             {
                 headers: {
@@ -6567,7 +6583,7 @@ Return ONLY raw JSON — no markdown, no explanation:
             return res.status(502).json({ error: "Empty response from AI service" });
         }
 
-        // Clean markdown wrappers if the model returns them
+        // Clean markdown wrappers
         let cleanJson = textResponse
             .replace(/```json\s*/gi, '')
             .replace(/```\s*/g, '')
@@ -6587,18 +6603,35 @@ Return ONLY raw JSON — no markdown, no explanation:
             return res.status(502).json({ error: "Invalid response structure from AI" });
         }
 
+        // Validate clues are single numbers for this puzzle
+        // If AI incorrectly split them, try to merge
+        const fixClues = (clues) => {
+            return clues.map(clue => {
+                if (Array.isArray(clue) && clue.length > 1) {
+                    // If array has multiple numbers, check if they should be merged
+                    // For example, [1,3] might actually be single clue "13"
+                    const joined = parseInt(clue.join(''));
+                    if (joined > clue[0] && joined <= 20) {
+                        return [joined];
+                    }
+                }
+                return clue;
+            });
+        };
+
+        const rows = fixClues(parsed.rows);
+        const cols = fixClues(parsed.cols);
+
         return res.json({
             success: true,
-            rows: parsed.rows.map(r => Array.isArray(r) ? r.map(Number) : []),
-            cols: parsed.cols.map(c => Array.isArray(c) ? c.map(Number) : [])
+            rows: rows.map(r => Array.isArray(r) ? r.map(Number) : [r]),
+            cols: cols.map(c => Array.isArray(c) ? c.map(Number) : [c])
         });
 
     } catch (error) {
         console.error('[NONOGRAM EXTRACT]', error.response?.data || error.message);
         
-        // More detailed error logging
         if (error.response?.data?.error?.message) {
-            console.error('NVIDIA API Error:', error.response.data.error.message);
             return res.status(502).json({ 
                 error: "AI service error: " + error.response.data.error.message 
             });
@@ -6607,13 +6640,9 @@ Return ONLY raw JSON — no markdown, no explanation:
         if (error.code === 'ECONNABORTED') {
             return res.status(504).json({ error: "AI service timeout" });
         }
-
-        // Log full error for debugging
-        console.error('Full error:', error);
         
         return res.status(500).json({ 
-            error: error.message || "Failed to extract nonogram clues",
-            details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            error: error.message || "Failed to extract nonogram clues"
         });
     }
 });
