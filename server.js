@@ -6490,7 +6490,133 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
     }
 }
 
+app.post("/api/nonogram/extract", async (req, res) => {
+    try {
+        const { imageBase64, mediaType } = req.body;
 
+        if (!imageBase64 || typeof imageBase64 !== 'string') {
+            return res.status(400).json({ error: "Missing or invalid imageBase64" });
+        }
+        if (!mediaType || typeof mediaType !== 'string') {
+            return res.status(400).json({ error: "Missing or invalid mediaType" });
+        }
+
+        if (!NVIDIA_API_KEY) {
+            return res.status(503).json({ error: "NVIDIA_API_KEY not configured on server" });
+        }
+
+        const prompt = `You are analyzing a nonogram (picross) puzzle screenshot.
+
+TASK: Extract the row clues and column clues precisely.
+
+RULES:
+- Column clues: numbers printed ABOVE the grid columns (each column header may have multiple stacked numbers — read top to bottom; they are separate clues)
+- Row clues: numbers printed to the LEFT of the grid rows (may have multiple numbers on one row — read left to right; they are separate clues)
+- A clue that visually appears as "13" (with no space) on a header with TWO numbers stacked means TWO separate clues: 1 and 3
+- A clue that is truly the number 13 (thirteen) is one clue: 13
+- Count the actual grid columns and rows carefully (ignore clue header area)
+- Empty rows/columns use clue [0]
+
+Return ONLY raw JSON — no markdown, no explanation:
+{"rows":[[1,3],[5],[2,2],[5],[1,1]],"cols":[[4],[4],[2,1],[5],[4]]}`;
+
+        const response = await axios.post(
+            `${NVIDIA_BASE_URL}/chat/completions`,
+            {
+                model: "moonshotai/kimi-k2.5",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are an expert at reading nonogram puzzle screenshots and extracting numerical clues precisely. Respond only in the requested JSON format."
+                    },
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:${mediaType};base64,${imageBase64}`
+                                }
+                            },
+                            {
+                                type: "text",
+                                text: prompt
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 1024,
+                temperature: 0.1,
+                top_p: 0.8,
+                stream: false
+                // REMOVED: chat_template_kwargs - this was causing the issue
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                timeout: 30000
+            }
+        );
+
+        const textResponse = response.data?.choices?.[0]?.message?.content;
+
+        if (!textResponse) {
+            return res.status(502).json({ error: "Empty response from AI service" });
+        }
+
+        // Clean markdown wrappers if the model returns them
+        let cleanJson = textResponse
+            .replace(/```json\s*/gi, '')
+            .replace(/```\s*/g, '')
+            .trim();
+
+        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+            return res.status(502).json({ 
+                error: "No JSON found in AI response", 
+                raw: textResponse.substring(0, 500) 
+            });
+        }
+
+        const parsed = JSON.parse(jsonMatch[0]);
+
+        if (!Array.isArray(parsed.rows) || !Array.isArray(parsed.cols)) {
+            return res.status(502).json({ error: "Invalid response structure from AI" });
+        }
+
+        return res.json({
+            success: true,
+            rows: parsed.rows.map(r => Array.isArray(r) ? r.map(Number) : []),
+            cols: parsed.cols.map(c => Array.isArray(c) ? c.map(Number) : [])
+        });
+
+    } catch (error) {
+        console.error('[NONOGRAM EXTRACT]', error.response?.data || error.message);
+        
+        // More detailed error logging
+        if (error.response?.data?.error?.message) {
+            console.error('NVIDIA API Error:', error.response.data.error.message);
+            return res.status(502).json({ 
+                error: "AI service error: " + error.response.data.error.message 
+            });
+        }
+        
+        if (error.code === 'ECONNABORTED') {
+            return res.status(504).json({ error: "AI service timeout" });
+        }
+
+        // Log full error for debugging
+        console.error('Full error:', error);
+        
+        return res.status(500).json({ 
+            error: error.message || "Failed to extract nonogram clues",
+            details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
+    }
+});
 
 // ============================================
 // AI NAME VALIDATION ENDPOINT (2 ATTEMPTS PER DEVICE)
@@ -6623,131 +6749,6 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     } catch (error) {
         console.error('[MANUAL VERIFICATION] Error:', error);
         res.status(500).json({ error: "Failed to submit manual verification request" });
-    }
-});
-
-// ============================================
-// NONOGRAM SOLVER PROXY ENDPOINT
-// ============================================
-app.post("/api/nonogram/extract", async (req, res) => {
-    try {
-        const { imageBase64, mediaType } = req.body;
-
-        if (!imageBase64 || typeof imageBase64 !== 'string') {
-            return res.status(400).json({ error: "Missing or invalid imageBase64" });
-        }
-        if (!mediaType || typeof mediaType !== 'string') {
-            return res.status(400).json({ error: "Missing or invalid mediaType" });
-        }
-
-        if (!NVIDIA_API_KEY) {
-            return res.status(503).json({ error: "NVIDIA_API_KEY not configured on server" });
-        }
-
-        const prompt = `You are analyzing a nonogram (picross) puzzle screenshot.
-
-TASK: Extract the row clues and column clues precisely.
-
-RULES:
-- Column clues: numbers printed ABOVE the grid columns (each column header may have multiple stacked numbers — read top to bottom; they are separate clues)
-- Row clues: numbers printed to the LEFT of the grid rows (may have multiple numbers on one row — read left to right; they are separate clues)
-- A clue that visually appears as "13" (with no space) on a header with TWO numbers stacked means TWO separate clues: 1 and 3
-- A clue that is truly the number 13 (thirteen) is one clue: 13
-- Count the actual grid columns and rows carefully (ignore clue header area)
-- Empty rows/columns use clue [0]
-
-Return ONLY raw JSON — no markdown, no explanation:
-{"rows":[[1,3],[5],[2,2],[5],[1,1]],"cols":[[4],[4],[2,1],[5],[4]]}`;
-
-        const response = await axios.post(
-            `${NVIDIA_BASE_URL}/chat/completions`,
-            {
-                model: "moonshotai/kimi-k2.5",
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are an expert at reading nonogram puzzle screenshots and extracting numerical clues precisely. Respond only in the requested JSON format."
-                    },
-                    {
-                        role: "user",
-                        content: [
-                            {
-                                type: "image_url",
-                                image_url: {
-                                    url: `data:${mediaType};base64,${imageBase64}`
-                                }
-                            },
-                            {
-                                type: "text",
-                                text: prompt
-                            }
-                        ]
-                    }
-                ],
-                max_tokens: 1024,
-                temperature: 0.1,
-                top_p: 0.8,
-                stream: false,
-                chat_template_kwargs: { thinking: false }
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${NVIDIA_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json'
-                },
-                timeout: 30000
-            }
-        );
-
-        const textResponse = response.data?.choices?.[0]?.message?.content;
-
-        if (!textResponse) {
-            return res.status(502).json({ error: "Empty response from AI service" });
-        }
-
-        // Clean markdown wrappers if the model returns them
-        let cleanJson = textResponse
-            .replace(/```json\s*/gi, '')
-            .replace(/```\s*/g, '')
-            .trim();
-
-        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            return res.status(502).json({ 
-                error: "No JSON found in AI response", 
-                raw: textResponse.substring(0, 500) 
-            });
-        }
-
-        const parsed = JSON.parse(jsonMatch[0]);
-
-        if (!Array.isArray(parsed.rows) || !Array.isArray(parsed.cols)) {
-            return res.status(502).json({ error: "Invalid response structure from AI" });
-        }
-
-        return res.json({
-            success: true,
-            rows: parsed.rows.map(r => Array.isArray(r) ? r.map(Number) : []),
-            cols: parsed.cols.map(c => Array.isArray(c) ? c.map(Number) : [])
-        });
-
-    } catch (error) {
-        console.error('[NONOGRAM EXTRACT]', error.response?.data || error.message);
-        
-        if (error.response?.data?.error?.message) {
-            return res.status(502).json({ 
-                error: "AI service error: " + error.response.data.error.message 
-            });
-        }
-        
-        if (error.code === 'ECONNABORTED') {
-            return res.status(504).json({ error: "AI service timeout" });
-        }
-
-        return res.status(500).json({ 
-            error: error.message || "Failed to extract nonogram clues" 
-        });
     }
 });
 
