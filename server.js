@@ -6573,7 +6573,7 @@ If the numbers are different, adjust the arrays accordingly, but keep the same s
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 },
-                timeout: 30000
+                timeout: 3000000
             }
         );
 
