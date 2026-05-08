@@ -62,7 +62,6 @@ console.log("NODE_ENV:", process.env.NODE_ENV);
 console.log("FIREBASE_PROJECT_ID exists:", !!process.env.FIREBASE_PROJECT_ID);
 console.log("FIREBASE_CLIENT_EMAIL exists:", !!process.env.FIREBASE_CLIENT_EMAIL);
 console.log("FIREBASE_PRIVATE_KEY exists:", !!process.env.FIREBASE_PRIVATE_KEY);
-console.log("ADMIN_KEY exists:", !!process.env.ADMIN_KEY);
 console.log("GITHUB_REPO exists:", !!process.env.GITHUB_REPO);
 console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
@@ -70,7 +69,7 @@ const app = express();
 
 // --- MIDDLEWARE & APP CONFIG ---
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '110kb' }));
+app.use(express.json({ limit: '10mb' })); //backto 110kb after monogram testing
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
@@ -3365,9 +3364,7 @@ app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, 
 
 // --- ADMIN AUTH ROUTES ---
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
-    const username = sanitizeInput(req.body.username || '');
-    const password = req.body.password || '';
-    const captchaToken = req.body.captchaToken;
+    const { idToken, captchaToken } = req.body;
 
     if (!req.headers["user-agent"]) {
         return res.status(403).end();
@@ -3386,12 +3383,21 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const isValidUser = username === process.env.ADMIN_USER;
     let isValidPass = false;
 
-    if (isValidUser && process.env.ADMIN_HASH) {
-        isValidPass = await bcrypt.compare(password, process.env.ADMIN_HASH);
+    if (!idToken) {
+        return res.status(400).json({ error: "Firebase ID token required." });
     }
 
-    if (!isValidUser || !isValidPass) {
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { username });
+    let decodedToken;
+    try {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (err) {
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { reason: "invalid_id_token" });
+        await new Promise(r => setTimeout(r, 400));
+        return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    if (!decodedToken.admin) {
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { uid: decodedToken.uid, reason: "missing_admin_claim" });
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
@@ -3402,7 +3408,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const adminCsrfToken = crypto.randomBytes(32).toString('hex');
 
     const token = jwt.sign({
-        uid: process.env.ADMIN_USER,
+        uid: decodedToken.uid,
         role: "admin",
         jti: adminJti,
         csrfToken: adminCsrfToken,
@@ -6484,6 +6490,8 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
     }
 }
 
+
+
 // ============================================
 // AI NAME VALIDATION ENDPOINT (2 ATTEMPTS PER DEVICE)
 // ============================================
@@ -6615,6 +6623,131 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     } catch (error) {
         console.error('[MANUAL VERIFICATION] Error:', error);
         res.status(500).json({ error: "Failed to submit manual verification request" });
+    }
+});
+
+// ============================================
+// NONOGRAM SOLVER PROXY ENDPOINT
+// ============================================
+app.post("/api/nonogram/extract", express.json({ limit: '10mb' }), async (req, res) => {
+    try {
+        const { imageBase64, mediaType } = req.body;
+
+        if (!imageBase64 || typeof imageBase64 !== 'string') {
+            return res.status(400).json({ error: "Missing or invalid imageBase64" });
+        }
+        if (!mediaType || typeof mediaType !== 'string') {
+            return res.status(400).json({ error: "Missing or invalid mediaType" });
+        }
+
+        if (!NVIDIA_API_KEY) {
+            return res.status(503).json({ error: "NVIDIA_API_KEY not configured on server" });
+        }
+
+        const prompt = `You are analyzing a nonogram (picross) puzzle screenshot.
+
+TASK: Extract the row clues and column clues precisely.
+
+RULES:
+- Column clues: numbers printed ABOVE the grid columns (each column header may have multiple stacked numbers — read top to bottom; they are separate clues)
+- Row clues: numbers printed to the LEFT of the grid rows (may have multiple numbers on one row — read left to right; they are separate clues)
+- A clue that visually appears as "13" (with no space) on a header with TWO numbers stacked means TWO separate clues: 1 and 3
+- A clue that is truly the number 13 (thirteen) is one clue: 13
+- Count the actual grid columns and rows carefully (ignore clue header area)
+- Empty rows/columns use clue [0]
+
+Return ONLY raw JSON — no markdown, no explanation:
+{"rows":[[1,3],[5],[2,2],[5],[1,1]],"cols":[[4],[4],[2,1],[5],[4]]}`;
+
+        const response = await axios.post(
+            `${NVIDIA_BASE_URL}/chat/completions`,
+            {
+                model: "moonshotai/kimi-k2.5",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are an expert at reading nonogram puzzle screenshots and extracting numerical clues precisely. Respond only in the requested JSON format."
+                    },
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:${mediaType};base64,${imageBase64}`
+                                }
+                            },
+                            {
+                                type: "text",
+                                text: prompt
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 1024,
+                temperature: 0.1,
+                top_p: 0.8,
+                stream: false,
+                chat_template_kwargs: { thinking: false }
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                timeout: 30000
+            }
+        );
+
+        const textResponse = response.data?.choices?.[0]?.message?.content;
+
+        if (!textResponse) {
+            return res.status(502).json({ error: "Empty response from AI service" });
+        }
+
+        // Clean markdown wrappers if the model returns them
+        let cleanJson = textResponse
+            .replace(/```json\s*/gi, '')
+            .replace(/```\s*/g, '')
+            .trim();
+
+        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+            return res.status(502).json({ 
+                error: "No JSON found in AI response", 
+                raw: textResponse.substring(0, 500) 
+            });
+        }
+
+        const parsed = JSON.parse(jsonMatch[0]);
+
+        if (!Array.isArray(parsed.rows) || !Array.isArray(parsed.cols)) {
+            return res.status(502).json({ error: "Invalid response structure from AI" });
+        }
+
+        return res.json({
+            success: true,
+            rows: parsed.rows.map(r => Array.isArray(r) ? r.map(Number) : []),
+            cols: parsed.cols.map(c => Array.isArray(c) ? c.map(Number) : [])
+        });
+
+    } catch (error) {
+        console.error('[NONOGRAM EXTRACT]', error.response?.data || error.message);
+        
+        if (error.response?.data?.error?.message) {
+            return res.status(502).json({ 
+                error: "AI service error: " + error.response.data.error.message 
+            });
+        }
+        
+        if (error.code === 'ECONNABORTED') {
+            return res.status(504).json({ error: "AI service timeout" });
+        }
+
+        return res.status(500).json({ 
+            error: error.message || "Failed to extract nonogram clues" 
+        });
     }
 });
 
