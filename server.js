@@ -6394,7 +6394,7 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
         const response = await axios.post(
             `${NVIDIA_BASE_URL}/chat/completions`,
             {
-                model: "moonshotai/kimi-k2.5",
+                model: "moonshotai/kimi-k2.6",
                 messages: [
                     {
                         role: "system",
@@ -6523,7 +6523,7 @@ Return ONLY raw JSON — no markdown, no explanation:
         const response = await axios.post(
             `${NVIDIA_BASE_URL}/chat/completions`,
             {
-                model: "moonshotai/kimi-k2.5",
+                model: "moonshotai/kimi-k2.6",
                 messages: [
                     {
                         role: "system",
