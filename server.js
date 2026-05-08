@@ -6629,7 +6629,7 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
 // ============================================
 // NONOGRAM SOLVER PROXY ENDPOINT
 // ============================================
-app.post("/api/nonogram/extract", express.json({ limit: '10mb' }), async (req, res) => {
+app.post("/api/nonogram/extract", async (req, res) => {
     try {
         const { imageBase64, mediaType } = req.body;
 
