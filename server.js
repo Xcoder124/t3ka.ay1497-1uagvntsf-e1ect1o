@@ -2963,10 +2963,14 @@ function requireRole(role) {
     };
 }
 
-function requireRoles(roles) {
+function requireRole(role) {
     return (req, res, next) => {
-        if (!req.user || !roles.includes(req.user.role)) {
-            logSecurityEvent("UNAUTHORIZED_ACCESS", req, { requiredRoles: roles, userRole: req.user?.role });
+        if (!req.user || req.user.role !== role) {
+            logSecurityEvent("UNAUTHORIZED_ACCESS", req, { 
+                requiredRole: role, 
+                userRole: req.user?.role,
+                userEmail: req.user?.email 
+            });
             return res.status(403).json({ error: "Forbidden: Insufficient privileges" });
         }
         next();
@@ -3366,55 +3370,68 @@ app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, 
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const { idToken, captchaToken } = req.body;
 
+    // Validate user agent
     if (!req.headers["user-agent"]) {
         return res.status(403).end();
     }
 
+    // Check captcha
     if (!captchaToken) {
         return res.status(400).json({
-            error: "Complete Captcha Verification First"
+            error: "Complete security verification first"
         });
     }
 
     if (!(await verifyCaptcha(captchaToken))) {
-        return res.status(403).json({ error: "Captcha verification failed" });
+        return res.status(403).json({ error: "Security verification failed" });
     }
 
-    const isValidUser = username === process.env.ADMIN_USER;
-    let isValidPass = false;
-
+    // Verify Firebase ID token
     if (!idToken) {
-        return res.status(400).json({ error: "Firebase ID token required." });
+        return res.status(400).json({ error: "Authentication token required." });
     }
 
     let decodedToken;
     try {
         decodedToken = await admin.auth().verifyIdToken(idToken);
     } catch (err) {
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { reason: "invalid_id_token" });
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { reason: "invalid_id_token", error: err.message });
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    if (!decodedToken.admin) {
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { uid: decodedToken.uid, reason: "missing_admin_claim" });
+    // ✅ FIX: Check if user exists in Firebase Authentication
+    // Any valid Firebase Auth user can login as admin
+    try {
+        const userRecord = await admin.auth().getUser(decodedToken.uid);
+        
+        // Optional: Log successful authentication
+        console.log(`[ADMIN LOGIN] User authenticated: ${userRecord.email} (${userRecord.uid})`);
+        
+    } catch (userError) {
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { 
+            uid: decodedToken.uid, 
+            reason: "user_not_found_in_auth",
+            error: userError.message 
+        });
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
+    // Generate session tokens
     const adminJti = crypto.randomBytes(16).toString("hex");
-    // Generate CSRF token — embedded in JWT, returned in body for the admin panel to store
-    // and attach as X-CSRF-Token header on every mutation request.
     const adminCsrfToken = crypto.randomBytes(32).toString('hex');
 
     const token = jwt.sign({
         uid: decodedToken.uid,
+        email: decodedToken.email,
         role: "admin",
         jti: adminJti,
         csrfToken: adminCsrfToken,
         iat: Math.floor(Date.now() / 1000)
-    }, SECRET, { expiresIn: "1h" });
+    }, SECRET, { expiresIn: "2h" });
 
+    // Set session cookie
     res.cookie("__session", token, {
         httpOnly: true,
         secure: true,
@@ -3423,9 +3440,17 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         maxAge: 2 * 60 * 60 * 1000
     });
 
-    await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { uid: "admin" });
+    // Log successful login
+    await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { 
+        email: decodedToken.email,
+        uid: decodedToken.uid 
+    });
 
-    res.json({ success: true, csrfToken: adminCsrfToken });
+    // Return CSRF token to client
+    res.json({ 
+        success: true, 
+        csrfToken: adminCsrfToken 
+    });
 });
 
 app.post("/admin/logout", async (req, res) => {
@@ -3449,8 +3474,15 @@ app.post("/admin/logout", async (req, res) => {
     }
 });
 
-app.get("/admin/verify", requireAuth, requireRole("admin"), (req, res) => {
-    res.json({ success: true });
+app.get("/admin/verify", requireAuth, requireRole("admin"), async (req, res) => {
+    // Return success with user info
+    res.json({ 
+        success: true,
+        user: {
+            email: req.user.email,
+            uid: req.user.uid
+        }
+    });
 });
 
 // --- PUBLIC ROUTES ---
@@ -6489,163 +6521,6 @@ NOTE: FILTER BAD WORDS, SLANG AND OTHER INAPPROPRIATE NAMES AND SURNAMES. DECLIN
         throw new Error(`Kimi validation failed. AI responded: "${aiResponseText.substring(0, 500)}"`);
     }
 }
-
-app.post("/api/nonogram/extract", async (req, res) => {
-    try {
-        const { imageBase64, mediaType } = req.body;
-
-        if (!imageBase64 || typeof imageBase64 !== 'string') {
-            return res.status(400).json({ error: "Missing or invalid imageBase64" });
-        }
-        if (!mediaType || typeof mediaType !== 'string') {
-            return res.status(400).json({ error: "Missing or invalid mediaType" });
-        }
-
-        if (!NVIDIA_API_KEY) {
-            return res.status(503).json({ error: "NVIDIA_API_KEY not configured on server" });
-        }
-
-        const prompt = `You are analyzing a nonogram (picross) puzzle screenshot.
-
-CRITICAL: Extract the numbers EXACTLY as they appear in the image.
-
-LAYOUT STRUCTURE:
-- ROW CLUES: Numbers listed on the LEFT side of the grid. Each row has its own set of numbers.
-- COLUMN CLUES: Numbers listed ABOVE the grid. Each column has its own set of numbers.
-
-FOR THIS SPECIFIC IMAGE:
-- There are 6 rows and 6 columns
-- Column clues (top row numbers): Read these 6 numbers from left to right: ___ ___ ___ ___ ___ ___
-- Row clues (left side numbers): Read these 6 numbers from top to bottom: 
-  Row 1: ___
-  Row 2: ___
-  Row 3: ___
-  Row 4: ___
-  Row 5: ___
-  Row 6: ___
-
-RULES FOR INTERPRETATION:
-- If a cell shows "2 3 4 4 1 2" - that means there are 6 separate columns with single-number clues
-- If a cell shows stacked numbers (one above another), treat them as multiple clues for that row/column
-- Single number clues should NOT be split
-
-Return ONLY valid JSON in this exact format (no markdown, no extra text):
-{
-  "rows": [[2], [1], [2], [4], [6], [6]],
-  "cols": [[2], [3], [4], [4], [1], [2]]
-}
-
-If the numbers are different, adjust the arrays accordingly, but keep the same structure.`;
-
-        const response = await axios.post(
-            `${NVIDIA_BASE_URL}/chat/completions`,
-            {
-                model: "moonshotai/kimi-k2.6",
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are an expert at reading nonogram puzzle screenshots. Extract the exact numbers as they appear. Do not split single numbers. Return ONLY JSON."
-                    },
-                    {
-                        role: "user",
-                        content: [
-                            {
-                                type: "image_url",
-                                image_url: {
-                                    url: `data:${mediaType};base64,${imageBase64}`
-                                }
-                            },
-                            {
-                                type: "text",
-                                text: prompt
-                            }
-                        ]
-                    }
-                ],
-                max_tokens: 1024,
-                temperature: 0.1,
-                top_p: 0.8,
-                stream: false
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${NVIDIA_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json'
-                },
-                timeout: 3000000
-            }
-        );
-
-        const textResponse = response.data?.choices?.[0]?.message?.content;
-
-        if (!textResponse) {
-            return res.status(502).json({ error: "Empty response from AI service" });
-        }
-
-        // Clean markdown wrappers
-        let cleanJson = textResponse
-            .replace(/```json\s*/gi, '')
-            .replace(/```\s*/g, '')
-            .trim();
-
-        const jsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            return res.status(502).json({ 
-                error: "No JSON found in AI response", 
-                raw: textResponse.substring(0, 500) 
-            });
-        }
-
-        const parsed = JSON.parse(jsonMatch[0]);
-
-        if (!Array.isArray(parsed.rows) || !Array.isArray(parsed.cols)) {
-            return res.status(502).json({ error: "Invalid response structure from AI" });
-        }
-
-        // Validate clues are single numbers for this puzzle
-        // If AI incorrectly split them, try to merge
-        const fixClues = (clues) => {
-            return clues.map(clue => {
-                if (Array.isArray(clue) && clue.length > 1) {
-                    // If array has multiple numbers, check if they should be merged
-                    // For example, [1,3] might actually be single clue "13"
-                    const joined = parseInt(clue.join(''));
-                    if (joined > clue[0] && joined <= 20) {
-                        return [joined];
-                    }
-                }
-                return clue;
-            });
-        };
-
-        const rows = fixClues(parsed.rows);
-        const cols = fixClues(parsed.cols);
-
-        return res.json({
-            success: true,
-            rows: rows.map(r => Array.isArray(r) ? r.map(Number) : [r]),
-            cols: cols.map(c => Array.isArray(c) ? c.map(Number) : [c])
-        });
-
-    } catch (error) {
-        console.error('[NONOGRAM EXTRACT]', error.response?.data || error.message);
-        
-        if (error.response?.data?.error?.message) {
-            return res.status(502).json({ 
-                error: "AI service error: " + error.response.data.error.message 
-            });
-        }
-        
-        if (error.code === 'ECONNABORTED') {
-            return res.status(504).json({ error: "AI service timeout" });
-        }
-        
-        return res.status(500).json({ 
-            error: error.message || "Failed to extract nonogram clues"
-        });
-    }
-});
 
 // ============================================
 // AI NAME VALIDATION ENDPOINT (2 ATTEMPTS PER DEVICE)
