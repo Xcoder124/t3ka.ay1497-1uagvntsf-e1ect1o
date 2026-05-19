@@ -1548,8 +1548,10 @@ async function restoreElectionFromBackup(jsonData, providedHash) {
 
 app.get('/api/firebase-config', (req, res) => {
     res.json({
-        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`,
-        projectId: process.env.FIREBASE_PROJECT_ID
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        apiKey: process.env.FIREBASE_API_KEY, // Ensure this maps to the web API key
+        authDomain: `${process.env.FIREBASE_PROJECT_ID}.firebaseapp.com`,
+        databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app`
     });
 });
 
