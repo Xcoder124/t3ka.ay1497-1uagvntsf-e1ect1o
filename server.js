@@ -174,7 +174,7 @@ app.post("/api/academic-review", async (req, res) => {
                 temperature: 1,
                 top_p: 1,
 
-                max_tokens: 400,
+                max_tokens: 1000,
 
                 // NVIDIA sends chunks because streaming is enabled.
                 stream: true
