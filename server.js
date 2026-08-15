@@ -8,43 +8,62 @@ const PORT = process.env.PORT || 10000;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
 const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
-// Set FRONTEND_URL in Render to your Firebase Hosting URL.
-// Example: https://tsf-g-digital-election.web.app
 const allowedOrigins = [
-    process.env.FRONTEND_URL,
-    "http://127.0.0.1:5500",
-    "http://localhost:5500"
-].filter(Boolean);
+    "https://tsf-g-digital-election.web.app",
+    "https://tsf-g-digital-election.firebaseapp.com",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500"
+];
 
+// IMPORTANT: CORS must be registered BEFORE your routes.
 app.use(cors({
-    origin(origin, callback) {
-        // Allow non-browser/server requests with no Origin.
-        if (!origin) return callback(null, true);
+    origin: function (origin, callback) {
+        // Requests without an Origin header
+        // are allowed (curl, Render health checks, etc.)
+        if (!origin) {
+            return callback(null, true);
+        }
 
         if (allowedOrigins.includes(origin)) {
             return callback(null, true);
         }
 
-        return callback(new Error(`CORS blocked origin: ${origin}`));
+        console.log("Blocked CORS origin:", origin);
+        return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["POST", "GET", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Accept"]
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Accept"],
+    optionsSuccessStatus: 204
 }));
 
+// Explicitly handle preflight requests.
+app.options("*", cors());
+
 app.use(express.json({ limit: "100kb" }));
+
+
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
 
 app.get("/health", (req, res) => {
     res.json({
         ok: true,
-        service: "academic-reviewer",
-        provider: "NVIDIA Kimi"
+        service: "academic-reviewer"
     });
 });
 
+
+// --------------------------------------------------
+// ACADEMIC REVIEWER
+// --------------------------------------------------
+
 app.post("/api/academic-review", async (req, res) => {
     try {
+
         if (!NVIDIA_API_KEY) {
             console.error("NVIDIA_API_KEY is not configured.");
+
             return res.status(500).json({
                 error: "Server AI configuration is missing."
             });
@@ -58,49 +77,61 @@ app.post("/api/academic-review", async (req, res) => {
             });
         }
 
-        // The backend constructs the actual Kimi request.
-        // The browser never sees the NVIDIA API key.
-       const response = await axios.post(
-    NVIDIA_URL,
-    {
-        model: "openai/gpt-oss-120b",
-        messages: [
+        console.log(
+            `[ACADEMIC REVIEW] Request received from ${req.headers.origin || "unknown origin"}`
+        );
+
+        const response = await axios.post(
+            NVIDIA_URL,
             {
-                role: "system",
-                content:
-                    "You are an expert science academic reviewer and tutor. " +
-                    "Teach through scenario recognition and reasoning. " +
-                    "Respond clearly and naturally."
+                model: "openai/gpt-oss-120b",
+
+                messages: [
+                    {
+                        role: "system",
+                        content:
+                            "You are an expert science academic reviewer and tutor. " +
+                            "Teach through scenario recognition and reasoning. " +
+                            "Respond clearly and naturally."
+                    },
+                    {
+                        role: "user",
+                        content: prompt
+                    }
+                ],
+
+                temperature: 1,
+                top_p: 1,
+                max_tokens: 700,
+                stream: false
             },
             {
-                role: "user",
-                content: prompt
+                headers: {
+                    Authorization: `Bearer ${NVIDIA_API_KEY}`,
+                    "Content-Type": "application/json",
+                    Accept: "application/json"
+                },
+
+                timeout: 90000
             }
-        ],
-        temperature: 1,
-        top_p: 1,
-        max_tokens: 4096,
-        stream: false
-    },
-    {
-        headers: {
-            Authorization: `Bearer ${NVIDIA_API_KEY}`,
-            "Content-Type": "application/json",
-            Accept: "application/json"
-        },
-        timeout: 90000
-    }
-);
+        );
 
         const answer =
             response.data?.choices?.[0]?.message?.content;
 
         if (!answer) {
-            console.error("NVIDIA returned no message content:", response.data);
+
+            console.error(
+                "NVIDIA returned no message content:",
+                response.data
+            );
+
             return res.status(502).json({
                 error: "AI returned an empty response."
             });
         }
+
+        console.log("[ACADEMIC REVIEW] NVIDIA response received.");
 
         return res.json({
             success: true,
@@ -108,11 +139,19 @@ app.post("/api/academic-review", async (req, res) => {
         });
 
     } catch (error) {
-        const details = error.response?.data || error.message;
 
-        console.error("[NVIDIA/KIMI ERROR]", details);
+        const details =
+            error.response?.data ||
+            error.message;
 
-        return res.status(error.response?.status || 500).json({
+        console.error(
+            "[NVIDIA/KIMI ERROR]",
+            details
+        );
+
+        return res.status(
+            error.response?.status || 500
+        ).json({
             error: "Academic reviewer request failed.",
             details:
                 typeof details === "string"
@@ -122,6 +161,13 @@ app.post("/api/academic-review", async (req, res) => {
     }
 });
 
+
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Academic Reviewer backend listening on port ${PORT}`);
+    console.log(
+        `Academic Reviewer backend listening on port ${PORT}`
+    );
 });
