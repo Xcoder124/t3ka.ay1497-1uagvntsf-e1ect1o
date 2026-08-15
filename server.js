@@ -77,10 +77,10 @@ app.post("/api/academic-review", async (req, res) => {
                         content: prompt
                     }
                 ],
-                max_tokens: 1200,
-                temperature: 0.2,
-                top_p: 0.8,
-                stream: false,
+                max_tokens: 700,
+temperature: 0.2,
+top_p: 0.8,
+stream: false
                 chat_template_kwargs: {
                     thinking: false
                 }
@@ -91,7 +91,7 @@ app.post("/api/academic-review", async (req, res) => {
                     "Content-Type": "application/json",
                     Accept: "application/json"
                 },
-                timeout: 40000
+                timeout: 90000
             }
         );
 
