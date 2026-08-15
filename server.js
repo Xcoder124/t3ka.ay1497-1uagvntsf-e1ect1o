@@ -102,8 +102,8 @@ app.post("/api/academic-review", async (req, res) => {
 
                 temperature: 1,
                 top_p: 1,
-                max_tokens: 700,
-                stream: false
+                max_tokens: 400,
+                stream: true
             },
             {
                 headers: {
@@ -112,7 +112,7 @@ app.post("/api/academic-review", async (req, res) => {
                     Accept: "application/json"
                 },
 
-                timeout: 90000
+                timeout: 180000
             }
         );
 
