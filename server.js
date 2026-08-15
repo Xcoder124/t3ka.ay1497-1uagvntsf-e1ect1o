@@ -63,7 +63,7 @@ app.post("/api/academic-review", async (req, res) => {
         const response = await axios.post(
             NVIDIA_URL,
             {
-                model: "moonshotai/kimi-k2.6",
+                model: "openai/gpt-oss-120b",
                 messages: [
                     {
                         role: "system",
