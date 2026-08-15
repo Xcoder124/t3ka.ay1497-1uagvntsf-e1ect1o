@@ -80,7 +80,7 @@ app.post("/api/academic-review", async (req, res) => {
                 max_tokens: 700,
 temperature: 0.2,
 top_p: 0.8,
-stream: false
+stream: false,
                 chat_template_kwargs: {
                     thinking: false
                 }
