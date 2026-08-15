@@ -60,40 +60,37 @@ app.post("/api/academic-review", async (req, res) => {
 
         // The backend constructs the actual Kimi request.
         // The browser never sees the NVIDIA API key.
-        const response = await axios.post(
-            NVIDIA_URL,
+       const response = await axios.post(
+    NVIDIA_URL,
+    {
+        model: "openai/gpt-oss-120b",
+        messages: [
             {
-                model: "openai/gpt-oss-120b",
-                messages: [
-                    {
-                        role: "system",
-                        content:
-                            "You are an expert science academic reviewer and tutor. " +
-                            "Teach through scenario recognition and reasoning. " +
-                            "Respond clearly and naturally."
-                    },
-                    {
-                        role: "user",
-                        content: prompt
-                    }
-                ],
-                max_tokens: 700,
-temperature: 0.2,
-top_p: 0.8,
-stream: false,
-                chat_template_kwargs: {
-                    thinking: false
-                }
+                role: "system",
+                content:
+                    "You are an expert science academic reviewer and tutor. " +
+                    "Teach through scenario recognition and reasoning. " +
+                    "Respond clearly and naturally."
             },
             {
-                headers: {
-                    Authorization: `Bearer ${NVIDIA_API_KEY}`,
-                    "Content-Type": "application/json",
-                    Accept: "application/json"
-                },
-                timeout: 90000
+                role: "user",
+                content: prompt
             }
-        );
+        ],
+        temperature: 1,
+        top_p: 1,
+        max_tokens: 4096,
+        stream: false
+    },
+    {
+        headers: {
+            Authorization: `Bearer ${NVIDIA_API_KEY}`,
+            "Content-Type": "application/json",
+            Accept: "application/json"
+        },
+        timeout: 90000
+    }
+);
 
         const answer =
             response.data?.choices?.[0]?.message?.content;
