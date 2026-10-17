@@ -378,7 +378,11 @@ async function getVoterStatusCache() {
     return LiveVoterStatus;
 }
 
-const ACCESS_CODE_KEY = process.env.BACKUP_SECRET;
+const ACCESS_CODE_KEY = crypto.scryptSync(
+    process.env.BACKUP_SECRET || "",
+    "tsf-access-code-kdf-salt-v1",
+    32
+);
 
 setInterval(async () => {
     try {
@@ -1132,21 +1136,24 @@ async function consumeNonce(nonce, jti) {
     return accepted;
 }
 
-// Purge nonces older than 2 minutes every 60 seconds (keeps collection lean)
+// Purge expired nonces, receipt recovery records, and revocation records every 60 seconds.
 setInterval(async () => {
     try {
-        const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - 120_000);
-        const snap = await db.collection('used_nonces')
-            .where('usedAt', '<', cutoff)
-            .limit(200)
-            .get();
-        if (snap.empty) return;
+        const nowTs = admin.firestore.Timestamp.now();
+        const nonceCutoff = admin.firestore.Timestamp.fromMillis(Date.now() - 600_000);
+        const [nonceSnap, recoverySnap, revokedSnap] = await Promise.all([
+            db.collection("used_nonces").where("usedAt", "<", nonceCutoff).limit(200).get(),
+            db.collection("receipt_recovery").where("expiresAt", "<", nowTs).limit(200).get(),
+            db.collection("revoked_jtis").where("expiresAt", "<", nowTs).limit(200).get()
+        ]);
+        if (nonceSnap.empty && recoverySnap.empty && revokedSnap.empty) return;
         const batch = db.batch();
-        snap.forEach(doc => batch.delete(doc.ref));
+        nonceSnap.forEach(doc => batch.delete(doc.ref));
+        recoverySnap.forEach(doc => batch.delete(doc.ref));
+        revokedSnap.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
-        console.log(`[NONCE] Purged ${snap.size} expired nonce(s)`);
     } catch (e) {
-        console.error('[NONCE CLEANUP] Error:', e);
+        console.error("[CLEANUP] Error:", e);
     }
 }, 60_000);
 
@@ -1227,31 +1234,38 @@ function calculateETA(position, currentServing, maxActive = QUEUE_MAX_ACTIVE, av
 
 function encryptAccessCode(code) {
     if (!code) return null;
-    const key = crypto.createHash("sha256").update(ACCESS_CODE_KEY).digest();
     const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const cipher = crypto.createCipheriv("aes-256-gcm", ACCESS_CODE_KEY, iv);
     const encrypted = Buffer.concat([cipher.update(code.toUpperCase(), "utf8"), cipher.final()]);
     const authTag = cipher.getAuthTag();
-    return `gcm:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+    return `gcm2:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
 }
 
 function decryptAccessCode(encryptedCode) {
     if (!encryptedCode || !encryptedCode.includes(":")) return null;
     try {
-        const key = crypto.createHash("sha256").update(ACCESS_CODE_KEY).digest();
-        // Support both new AES-256-GCM ("gcm:iv:tag:cipher") and legacy AES-256-CBC ("iv:cipher")
-        if (encryptedCode.startsWith("gcm:")) {
+        if (encryptedCode.startsWith("gcm2:")) {
             const [, ivHex, tagHex, cipherHex] = encryptedCode.split(":");
-            const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
+            if (!ivHex || !tagHex || cipherHex === undefined) return null;
+            const decipher = crypto.createDecipheriv("aes-256-gcm", ACCESS_CODE_KEY, Buffer.from(ivHex, "hex"));
             decipher.setAuthTag(Buffer.from(tagHex, "hex"));
             return Buffer.concat([decipher.update(Buffer.from(cipherHex, "hex")), decipher.final()]).toString("utf8");
-        } else {
-            const [ivHex, encrypted] = encryptedCode.split(":");
-            const decipher = crypto.createDecipheriv("aes-256-cbc", key, Buffer.from(ivHex, "hex"));
-            let decrypted = decipher.update(encrypted, "hex", "utf8");
-            decrypted += decipher.final("utf8");
-            return decrypted;
         }
+        // Backward compatibility for legacy gcm: and CBC formats.
+        const legacyKey = crypto.createHash("sha256").update(process.env.BACKUP_SECRET || "").digest();
+        if (encryptedCode.startsWith("gcm:")) {
+            const [, ivHex, tagHex, cipherHex] = encryptedCode.split(":");
+            if (!ivHex || !tagHex || cipherHex === undefined) return null;
+            const decipher = crypto.createDecipheriv("aes-256-gcm", legacyKey, Buffer.from(ivHex, "hex"));
+            decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+            return Buffer.concat([decipher.update(Buffer.from(cipherHex, "hex")), decipher.final()]).toString("utf8");
+        }
+        const [ivHex, encrypted] = encryptedCode.split(":");
+        if (!ivHex || encrypted === undefined) return null;
+        const decipher = crypto.createDecipheriv("aes-256-cbc", legacyKey, Buffer.from(ivHex, "hex"));
+        let decrypted = decipher.update(encrypted, "hex", "utf8");
+        decrypted += decipher.final("utf8");
+        return decrypted;
     } catch (e) {
         console.error("Failed to decrypt access code:", e.message);
         return null;
@@ -1321,32 +1335,26 @@ async function updateVoterStatusInRTDB(voterId, { hasVoted, isMissed, integrityS
 // AI SERVICE AUTHENTICATION - STRICT SECURITY
 // ============================================
 
-function requireAIServiceOnly(req, res, next) {
-    const aiKey = req.headers['x-ai-service-key'];
-    const origin = req.headers.origin || req.headers.referer;
+function timingSafeEqualString(a, b) {
+    if (typeof a !== "string" || typeof b !== "string") return false;
+    const bufA = Buffer.from(a, "utf8");
+    const bufB = Buffer.from(b, "utf8");
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+}
 
-    // Must have valid key
-    if (!aiKey || !AI_SERVICE_KEY || aiKey !== AI_SERVICE_KEY) {
+function requireAIServiceOnly(req, res, next) {
+    const aiKey = req.headers["x-ai-service-key"];
+    const origin = req.headers.origin || req.headers.referer;
+    if (!aiKey || !AI_SERVICE_KEY || !timingSafeEqualString(String(aiKey), String(AI_SERVICE_KEY))) {
         return res.status(401).json({ error: "Invalid or missing AI Service key" });
     }
-
-    // Must have valid origin
-    const isAllowedOrigin = ALLOWED_AI_ORIGINS.some(allowed => {
-        return origin === allowed || origin?.startsWith(allowed);
-    });
-
-    if (!isAllowedOrigin && process.env.NODE_ENV === 'production') {
+    const isAllowedOrigin = ALLOWED_AI_ORIGINS.some(allowed => origin === allowed || origin?.startsWith(allowed));
+    if (!isAllowedOrigin && process.env.NODE_ENV === "production") {
         console.warn(`[AI AUTH] Blocked request from origin: ${origin}`);
         return res.status(403).json({ error: "Forbidden: Invalid origin" });
     }
-
-    // Set AI context
-    req.user = {
-        uid: 'AI_SERVICE',
-        role: 'ai_service',
-        isAIService: true
-    };
-
+    req.user = { uid: "AI_SERVICE", role: "ai_service", isAIService: true };
     next();
 }
 
@@ -2608,7 +2616,7 @@ const revealLvnLimiter = rateLimit({
     message: { error: "Too many LVN reveal requests. Please slow down." },
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => req.ip,
+    keyGenerator: (req) => getClientIp(req),
 });
 
 const adminLoginLimiter = rateLimit({
@@ -3004,7 +3012,8 @@ function verifyCSRF(req, res, next) {
 async function revokeJti(jti) {
     if (!jti) return;
     await db.collection("revoked_jtis").doc(jti).set({
-        revokedAt: admin.firestore.FieldValue.serverTimestamp()
+        revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 24 * 60 * 60 * 1000)
     });
 }
 
@@ -3034,16 +3043,6 @@ async function requireAuth(req, res, next) {
     } catch (err) {
         return res.status(401).end();
     }
-}
-
-function requireRole(role) {
-    return (req, res, next) => {
-        if (!req.user || req.user.role !== role) {
-            logSecurityEvent("UNAUTHORIZED_ACCESS", req, { requiredRole: role, userRole: req.user?.role });
-            return res.status(403).json({ error: "Forbidden" });
-        }
-        next();
-    };
 }
 
 function requireRole(role) {
@@ -3114,7 +3113,7 @@ async function verifyFirebaseAdmin(req, res, next) {
 
 function requireAdminKey(req, res, next) {
     const adminKey = req.headers["x-admin-key"];
-    if (!adminKey || adminKey !== ADMIN_KEY) {
+    if (!adminKey || !ADMIN_KEY || !timingSafeEqualString(String(adminKey), String(ADMIN_KEY))) {
         logSecurityEvent("ADMIN_KEY_FAILED", req, { hasKey: !!adminKey, path: req.originalUrl });
         return res.status(403).json({ error: "Forbidden: Invalid admin key" });
     }
@@ -3181,75 +3180,37 @@ app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => 
     }
 });
 
-app.post("/admin/correct-name", requireAuth, requireRole("admin"), async (req, res) => {
+app.post("/admin/correct-name", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
     try {
-        const { lvn, newName, reason } = req.body;
-
-        if (!lvn || !newName) {
-            return res.status(400).json({
-                error: "LVN and newName are required."
-            });
-        }
-
-        const cleanLVN = String(lvn).trim();
-        const cleanName = String(newName)
-            .trim()
-            .toUpperCase()
-            .replace(/\s+/g, " ");
-
-        // Search by LVN
-        const snap = await admin.firestore()
-            .collection("votersData")
-            .where("lvn", "==", cleanLVN)
-            .limit(1)
-            .get();
-
-        if (snap.empty) {
-            return res.status(404).json({
-                error: "LVN not found."
-            });
-        }
-
-        const doc = snap.docs[0];
-        const oldData = doc.data();
+        const { lvn, id, newName, reason } = req.body;
+        if ((!lvn && !id) || !newName) return res.status(400).json({ error: "Voter LVN/ID and newName are required." });
+        const cleanName = sanitizeInput(newName).trim().toUpperCase().replace(/\s+/g, " ");
+        const normalizedId = String(id || "").trim();
+        const validId = /^[a-f0-9]{64}$/.test(normalizedId);
+        if (!validId && !lvn) return res.status(400).json({ error: "A valid voter ID or LVN is required." });
+        const docId = validId ? normalizedId : hashLVN(String(lvn).trim());
+        const voterRef = db.collection("voters").doc(docId);
+        const snap = await voterRef.get();
+        if (!snap.exists) return res.status(404).json({ error: "Voter not found." });
+        const oldData = snap.data() || {};
         const oldName = oldData.name || "";
-
-        if (oldName === cleanName) {
-            return res.status(409).json({
-                error: "Name is already the same."
-            });
-        }
-
-        // Update only name
-        await doc.ref.update({
-            name: cleanName,
+        if (oldName === cleanName) return res.status(409).json({ error: "Name is already the same." });
+        await voterRef.update({
+            name: cleanName, nameKey: cleanName,
             nameCorrectedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-
-        // Audit log
-        await admin.firestore()
-            .collection("nameCorrections")
-            .add({
-                voterId: doc.id,
-                lvn: cleanLVN,
-                oldName,
-                newName: cleanName,
-                reason: reason || "Manual correction",
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-        return res.json({
-            success: true,
-            lvn: cleanLVN,
-            oldName,
-            newName: cleanName
+        const cachedVoter = VotersStaticCache.data.find(v => v.id === docId);
+        if (cachedVoter) cachedVoter.name = cleanName;
+        await db.collection("nameCorrections").add({
+            voterId: docId, lvnLast4: oldData.lvnLast4 || "????", oldName, newName: cleanName,
+            reason: sanitizeInput(reason || "Manual correction"),
+            correctedBy: req.user?.email || "admin",
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
-
+        return res.json({ success: true, voterId: docId, oldName, newName: cleanName });
     } catch (err) {
         console.error(err);
-        return res.status(500).json({
-            error: "Internal server error."
-        });
+        return res.status(500).json({ error: "Internal server error." });
     }
 });
 
@@ -3440,94 +3401,68 @@ app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, 
 // --- ADMIN AUTH ROUTES ---
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const { idToken, captchaToken } = req.body;
-
-    // Validate user agent
-    if (!req.headers["user-agent"]) {
-        return res.status(403).end();
-    }
-
-    // Check captcha
-    if (!captchaToken) {
-        return res.status(400).json({
-            error: "Complete security verification first"
-        });
-    }
-
-    if (!(await verifyCaptcha(captchaToken))) {
-        return res.status(403).json({ error: "Security verification failed" });
-    }
-
-    // Verify Firebase ID token
-    if (!idToken) {
-        return res.status(400).json({ error: "Authentication token required." });
-    }
+    if (!req.headers["user-agent"]) return res.status(403).end();
+    if (!captchaToken) return res.status(400).json({ error: "Complete security verification first" });
+    if (!(await verifyCaptcha(captchaToken))) return res.status(403).json({ error: "Security verification failed" });
+    if (!idToken) return res.status(400).json({ error: "Authentication token required." });
 
     let decodedToken;
     try {
-        decodedToken = await admin.auth().verifyIdToken(idToken);
+        decodedToken = await admin.auth().verifyIdToken(idToken, true);
     } catch (err) {
         await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { reason: "invalid_id_token", error: err.message });
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    // ✅ FIX: Check if user exists in Firebase Authentication
-    // Any valid Firebase Auth user can login as admin
+    const allowedAdmins = (process.env.ADMIN_EMAIL || "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean);
+    if (allowedAdmins.length === 0) {
+        console.error("[SECURITY] ADMIN_EMAIL environment variable is not configured!");
+        return res.status(500).json({ error: "Server admin configuration error." });
+    }
+
+    const userEmail = (decodedToken.email || "").trim().toLowerCase();
+    const isAuthorizedAdmin = (userEmail && allowedAdmins.includes(userEmail)) || decodedToken.admin === true;
+    if (!isAuthorizedAdmin) {
+        await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: decodedToken.email || "none" });
+        await new Promise(r => setTimeout(r, 400));
+        return res.status(403).json({ error: "Forbidden: Not an authorized administrator." });
+    }
+
     try {
         const userRecord = await admin.auth().getUser(decodedToken.uid);
-        
-        // Optional: Log successful authentication
-        console.log(`[ADMIN LOGIN] User authenticated: ${userRecord.email} (${userRecord.uid})`);
-        
+        if (userRecord.disabled) return res.status(403).json({ error: "Account disabled." });
     } catch (userError) {
-        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, { 
-            uid: decodedToken.uid, 
-            reason: "user_not_found_in_auth",
-            error: userError.message 
+        await logSecurityEvent("ADMIN_LOGIN_FAILED", req, {
+            uid: decodedToken.uid, reason: "user_not_found_in_auth", error: userError.message
         });
         await new Promise(r => setTimeout(r, 400));
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    // Generate session tokens
     const adminJti = crypto.randomBytes(16).toString("hex");
-    const adminCsrfToken = crypto.randomBytes(32).toString('hex');
-
+    const adminCsrfToken = crypto.randomBytes(32).toString("hex");
     const token = jwt.sign({
-        uid: decodedToken.uid,
-        email: decodedToken.email,
-        role: "admin",
-        jti: adminJti,
-        csrfToken: adminCsrfToken,
-        iat: Math.floor(Date.now() / 1000)
+        uid: decodedToken.uid, email: decodedToken.email, role: "admin",
+        jti: adminJti, csrfToken: adminCsrfToken, iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "2h" });
 
-    // Set session cookie
     res.cookie("__session", token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        path: "/",
-        maxAge: 2 * 60 * 60 * 1000
+        httpOnly: true, secure: true, sameSite: "none", path: "/", maxAge: 2 * 60 * 60 * 1000
     });
-
-    // Log successful login
-    await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { 
-        email: decodedToken.email,
-        uid: decodedToken.uid 
-    });
-
-    // Return CSRF token to client
-    res.json({ 
-        success: true, 
-        csrfToken: adminCsrfToken 
-    });
+    await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { email: decodedToken.email, uid: decodedToken.uid });
+    return res.json({ success: true, csrfToken: adminCsrfToken });
 });
 
-app.post("/admin/logout", async (req, res) => {
+app.post("/logout", async (req, res) => {
     try {
-        if (req.user?.jti) {
-            await revokeJti(req.user.jti);
+        const token = req.cookies?.__session;
+        if (token) {
+            try {
+                const decoded = jwt.verify(token, SECRET);
+                if (decoded?.jti) await revokeJti(decoded.jti);
+                if (decoded?.uid) await rtdb.ref(`activeSessions/${decoded.uid}`).remove().catch(() => {});
+            } catch (_) {}
         }
 
         res.clearCookie("__session", {
@@ -3537,11 +3472,10 @@ app.post("/admin/logout", async (req, res) => {
             path: "/"
         });
 
-        res.json({ success: true });
-
+        return res.json({ success: true });
     } catch (err) {
-        console.error("Logout error:", err);
-        res.status(500).json({ error: "Logout failed" });
+        console.error("Voter logout error:", err);
+        return res.status(500).json({ error: "Logout failed" });
     }
 });
 
@@ -3806,40 +3740,81 @@ app.post("/verify-receipt", rateLimit({
 });
 
 // --- VERIFIABLE VOTING: HASH CHAIN VERIFICATION ---
-async function verifyHashChain(shardFilter = null) {
+const VerifiedShardCheckpoints = new Map();
+
+async function verifyHashChain(shardFilter = null, forceFullScan = false) {
     try {
-        // Backward compatibility: some integrity checks already pass a preloaded Firestore snapshot.
-        // A snapshot avoids a second database read; order by per-chain sequence before verification.
         let votesSnap;
         if (shardFilter && typeof shardFilter === "object" && Array.isArray(shardFilter.docs)) {
             votesSnap = shardFilter;
             shardFilter = null;
+            forceFullScan = true;
+        } else if (!forceFullScan && !shardFilter && VerifiedShardCheckpoints.size > 0) {
+            const shardsMetaSnap = await db.collection("_meta").get();
+            let invalidCount = 0;
+            let totalVerified = 0;
+            for (const metaDoc of shardsMetaSnap.docs) {
+                if (!metaDoc.id.startsWith("chain_shard_")) continue;
+                const shardId = metaDoc.id;
+                const checkpoint = VerifiedShardCheckpoints.get(shardId) || { sequence: 0, hash: `GENESIS_${shardId}` };
+                const currentCount = Number(metaDoc.data().count || 0);
+                if (currentCount < checkpoint.sequence) {
+                    invalidCount++;
+                    continue;
+                }
+                if (currentCount === checkpoint.sequence) {
+                    if (checkpoint.sequence > 0 && metaDoc.data().hash !== checkpoint.hash) {
+                        invalidCount++;
+                    }
+                    totalVerified += currentCount;
+                    continue;
+                }
+                const deltaSnap = await db.collection("votes")
+                    .where("shardId", "==", shardId)
+                    .where("sequence", ">", checkpoint.sequence)
+                    .orderBy("sequence", "asc").get();
+                let expectedPrev = checkpoint.hash;
+                let lastSeq = checkpoint.sequence;
+                let shardInvalid = 0;
+                for (const doc of deltaSnap.docs) {
+                    const vote = doc.data();
+                    if (Number(vote.sequence) !== lastSeq + 1) shardInvalid++;
+                    if (vote.prevHash !== expectedPrev) shardInvalid++;
+                    const payloadToHash = vote.type === "REVOCATION"
+                        ? `REVOKE:${vote.targetReceipt}:${vote.prevHash}`
+                        : vote.receipt + vote.prevHash + stableStringify(vote.selections || {});
+                    const expectedHash = crypto.createHash("sha256").update(payloadToHash).digest("hex");
+                    if (vote.hash !== expectedHash) shardInvalid++;
+                    expectedPrev = vote.hash;
+                    lastSeq = Number(vote.sequence || lastSeq + 1);
+                }
+                if (lastSeq !== currentCount) shardInvalid++;
+                invalidCount += shardInvalid;
+                if (shardInvalid === 0) VerifiedShardCheckpoints.set(shardId, { sequence: lastSeq, hash: expectedPrev });
+                totalVerified += lastSeq;
+            }
+            return {
+                valid: invalidCount === 0, totalVotes: totalVerified, invalidCount,
+                firstInvalidIndex: invalidCount > 0 ? 1 : -1,
+                message: invalidCount === 0
+                    ? `Incremental hash chain integrity verified (${totalVerified} votes)`
+                    : `Hash chain broken at ${invalidCount} position(s)`
+            };
         } else {
             let query = db.collection("votes").orderBy("sequence", "asc");
-            if (shardFilter) {
-                query = db.collection("votes").where("shardId", "==", shardFilter).orderBy("sequence", "asc");
-            }
+            if (shardFilter) query = db.collection("votes").where("shardId", "==", shardFilter).orderBy("sequence", "asc");
             votesSnap = await query.get();
         }
-        if (votesSnap.empty) {
-            return { valid: true, message: "No votes to verify", totalVotes: 0, invalidCount: 0, firstInvalidIndex: -1 };
-        }
+        if (votesSnap.empty) return { valid: true, message: "No votes to verify", totalVotes: 0, invalidCount: 0, firstInvalidIndex: -1 };
 
         const shardPrevHashes = {};
-        let index = 0;
-        let invalidCount = 0;
-        let firstInvalidIndex = -1;
-        const orderedDocs = [...votesSnap.docs].sort((a, b) => {
-            const av = Number(a.data().sequence || 0);
-            const bv = Number(b.data().sequence || 0);
-            return av - bv;
-        });
-
+        const shardLastSeq = {};
+        let index = 0, invalidCount = 0, firstInvalidIndex = -1;
+        const orderedDocs = [...votesSnap.docs].sort((a, b) => Number(a.data().sequence || 0) - Number(b.data().sequence || 0));
         for (const doc of orderedDocs) {
             const vote = doc.data();
             const shardKey = vote.shardId || "LEGACY_SINGLE_CHAIN";
             const expectedPrev = shardPrevHashes[shardKey] || (vote.shardId ? `GENESIS_${vote.shardId}` : "GENESIS");
-
             if (vote.prevHash !== expectedPrev) {
                 invalidCount++;
                 if (firstInvalidIndex === -1) firstInvalidIndex = index;
@@ -3847,23 +3822,23 @@ async function verifyHashChain(shardFilter = null) {
                 const payloadToHash = vote.type === "REVOCATION"
                     ? `REVOKE:${vote.targetReceipt}:${vote.prevHash}`
                     : vote.receipt + vote.prevHash + stableStringify(vote.selections || {});
-
                 const expectedHash = crypto.createHash("sha256").update(payloadToHash).digest("hex");
                 if (vote.hash !== expectedHash) {
                     invalidCount++;
                     if (firstInvalidIndex === -1) firstInvalidIndex = index;
                 }
             }
-
             shardPrevHashes[shardKey] = vote.hash;
+            shardLastSeq[shardKey] = Number(vote.sequence || 0);
             index++;
         }
-
+        if (invalidCount === 0 && !shardFilter) {
+            for (const [shardId, hash] of Object.entries(shardPrevHashes)) {
+                if (shardId.startsWith("chain_shard_")) VerifiedShardCheckpoints.set(shardId, { sequence: shardLastSeq[shardId], hash });
+            }
+        }
         return {
-            valid: invalidCount === 0,
-            totalVotes: index,
-            invalidCount,
-            firstInvalidIndex,
+            valid: invalidCount === 0, totalVotes: index, invalidCount, firstInvalidIndex,
             message: invalidCount === 0
                 ? `Hash chain integrity verified across ${Object.keys(shardPrevHashes).length} shard(s)`
                 : `Hash chain broken at ${invalidCount} position(s)`
@@ -3890,7 +3865,7 @@ setInterval(monitorIntegrity, 30 * 60 * 1000);
 
 app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, res) => {
     try {
-        const chainInfo = await verifyHashChain();
+        const chainInfo = await verifyHashChain(null, true);
         res.json(chainInfo);
     } catch (e) {
         res.status(500).json({ error: "Chain verification failed" });
@@ -4098,15 +4073,23 @@ app.post("/verify", loginLimiter, async (req, res) => {
         // 🔥 ✅ ACTIVE SESSION SET (CORRECT PLACE)
         const userRef = rtdb.ref(`activeSessions/${hashedLVN}`);
         await userRef.set({
-            startedAt: Date.now()
+            startedAt: Date.now(),
+            lastSeenAt: Date.now()
         });
-        userRef.onDisconnect().remove();
+        // Do not register onDisconnect on the Admin SDK server socket; stale sessions are pruned separately.
 
         const csrfToken = crypto.randomBytes(32).toString('hex');
         const jti = crypto.randomBytes(16).toString("hex");
 
         const sessionToken = jwt.sign(
-            { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, jti },
+            {
+                uid: hashedLVN,
+                grade: d.grade,
+                role: "voter",
+                csrfToken,
+                jti,
+                queueBypass: hasQueueBypassDevice === true
+            },
             SECRET,
             { expiresIn: "60m" }
         );
@@ -4145,111 +4128,63 @@ app.post("/verify", loginLimiter, async (req, res) => {
     }
 });
 
-setInterval(async () => {
-    const grades = ['G7', 'G8', 'G9', 'G10', 'G11', 'G12'];
+const QUEUE_ACTIVE_LEASE_MS = 15 * 60 * 1000;
 
+setInterval(async () => {
+    const grades = ["G7", "G8", "G9", "G10", "G11", "G12"];
+    const now = Date.now();
     for (const grade of grades) {
         const gradeKey = `session${grade}`;
-        const usersRef = rtdb.ref(`queue/${gradeKey}/users`);
         const queueRef = rtdb.ref(`queue/${gradeKey}`);
-
+        const usersRef = queueRef.child("users");
+        const servingRef = queueRef.child("servingUpTo");
         try {
-            const snapshot = await usersRef.once('value');
-            const users = snapshot.val() || {};
-
-            let cleanedCount = 0;
-            let needsRecalc = false;
+            const [usersSnap, servingSnap] = await Promise.all([usersRef.once("value"), servingRef.once("value")]);
+            const users = usersSnap.val() || {};
+            const currentServingUpTo = Number(servingSnap.val() || QUEUE_MAX_ACTIVE);
+            const updates = {};
+            let evictedActiveSlots = 0;
+            let remainingActiveCount = 0;
 
             for (const [userId, userData] of Object.entries(users)) {
-                // ✅ Just check RTDB status - no Firestore call!
-                if (userData.status === 'done') {
-                    await usersRef.child(userId).remove();
-                    cleanedCount++;
-                    needsRecalc = true;
+                if (!userData) continue;
+                const joinedAt = Number(userData.joinedAt || 0);
+                const isEligibleActive = userData.status === "active" ||
+                    (Number(userData.position) > 0 && Number(userData.position) <= currentServingUpTo);
+                const isExpiredActive = isEligibleActive && joinedAt > 0 && (now - joinedAt > QUEUE_ACTIVE_LEASE_MS);
+                if (userData.status === "done") {
+                    updates[userId] = null;
+                } else if (isExpiredActive) {
+                    updates[userId] = null;
+                    evictedActiveSlots++;
+                } else if (isEligibleActive) {
+                    remainingActiveCount++;
                 }
             }
-
-            if (cleanedCount > 0) {
-                console.log(`🧹 Cleaned up ${cleanedCount} 'done' entries from ${gradeKey}`);
-
-                if (needsRecalc) {
-                    // Recalculate activeCount from remaining users
-                    const remainingSnapshot = await usersRef.once('value');
-                    const remainingUsers = remainingSnapshot.val() || {};
-
-                    let newActiveCount = 0;
-                    for (const [_, data] of Object.entries(remainingUsers)) {
-                        if (data.status === 'active') {
-                            newActiveCount++;
-                        }
-                    }
-
-                    await queueRef.update({ activeCount: newActiveCount, maxActive: QUEUE_MAX_ACTIVE });
-                    console.log(`📊 ${gradeKey} activeCount recalculated: ${newActiveCount}`);
-                }
+            if (Object.keys(updates).length > 0) await usersRef.update(updates);
+            if (evictedActiveSlots > 0) {
+                await servingRef.transaction(curr =>
+                    Math.max(Number(curr) || QUEUE_MAX_ACTIVE, QUEUE_MAX_ACTIVE) + evictedActiveSlots
+                );
+                console.log(`[QUEUE HEAL] Released ${evictedActiveSlots} abandoned slot(s) in ${gradeKey}`);
             }
-
+            await queueRef.update({ activeCount: remainingActiveCount, maxActive: QUEUE_MAX_ACTIVE });
         } catch (err) {
             console.error(`Queue cleanup error for ${gradeKey}:`, err);
         }
     }
-}, 10 * 60 * 1000);
+}, 60 * 1000);
 
 function maskReceipt(receipt) {
-    if (!receipt || typeof receipt !== 'string') return { mask: '***', hash: null };
-    if (receipt.length < 16) return { mask: '***', hash: null };
-
-    const mask = receipt.substring(0, 4) + '⋯' + receipt.substring(receipt.length - 4);
-
-    const hash = crypto.createHmac('sha256', MASK_SECRET)
+    if (!receipt || typeof receipt !== "string" || receipt.length < 16) {
+        return { mask: "***", hash: null };
+    }
+    const mask = receipt.substring(0, 4) + "⋯" + receipt.substring(receipt.length - 4);
+    const hash = crypto.createHmac("sha256", MASK_SECRET)
         .update(receipt)
-        .digest('hex')
+        .digest("hex")
         .substring(0, 16);
-
     return { mask, hash };
-}
-
-function maskLVN(lvn) {
-    if (!lvn || typeof lvn !== 'string') return '***';
-    if (lvn.length < 8) return '***';
-    // Show only last 3 digits
-    return '***' + lvn.slice(-3);
-}
-
-function sanitizeVoterData(voter) {
-    const sanitized = { ...voter };
-
-    // Never expose these fields
-    delete sanitized.code;
-    delete sanitized.lvn;
-    delete sanitized.receipt;
-    delete sanitized._deviceFingerprint;
-
-    if (voter.lvn) {
-        sanitized.lvnMask = maskLVN(voter.lvn);
-    }
-    if (voter.receipt) {
-        const masked = maskReceipt(voter.receipt);
-        sanitized.receiptMask = masked.mask;
-        sanitized.receiptHash = masked.hash;
-    }
-
-    return sanitized;
-}
-
-function sanitizePublicVote(voteData) {
-    const { receipt, salt, ...safeData } = voteData;
-
-    delete safeData.voterId; // If exists
-    delete safeData.ip;      // If exists
-
-    if (receipt) {
-        const masked = maskReceipt(receipt);
-        safeData.receiptMask = masked.mask;
-        safeData.receiptVerifyHash = masked.hash;
-    }
-
-    return safeData;
 }
 
 app.post("/verify-vote", rateLimit({
@@ -4323,7 +4258,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
         }
-        if (typeof timestamp !== "number" || Math.abs(Date.now() - timestamp) > 120000) {
+        if (typeof timestamp !== "number" || Math.abs(Date.now() - timestamp) > 600000) {
             return res.status(400).json({ error: "Request expired. Please check your device clock." });
         }
         if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
@@ -4354,14 +4289,21 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
         const recoveryRef = db.collection("receipt_recovery").doc(hashedLVN);
 
         if (liveSystemStatus.isQueue === true && !req.user.queueBypass) {
-            const [qSnap, servingSnap] = await Promise.all([
+            const [qSnap, servingSnap, existingRecoverySnap] = await Promise.all([
                 rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once("value"),
-                rtdb.ref(`queue/sessionG${grade}/servingUpTo`).once("value")
+                rtdb.ref(`queue/sessionG${grade}/servingUpTo`).once("value"),
+                recoveryRef.get()
             ]);
-            const qUser = qSnap.val();
-            const servingUpTo = servingSnap.val() || QUEUE_MAX_ACTIVE;
-            if (!qUser || (qUser.status !== "active" && qUser.position > servingUpTo)) {
-                return res.status(403).json({ error: "Please wait for your turn." });
+            const isIdempotentRetry =
+                existingRecoverySnap.exists &&
+                existingRecoverySnap.data()?.ballotId === deterministicBallotId;
+
+            if (!isIdempotentRetry) {
+                const qUser = qSnap.val();
+                const servingUpTo = servingSnap.val() || QUEUE_MAX_ACTIVE;
+                if (!qUser || (qUser.status !== "active" && qUser.position > servingUpTo)) {
+                    return res.status(403).json({ error: "Please wait for your turn." });
+                }
             }
         }
 
@@ -4423,7 +4365,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
                 receipt,
                 hash: currentHash,
                 shardId,
-                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 15 * 60 * 1000)
+                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 60 * 60 * 1000)
             });
 
             // 4. Burn nonce inside the transaction & update shard head
@@ -5056,7 +4998,6 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
             const bcryptCode = await bcrypt.hash(accessCode.toUpperCase(), 10);
 
             batch.set(voterRef, {
-                lvn: lvn,
                 lvnEncrypted: encryptLVN(lvn),
                 lvnLast4: lvn.slice(-4),
                 name: cleanName,
@@ -5162,50 +5103,62 @@ app.post("/admin/voters/delete", async (req, res) => {
     }
 });
 
-app.post("/admin/voters/reset", async (req, res) => {
+app.post("/admin/voters/reset", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
     try {
-        const rawId = sanitizeInput(req.body.id || '');
-        const rawLvn = sanitizeInput(req.body.lvn || '');
-
+        const rawId = sanitizeInput(req.body.id || "");
+        const rawLvn = sanitizeInput(req.body.lvn || "");
+        const providedReceipt = sanitizeInput(req.body.receipt || "");
         let docId;
-        if (rawId && /^[a-f0-9]{64}$/.test(rawId)) {
-            docId = rawId;
-        } else if (rawLvn) {
-            docId = hashLVN(rawLvn);
-        } else {
-            return res.status(400).json({ error: "Voter ID required." });
-        }
+        if (rawId && /^[a-f0-9]{64}$/.test(rawId)) docId = rawId;
+        else if (rawLvn) docId = hashLVN(rawLvn);
+        else return res.status(400).json({ error: "Voter ID required." });
 
+        const voterRef = db.collection("voters").doc(docId);
+        const recoveryRef = db.collection("receipt_recovery").doc(docId);
         await db.runTransaction(async (t) => {
-            const voterRef = db.collection("voters").doc(docId);
-            const voterSnap = await t.get(voterRef);
+            const [voterSnap, recoverySnap] = await Promise.all([t.get(voterRef), t.get(recoveryRef)]);
             if (!voterSnap.exists) throw new Error("VOTER_NOT_FOUND");
+            const voterData = voterSnap.data() || {};
+            const targetReceipt = providedReceipt || (recoverySnap.exists ? recoverySnap.data().receipt : null) || voterData.receipt || null;
 
-            const voterData = voterSnap.data();
-            const receipt = voterData.receipt;
-
-            if (receipt) {
-                const voteSnap = await db.collection("votes")
-                    .where("receipt", "==", receipt).limit(1).get();
-                if (!voteSnap.empty) {
-                    t.delete(voteSnap.docs[0].ref);
+            if (targetReceipt) {
+                const voteRef = db.collection("votes").doc(targetReceipt);
+                const voteSnap = await t.get(voteRef);
+                if (voteSnap.exists) {
+                    const voteData = voteSnap.data();
+                    const shardId = voteData.shardId || `chain_shard_${String(parseInt(docId.slice(0, 4), 16) % SHARD_COUNT).padStart(2, "0")}`;
+                    const chainRef = db.collection("_meta").doc(shardId);
+                    const chainSnap = await t.get(chainRef);
+                    const prevHash = chainSnap.exists ? chainSnap.data().hash : `GENESIS_${shardId}`;
+                    const prevCount = chainSnap.exists ? (chainSnap.data().count || 0) : 0;
+                    const sequence = prevCount + 1;
+                    const payloadToHash = `REVOKE:${targetReceipt}:${prevHash}`;
+                    const revocationHash = crypto.createHash("sha256").update(payloadToHash).digest("hex");
+                    const revocationDocId = `revoke_${crypto.randomBytes(16).toString("hex")}`;
+                    t.set(db.collection("votes").doc(revocationDocId), {
+                        type: "REVOCATION", targetReceipt, shardId, hash: revocationHash, prevHash, sequence,
+                        createdAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    t.set(chainRef, { hash: revocationHash, count: sequence, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
                 }
             }
-
             t.update(voterRef, {
                 hasVoted: false,
                 receipt: admin.firestore.FieldValue.delete(),
+                lastBallotId: admin.firestore.FieldValue.delete(),
                 votedAt: admin.firestore.FieldValue.delete()
             });
+            if (recoverySnap.exists) t.delete(recoveryRef);
         });
 
-        await logAdminAction(req, "VOTER_RESET", {
-            voterId: docId
-        });
-        res.json({ success: true });
-
+        await updateVoterStatusInRTDB(docId, { hasVoted: false, isMissed: false, integrityStatus: "PENDING" });
+        await rebuildAggregates();
+        await logAdminAction(req, "VOTER_RESET", { voterId: docId });
+        return res.json({ success: true });
     } catch (e) {
-        res.status(500).json({ error: "Reset failed" });
+        console.error("Voter reset error:", e);
+        if (e.message === "VOTER_NOT_FOUND") return res.status(404).json({ error: "Voter not found." });
+        return res.status(500).json({ error: "Reset failed: " + e.message });
     }
 });
 
@@ -5325,8 +5278,8 @@ app.post("/admin/publish/candidates", async (req, res) => {
 
 
             await alertManager.detectSystemHealth();
-            res.json({ success: true, message: "Candidates published successfully." });
-            await alertManager.clearResolvedAlerts('candidate_sync');
+            await alertManager.clearResolvedAlerts("candidate_sync");
+            return res.json({ success: true, message: "Candidates published successfully." });
         } else {
             throw new Error("No data returned from source collections.");
         }
@@ -5420,7 +5373,6 @@ app.post("/admin/add-party", async (req, res) => {
         });
         await refreshLocalCandidates();
         await logAdminAction(req, "ADD_PARTY", { success: true });
-        res.json({ success: true });
         await createAlert(
             "candidate_sync",
             "minor",
@@ -5429,8 +5381,10 @@ app.post("/admin/add-party", async (req, res) => {
             {},
             24 * 60 * 60 * 1000
         );
+        return res.json({ success: true });
 
     } catch (e) {
+        if (res.headersSent) return;
         res.status(400).json({ error: e.message });
     }
 });
