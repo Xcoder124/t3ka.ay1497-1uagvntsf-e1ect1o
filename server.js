@@ -4664,6 +4664,73 @@ app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, 
 });
 
 // --- ADMIN ROUTES ---
+// List administrative users
+app.get("/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const listResult = await admin.auth().listUsers(100);
+        // Exclude voter records, display accounts with email or assigned claims
+        const adminAccounts = listResult.users.filter(u => u.email && (u.customClaims?.admin === true || u.customClaims?.role));
+        res.json({ users: adminAccounts });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Create Admin with Custom Claim
+app.post("/admin/users/create", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
+    try {
+        const { email, password, role } = req.body;
+        if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+
+        const user = await admin.auth().createUser({ email, password, emailVerified: true });
+        await admin.auth().setCustomUserClaims(user.uid, {
+            role: role || "admin",
+            admin: role === "admin" || role === "superadmin"
+        });
+
+        await logAdminAction(req, "CREATE_ADMIN_USER", { email, role });
+        res.json({ success: true, uid: user.uid });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update or Revoke Claims
+app.post("/admin/users/set-role", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
+    try {
+        const { uid, role } = req.body;
+        if (!uid) return res.status(400).json({ error: "User UID is required." });
+
+        if (role === "revoke") {
+            await admin.auth().setCustomUserClaims(uid, null);
+        } else {
+            await admin.auth().setCustomUserClaims(uid, {
+                role,
+                admin: role === "admin" || role === "superadmin"
+            });
+        }
+
+        await logAdminAction(req, "UPDATE_USER_ROLE", { uid, role });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete Admin Account
+app.post("/admin/users/delete", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
+    try {
+        const { uid } = req.body;
+        if (!uid) return res.status(400).json({ error: "User UID is required." });
+
+        await admin.auth().deleteUser(uid);
+        await logAdminAction(req, "DELETE_ADMIN_USER", { uid });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.use("/admin", requireAuth, requireRole("admin"), adminLimiter, (req, res, next) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
         if (req.path === '/logout') return next();
