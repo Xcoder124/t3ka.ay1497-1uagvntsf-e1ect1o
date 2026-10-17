@@ -3047,10 +3047,14 @@ async function requireAuth(req, res, next) {
 
 function requireRole(role) {
     return (req, res, next) => {
-        if (!req.user || req.user.role !== role) {
+        const userRole = req.user?.role;
+        const hasPermission = userRole === role || 
+                             (role === "admin" && (userRole === "superadmin" || req.user?.admin === true));
+
+        if (!req.user || !hasPermission) {
             logSecurityEvent("UNAUTHORIZED_ACCESS", req, { 
                 requiredRole: role, 
-                userRole: req.user?.role,
+                userRole: userRole,
                 userEmail: req.user?.email 
             });
             return res.status(403).json({ error: "Forbidden: Insufficient privileges" });
