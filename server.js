@@ -3415,18 +3415,33 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const allowedAdmins = (process.env.ADMIN_EMAIL || "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean);
-    if (allowedAdmins.length === 0) {
-        console.error("[SECURITY] ADMIN_EMAIL environment variable is not configured!");
-        return res.status(500).json({ error: "Server admin configuration error." });
+    const userEmail = (decodedToken.email || "").trim().toLowerCase();
+    
+    // 1. Resolve role from Firebase Auth Custom Claims, fallback to ADMIN_EMAIL allowlist if set
+    let assignedRole = decodedToken.role || (decodedToken.admin === true ? "admin" : null);
+
+    // Optional Firestore fallback if roles are stored in a `users` or `admins` collection:
+    if (!assignedRole) {
+        const adminDoc = await db.collection("admins").doc(decodedToken.uid).get();
+        if (adminDoc.exists) {
+            assignedRole = adminDoc.data().role || "admin";
+        }
     }
 
-    const userEmail = (decodedToken.email || "").trim().toLowerCase();
-    const isAuthorizedAdmin = (userEmail && allowedAdmins.includes(userEmail)) || decodedToken.admin === true;
-    if (!isAuthorizedAdmin) {
-        await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: decodedToken.email || "none" });
+    // Fallback to environment variable allowlist if configured
+    if (!assignedRole && process.env.ADMIN_EMAIL) {
+        const allowedAdmins = process.env.ADMIN_EMAIL.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+        if (allowedAdmins.includes(userEmail)) {
+            assignedRole = "admin";
+        }
+    }
+
+    // Only allow designated administrative roles through the admin portal
+    const allowedPortalRoles = ["admin", "superadmin", "election_officer"];
+    if (!assignedRole || !allowedPortalRoles.includes(assignedRole)) {
+        await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: userEmail, role: assignedRole || "none" });
         await new Promise(r => setTimeout(r, 400));
-        return res.status(403).json({ error: "Forbidden: Not an authorized administrator." });
+        return res.status(403).json({ error: "Forbidden: Account does not have an administrative role assigned in Firebase." });
     }
 
     try {
@@ -3443,8 +3458,12 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const adminJti = crypto.randomBytes(16).toString("hex");
     const adminCsrfToken = crypto.randomBytes(32).toString("hex");
     const token = jwt.sign({
-        uid: decodedToken.uid, email: decodedToken.email, role: "admin",
-        jti: adminJti, csrfToken: adminCsrfToken, iat: Math.floor(Date.now() / 1000)
+        uid: decodedToken.uid,
+        email: decodedToken.email,
+        role: assignedRole, 
+        jti: adminJti,
+        csrfToken: adminCsrfToken,
+        iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "2h" });
 
     res.cookie("__session", token, {
@@ -3480,12 +3499,13 @@ app.post("/logout", async (req, res) => {
 });
 
 app.get("/admin/verify", requireAuth, requireRole("admin"), async (req, res) => {
-    // Return success with user info
     res.json({ 
         success: true,
+        csrfToken: req.user.csrfToken,
         user: {
             email: req.user.email,
-            uid: req.user.uid
+            uid: req.user.uid,
+            role: req.user.role
         }
     });
 });
