@@ -2606,8 +2606,10 @@ const voteLimiter = rateLimit({
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 4500,
     message: { error: "Too many admin requests. Please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false
 });
 
 const revealLvnLimiter = rateLimit({
@@ -3026,10 +3028,14 @@ async function isJtiRevoked(jti) {
 // Make requireAuth async and use await properly:
 async function requireAuth(req, res, next) {
     try {
-        let token = req.cookies.__session;
-        if (!token && req.headers.authorization?.startsWith("Bearer "))
+        let token = null;
+        if (req.headers.authorization?.startsWith("Bearer ")) {
             token = req.headers.authorization.split(" ")[1];
-        if (!token) return res.status(401).end();
+        }
+        if (!token) {
+            token = req.cookies?.__session;
+        }
+        if (!token || token === "undefined" || token === "null") return res.status(401).end();
 
         const decoded = jwt.verify(token, SECRET);
         if (!decoded.jti) {
@@ -3117,12 +3123,27 @@ async function verifyFirebaseAdmin(req, res, next) {
 
 function requireAdminKey(req, res, next) {
     const adminKey = req.headers["x-admin-key"];
-    if (!adminKey || !ADMIN_KEY || !timingSafeEqualString(String(adminKey), String(ADMIN_KEY))) {
+    const isKeyValid = adminKey && ADMIN_KEY && timingSafeEqualString(String(adminKey), String(ADMIN_KEY));
+    const isSuperAdmin = req.user?.role === "superadmin" || req.user?.admin === true;
+
+    if (!isKeyValid && !isSuperAdmin) {
         logSecurityEvent("ADMIN_KEY_FAILED", req, { hasKey: !!adminKey, path: req.originalUrl });
-        return res.status(403).json({ error: "Forbidden: Invalid admin key" });
+        return res.status(403).json({ error: "Forbidden: Invalid admin key or insufficient role privileges." });
     }
     next();
 }
+
+// Dedicated endpoint to verify admin credentials before critical modal actions
+app.post("/admin/verify-key", requireAuth, requireRole("admin"), (req, res) => {
+    const key = req.body?.key || req.headers["x-admin-key"];
+    const isKeyValid = key && ADMIN_KEY && timingSafeEqualString(String(key), String(ADMIN_KEY));
+    const isSuperAdmin = req.user?.role === "superadmin";
+
+    if (isKeyValid || isSuperAdmin) {
+        return res.json({ success: true, verified: true });
+    }
+    return res.status(403).json({ success: false, error: "Invalid administrator key." });
+});
 
 // --- PURGE FUNCTION ---
 async function purgeElectionData() {
