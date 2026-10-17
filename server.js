@@ -3467,10 +3467,14 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     }, SECRET, { expiresIn: "2h" });
 
     res.cookie("__session", token, {
-        httpOnly: true, secure: true, sameSite: "none", path: "/", maxAge: 2 * 60 * 60 * 1000
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        path: "/",
+        maxAge: 2 * 60 * 60 * 1000
     });
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { email: decodedToken.email, uid: decodedToken.uid });
-    return res.json({ success: true, csrfToken: adminCsrfToken });
+    return res.json({ success: true, token, csrfToken: adminCsrfToken });
 });
 
 app.post("/logout", async (req, res) => {
@@ -4664,7 +4668,6 @@ app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, 
 });
 
 // --- ADMIN ROUTES ---
-// List administrative users
 app.get("/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
     try {
         const listResult = await admin.auth().listUsers(100);
