@@ -6,6 +6,8 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const crypto = require("crypto");
+const SHARD_COUNT = 64;
+const GRACE_PERIOD_MS = 5 * 60 * 1000; // soft-close buffer for already-authenticated voters
 const CANDIDATE_SECRET = process.env.CANDIDATE_SECRET;
 if (!process.env.CANDIDATE_SECRET) {
     throw new Error("CANDIDATE_SECRET is required.");
@@ -337,13 +339,34 @@ const MOCK_CANDIDATES = [
 let lastAggregateRebuildAt = 0;
 const AGGREGATE_REBUILD_COOLDOWN_MS = 5 * 60 * 1000;
 
-rtdb.ref("voterStatus").on("value", (snap) => {
-    LiveVoterStatus = snap.val() || {};
-});
+async function initializeRealtimeListeners() {
+    try {
+        // 1. Load initial voterStatus snapshot ONCE at boot
+        const initialSnap = await rtdb.ref("voterStatus").once("value");
+        LiveVoterStatus = initialSnap.val() || {};
+        console.log(`[RTDB] Loaded ${Object.keys(LiveVoterStatus).length} initial voter statuses.`);
 
-rtdb.ref("status").on("value", snap => {
-    liveSystemStatus = snap.val() || {};
-});
+        // 2. Attach O(1) delta listeners instead of O(N^2) root .on("value")
+        rtdb.ref("voterStatus").on("child_added", (snap) => {
+            LiveVoterStatus[snap.key] = snap.val();
+        });
+        rtdb.ref("voterStatus").on("child_changed", (snap) => {
+            LiveVoterStatus[snap.key] = snap.val();
+        });
+        rtdb.ref("voterStatus").on("child_removed", (snap) => {
+            delete LiveVoterStatus[snap.key];
+        });
+
+        // 3. Listen to lightweight system status flags
+        rtdb.ref("status").on("value", (snap) => {
+            liveSystemStatus = snap.val() || {};
+        });
+    } catch (err) {
+        console.error("[RTDB INIT] Failed to initialize delta listeners:", err);
+    }
+}
+
+initializeRealtimeListeners().catch(err => console.error("[RTDB INIT]", err));
 
 const VotersStaticCache = {
     data: [],
@@ -560,6 +583,28 @@ function buildAssistedDeviceFingerprint(req, pcDeviceId = "") {
     return crypto.createHash("sha256")
         .update(`${ua}|${req.headers['sec-ch-ua'] || ''}|${pcDeviceId ? `pc:${pcDeviceId}` : "legacy"}`)
         .digest("hex");
+}
+
+function getOrSetDeviceToken(req, res) {
+    const pcHeaderId = getVotingPcDeviceId(req);
+    if (pcHeaderId) {
+        return crypto.createHash("sha256").update(`pc:${pcHeaderId}`).digest("hex");
+    }
+
+    let deviceToken = req.cookies?.__tsf_did || req.headers["x-tsf-device-id"];
+    if (!deviceToken || !/^[a-f0-9]{32}$/.test(String(deviceToken))) {
+        deviceToken = crypto.randomBytes(16).toString("hex");
+        if (res && !res.headersSent) {
+            res.cookie("__tsf_did", deviceToken, {
+                httpOnly: true,
+                secure: true,
+                sameSite: "none",
+                path: "/",
+                maxAge: 365 * 24 * 60 * 60 * 1000
+            });
+        }
+    }
+    return crypto.createHash("sha256").update(`mob:${deviceToken}`).digest("hex");
 }
 
 function getAssistedDeviceFingerprint(req) {
@@ -1122,48 +1167,47 @@ const QUEUE_MAX_ACTIVE = 70;
 
 async function joinQueue(userId, grade) {
     const gradeKey = `sessionG${grade}`;
-    const queueRef = rtdb.ref(`queue/${gradeKey}`);
+    const userRef = rtdb.ref(`queue/${gradeKey}/users/${userId}`);
+    const existingSnap = await userRef.once("value");
 
-    await queueRef.transaction(current => {
-        current = current || {
-            activeCount: 0,
-            maxActive: QUEUE_MAX_ACTIVE,
-            lastPosition: 0,
-            users: {}
-        };
+    if (existingSnap.exists()) {
+        const existing = existingSnap.val();
+        if (existing.status === "done") return existing;
+        if (existing.position) return existing;
+    }
 
-        if (!current.users) current.users = {};
-        current.maxActive = QUEUE_MAX_ACTIVE;
+    // 1. Atomically allocate next ticket number in O(1)
+    const ticketTx = await rtdb.ref(`queue/${gradeKey}/lastPosition`).transaction((curr) => (curr || 0) + 1);
+    const position = ticketTx.snapshot.val();
 
-        // If user already exists and is done, don't re-add
-        if (current.users[userId] && current.users[userId].status === 'done') {
-            return; // abort transaction
-        }
+    // 2. Read or initialize the admission watermark (servingUpTo)
+    const servingRef = rtdb.ref(`queue/${gradeKey}/servingUpTo`);
+    let servingSnap = await servingRef.once("value");
+    let servingUpTo = servingSnap.val();
+    if (!servingUpTo || servingUpTo < QUEUE_MAX_ACTIVE) {
+        await servingRef.transaction((curr) => Math.max(curr || 0, QUEUE_MAX_ACTIVE));
+        servingUpTo = QUEUE_MAX_ACTIVE;
+    }
 
-        const newPosition = current.lastPosition + 1;
+    const status = position <= servingUpTo ? "active" : "waiting";
+    const userPayload = {
+        position,
+        status,
+        joinedAt: admin.database.ServerValue.TIMESTAMP,
+        grade
+    };
 
-        // Determine status based on position within this grade's slots
-        let newStatus = 'waiting';
-        let newActiveCount = current.activeCount;
+    await userRef.set(userPayload);
+    return userPayload;
+}
 
-        // If position is within maxActive slots for THIS GRADE, they're active immediately
-        if (newPosition <= current.maxActive) {
-            newStatus = 'active';
-            newActiveCount++;
-        }
-
-        current.users[userId] = {
-            position: newPosition,
-            status: newStatus,
-            joinedAt: admin.database.ServerValue.TIMESTAMP,
-            grade: grade  // Store grade for reference
-        };
-
-        current.activeCount = newActiveCount;
-        current.lastPosition = newPosition;
-
-        return current;
-    });
+async function releaseQueueSlot(userId, grade) {
+    const gradeKey = `sessionG${grade}`;
+    await Promise.all([
+        rtdb.ref(`queue/${gradeKey}/users/${userId}`).remove(),
+        // Advance watermark by 1 so the next waiting ticket becomes eligible in O(1)
+        rtdb.ref(`queue/${gradeKey}/servingUpTo`).transaction((curr) => Math.max(curr || QUEUE_MAX_ACTIVE, QUEUE_MAX_ACTIVE) + 1)
+    ]);
 }
 
 function calculateETA(position, currentServing, maxActive = QUEUE_MAX_ACTIVE, avgTime = 5) {
@@ -1183,26 +1227,33 @@ function calculateETA(position, currentServing, maxActive = QUEUE_MAX_ACTIVE, av
 
 function encryptAccessCode(code) {
     if (!code) return null;
-    const key = crypto.createHash('sha256').update(ACCESS_CODE_KEY).digest();
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-    let encrypted = cipher.update(code.toUpperCase(), 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    return iv.toString('hex') + ':' + encrypted;
+    const key = crypto.createHash("sha256").update(ACCESS_CODE_KEY).digest();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const encrypted = Buffer.concat([cipher.update(code.toUpperCase(), "utf8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return `gcm:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
 }
 
 function decryptAccessCode(encryptedCode) {
-    if (!encryptedCode || !encryptedCode.includes(':')) return null;
+    if (!encryptedCode || !encryptedCode.includes(":")) return null;
     try {
-        const [ivHex, encrypted] = encryptedCode.split(':');
-        const key = crypto.createHash('sha256').update(ACCESS_CODE_KEY).digest();
-        const iv = Buffer.from(ivHex, 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-        decrypted += decipher.final('utf8');
-        return decrypted;
+        const key = crypto.createHash("sha256").update(ACCESS_CODE_KEY).digest();
+        // Support both new AES-256-GCM ("gcm:iv:tag:cipher") and legacy AES-256-CBC ("iv:cipher")
+        if (encryptedCode.startsWith("gcm:")) {
+            const [, ivHex, tagHex, cipherHex] = encryptedCode.split(":");
+            const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
+            decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+            return Buffer.concat([decipher.update(Buffer.from(cipherHex, "hex")), decipher.final()]).toString("utf8");
+        } else {
+            const [ivHex, encrypted] = encryptedCode.split(":");
+            const decipher = crypto.createDecipheriv("aes-256-cbc", key, Buffer.from(ivHex, "hex"));
+            let decrypted = decipher.update(encrypted, "hex", "utf8");
+            decrypted += decipher.final("utf8");
+            return decrypted;
+        }
     } catch (e) {
-        console.error('Failed to decrypt access code:', e);
+        console.error("Failed to decrypt access code:", e.message);
         return null;
     }
 }
@@ -2253,9 +2304,33 @@ async function createAlert(type, level, title, message, meta = {}, expiresInMs =
     return alertManager.createAlert(type, level, title, message, meta, expiresInMs);
 }
 
-async function getActiveSessionCount() {
+async function getActiveSessionCountAndPrune() {
     const snap = await rtdb.ref("activeSessions").once("value");
-    return snap.numChildren();
+    if (!snap.exists()) return 0;
+
+    const now = Date.now();
+    const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes max active session
+    const sessions = snap.val() || {};
+    const expiredUpdates = {};
+    let activeCount = 0;
+
+    for (const [uid, data] of Object.entries(sessions)) {
+        const startedAt = Number(data?.startedAt || data?.createdAt || data?.lastSeenAt || now);
+        if (now - startedAt > SESSION_TTL_MS) {
+            expiredUpdates[uid] = null; // Prune stale session
+        } else {
+            activeCount++;
+        }
+    }
+
+    if (Object.keys(expiredUpdates).length > 0) {
+        await rtdb.ref("activeSessions").update(expiredUpdates).catch(() => {});
+    }
+    return activeCount;
+}
+
+async function getActiveSessionCount() {
+    return getActiveSessionCountAndPrune();
 }
 
 let lastLoadState = null;
@@ -2505,14 +2580,20 @@ function requireMobile(req, res, next) {
 // --- RATE LIMITERS ---
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 20,
-    message: { error: "Too many attempts. Please try again later." },
+    max: 15,
+    keyGenerator: (req) => `${getClientIp(req)}:${String(req.body?.lvn || "anon").trim().slice(-6)}`,
+    message: { error: "Too many login attempts for this LVN. Please try again in 15 minutes." },
+    standardHeaders: true,
+    legacyHeaders: false
 });
 
 const voteLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 5,
-    message: { error: "Too many vote attempts. Please try again later." },
+    max: 10,
+    keyGenerator: (req) => req.user?.uid || getClientIp(req),
+    message: { error: "Too many vote submission attempts. Please wait a moment." },
+    standardHeaders: true,
+    legacyHeaders: false
 });
 
 const adminLimiter = rateLimit({
@@ -3329,42 +3410,30 @@ async function detectVotingAnomalies(req, voterId) {
 
 // Client-side error reporting endpoint
 app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, res) => {
-    res.sendStatus(200);
     try {
         const { type, message, stack, url, line, column, userAgent } = req.body;
+        let level = "minor";
+        let alertType = "script_error";
 
-        // Determine alert level based on error type
-        let level = 'minor';
-        let alertType = 'script_error';
-
-        if (type === 'API_ERROR' || message?.includes('fetch') || message?.includes('network')) {
-            level = 'major';
-            alertType = 'client_api_error';
-        } else if (type === 'RENDER_ERROR' || message?.includes('render') || message?.includes('React')) {
-            level = 'major';
-            alertType = 'render_error';
+        if (type === "API_ERROR" || message?.includes("fetch") || message?.includes("network")) {
+            level = "major";
+            alertType = "client_api_error";
+        } else if (type === "RENDER_ERROR" || message?.includes("render") || message?.includes("React")) {
+            level = "major";
+            alertType = "render_error";
         }
 
         await alertManager.createAlert(
             alertType,
             level,
-            `Client ${type || 'Error'}`,
-            message || 'Unknown client-side error',
-            {
-                stack: stack?.substring(0, 1000),
-                url,
-                line,
-                column,
-                userAgent: userAgent?.substring(0, 500),
-                ip: req.ip
-            },
-            60 * 60 * 1000 // 1 hour expiration
+            `Client ${type || "Error"}`,
+            message || "Unknown client-side error",
+            { stack: stack?.substring(0, 1000), url, line, column, userAgent: userAgent?.substring(0, 500), ip: req.ip },
+            60 * 60 * 1000
         );
-
-        res.json({ success: true });
+        return res.status(200).json({ success: true });
     } catch (e) {
-        console.error("[CLIENT ERROR REPORT] Failed to process:", e);
-        res.status(500).json({ error: "Failed to process error report" });
+        return res.status(500).json({ error: "Failed to process error report" });
     }
 });
 
@@ -3737,50 +3806,56 @@ app.post("/verify-receipt", rateLimit({
 });
 
 // --- VERIFIABLE VOTING: HASH CHAIN VERIFICATION ---
-async function verifyHashChain(votesSnapParam = null) {
+async function verifyHashChain(shardFilter = null) {
     try {
-        // ✅ Use provided snapshot OR fetch only if needed
-        const votesSnap = votesSnapParam || await db.collection("votes")
-            .orderBy("createdAt", "asc")
-            .get();
-
-        if (!votesSnap || votesSnap.empty) {
-            return {
-                valid: true,
-                message: "No votes to verify",
-                totalVotes: 0,
-                invalidCount: 0,
-                firstInvalidIndex: -1
-            };
+        // Backward compatibility: some integrity checks already pass a preloaded Firestore snapshot.
+        // A snapshot avoids a second database read; order by per-chain sequence before verification.
+        let votesSnap;
+        if (shardFilter && typeof shardFilter === "object" && Array.isArray(shardFilter.docs)) {
+            votesSnap = shardFilter;
+            shardFilter = null;
+        } else {
+            let query = db.collection("votes").orderBy("sequence", "asc");
+            if (shardFilter) {
+                query = db.collection("votes").where("shardId", "==", shardFilter).orderBy("sequence", "asc");
+            }
+            votesSnap = await query.get();
+        }
+        if (votesSnap.empty) {
+            return { valid: true, message: "No votes to verify", totalVotes: 0, invalidCount: 0, firstInvalidIndex: -1 };
         }
 
-        let prevHash = "GENESIS";
+        const shardPrevHashes = {};
         let index = 0;
         let invalidCount = 0;
         let firstInvalidIndex = -1;
+        const orderedDocs = [...votesSnap.docs].sort((a, b) => {
+            const av = Number(a.data().sequence || 0);
+            const bv = Number(b.data().sequence || 0);
+            return av - bv;
+        });
 
-        // ✅ Iterate directly (no array allocation → better memory)
-        for (const doc of votesSnap.docs) {
+        for (const doc of orderedDocs) {
             const vote = doc.data();
+            const shardKey = vote.shardId || "LEGACY_SINGLE_CHAIN";
+            const expectedPrev = shardPrevHashes[shardKey] || (vote.shardId ? `GENESIS_${vote.shardId}` : "GENESIS");
 
-            // 🔐 Check previous hash linkage
-            if (vote.prevHash !== prevHash) {
+            if (vote.prevHash !== expectedPrev) {
                 invalidCount++;
                 if (firstInvalidIndex === -1) firstInvalidIndex = index;
             } else {
-                // 🔐 Verify current hash only if prevHash is valid
-                const expectedHash = crypto.createHash("sha256")
-                    .update(vote.receipt + vote.prevHash + stableStringify(vote.selections || {}))
-                    .digest("hex");
+                const payloadToHash = vote.type === "REVOCATION"
+                    ? `REVOKE:${vote.targetReceipt}:${vote.prevHash}`
+                    : vote.receipt + vote.prevHash + stableStringify(vote.selections || {});
 
+                const expectedHash = crypto.createHash("sha256").update(payloadToHash).digest("hex");
                 if (vote.hash !== expectedHash) {
                     invalidCount++;
                     if (firstInvalidIndex === -1) firstInvalidIndex = index;
                 }
             }
 
-            // Move chain forward regardless (so we detect cascading issues)
-            prevHash = vote.hash;
+            shardPrevHashes[shardKey] = vote.hash;
             index++;
         }
 
@@ -3790,19 +3865,11 @@ async function verifyHashChain(votesSnapParam = null) {
             invalidCount,
             firstInvalidIndex,
             message: invalidCount === 0
-                ? "Hash chain integrity verified"
+                ? `Hash chain integrity verified across ${Object.keys(shardPrevHashes).length} shard(s)`
                 : `Hash chain broken at ${invalidCount} position(s)`
         };
-
     } catch (e) {
-        console.error("Hash chain verification error:", e);
-        return {
-            valid: false,
-            message: "Verification error: " + e.message,
-            totalVotes: 0,
-            invalidCount: 0,
-            firstInvalidIndex: -1
-        };
+        return { valid: false, message: "Verification error: " + e.message, totalVotes: 0, invalidCount: 0, firstInvalidIndex: -1 };
     }
 }
 
@@ -4243,190 +4310,183 @@ function stableStringify(obj) {
     }).join(",") + "}";
 }
 
-app.post("/vote", voteLimiter, requireAuth, requireRole("voter"), verifyCSRF, async (req, res) => {
+app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, async (req, res) => {
     try {
         if (req.user?.isMockElection === true || liveSystemStatus.isMockElection === true) {
-            return res.status(403).json({
-                error: "Live voting disabled during mock election."
-            });
+            return res.status(403).json({ error: "Live voting disabled during mock election." });
         }
+
         const hashedLVN = req.user.uid;
-        const grade = req.user.grade;
-        const { selections, timestamp, nonce } = req.body;
+        const grade = String(req.user.grade);
+        const { selections, timestamp, nonce, ballotId } = req.body;
 
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
         }
-
-        if (typeof timestamp !== "number" || Math.abs(Date.now() - timestamp) > 60000) {
-            return res.status(400).json({ error: "Request expired." });
+        if (typeof timestamp !== "number" || Math.abs(Date.now() - timestamp) > 120000) {
+            return res.status(400).json({ error: "Request expired. Please check your device clock." });
         }
-
         if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
-            return res.status(400).json({ error: "Invalid nonce." });
+            return res.status(400).json({ error: "Invalid security nonce." });
         }
-
         if (liveSystemStatus.isLive !== true) {
             return res.status(403).json({ error: "Election closed." });
         }
-
-        if (liveSystemStatus.endTime && Date.now() > Number(liveSystemStatus.endTime)) {
+        // Soft-Close Grace Period: Give already-authenticated voters 5 minutes after timer hits 00:00
+        if (liveSystemStatus.endTime && Date.now() > Number(liveSystemStatus.endTime) + GRACE_PERIOD_MS) {
             return res.status(403).json({ error: "Voting period ended." });
         }
 
-        const nonceAccepted = await consumeNonce(nonce, hashedLVN);
-
-        if (!nonceAccepted) {
-            return res.status(409).json({ error: "Duplicate request detected." });
-        }
-
         const validatedSelections = await validateSelections(selections, grade);
+        const canonicalSelections = stableStringify(validatedSelections);
+        const deterministicBallotId = ballotId || crypto.createHash("sha256")
+            .update(`${hashedLVN}:${canonicalSelections}`)
+            .digest("hex");
+
+        // Route deterministically to 1 of 64 chain shards (320+ writes/sec throughput)
+        const shardIndex = parseInt(hashedLVN.slice(0, 4), 16) % SHARD_COUNT;
+        const shardId = `chain_shard_${String(shardIndex).padStart(2, "0")}`;
 
         const voterRef = db.collection("voters").doc(hashedLVN);
-        const chainRef = db.collection("_meta").doc("chain_head");
+        const chainRef = db.collection("_meta").doc(shardId);
+        const nonceKey = crypto.createHash("sha256").update(`${nonce}:${hashedLVN}`).digest("hex");
+        const nonceRef = db.collection("used_nonces").doc(nonceKey);
+        const recoveryRef = db.collection("receipt_recovery").doc(hashedLVN);
+
+        if (liveSystemStatus.isQueue === true && !req.user.queueBypass) {
+            const [qSnap, servingSnap] = await Promise.all([
+                rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once("value"),
+                rtdb.ref(`queue/sessionG${grade}/servingUpTo`).once("value")
+            ]);
+            const qUser = qSnap.val();
+            const servingUpTo = servingSnap.val() || QUEUE_MAX_ACTIVE;
+            if (!qUser || (qUser.status !== "active" && qUser.position > servingUpTo)) {
+                return res.status(403).json({ error: "Please wait for your turn." });
+            }
+        }
 
         const voteResult = await db.runTransaction(async (t) => {
-            const [voterDoc, chainDoc] = await Promise.all([
+            const [voterDoc, chainDoc, nonceDoc, recoveryDoc] = await Promise.all([
                 t.get(voterRef),
-                t.get(chainRef)
+                t.get(chainRef),
+                t.get(nonceRef),
+                t.get(recoveryRef)
             ]);
 
-            if (!voterDoc.exists) {
-                throw new Error("VOTER_NOT_FOUND");
-            }
+            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
 
+            // IDEMPOTENT CONNECTION-LOSS RECOVERY:
+            // If the previous request committed in Firestore but the response dropped, return the saved receipt!
             if (voterDoc.data().hasVoted === true) {
+                if (recoveryDoc.exists && recoveryDoc.data().ballotId === deterministicBallotId) {
+                    const saved = recoveryDoc.data();
+                    return { receipt: saved.receipt, hash: saved.hash, shardId: saved.shardId, replayed: true };
+                }
                 throw new Error("ALREADY_VOTED");
             }
 
-            if (liveSystemStatus.isQueue === true) {
-                const queueSnap = await rtdb.ref(`queue/sessionG${grade}/users/${hashedLVN}`).once("value");
+            if (nonceDoc.exists) throw new Error("DUPLICATE_NONCE");
 
-                if (!queueSnap.exists() || queueSnap.val().status !== "active") {
-                    throw new Error("QUEUE_NOT_ACTIVE");
-                }
-            }
-
-            const prevHash = chainDoc.exists ? chainDoc.data().hash : "GENESIS";
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : `GENESIS_${shardId}`;
             const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
-
             const receipt = crypto.randomBytes(32).toString("hex");
+            const sequence = prevCount + 1;
 
             const currentHash = crypto.createHash("sha256")
-                .update(receipt + prevHash + stableStringify(validatedSelections))
+                .update(receipt + prevHash + canonicalSelections)
                 .digest("hex");
 
-            const voteRef = db.collection("votes").doc();
+            const voteRef = db.collection("votes").doc(receipt);
 
+            // 1. Write ANONYMOUS ballot (No voterId, no link to voters doc)
             t.set(voteRef, {
                 selections: validatedSelections,
-                grade: String(grade),
+                grade,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 receipt,
+                shardId,
                 hash: currentHash,
                 prevHash,
-                sequence: prevCount + 1
+                sequence
             });
 
+            // 2. Mark voter as voted WITHOUT storing plaintext receipt on voter doc (Preserves Ballot Secrecy)
             t.update(voterRef, {
                 hasVoted: true,
                 votedAt: admin.firestore.FieldValue.serverTimestamp(),
-                receipt
+                lastBallotId: deterministicBallotId
             });
 
+            // 3. Write 15-minute TTL receipt recovery doc for idempotent retry support
+            t.set(recoveryRef, {
+                ballotId: deterministicBallotId,
+                receipt,
+                hash: currentHash,
+                shardId,
+                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 15 * 60 * 1000)
+            });
+
+            // 4. Burn nonce inside the transaction & update shard head
+            t.set(nonceRef, { usedAt: admin.firestore.FieldValue.serverTimestamp() });
             t.set(chainRef, {
                 hash: currentHash,
-                count: prevCount + 1
+                count: sequence,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            return {
-                receipt,
-                hash: currentHash
-            };
+            return { receipt, hash: currentHash, shardId, replayed: false };
         });
 
-        await updateVoterStatusInRTDB(hashedLVN, {
-            hasVoted: true,
-            isMissed: false,
-            integrityStatus: "VALID"
-        });
+        if (!voteResult.replayed) {
+            // Update in-memory dashboard immediately
+            incrementDashboardMemory(validatedSelections, grade);
+            if (GlobalCache.dashboard?.stats) {
+                GlobalCache.dashboard.stats.voted = (GlobalCache.dashboard.stats.voted || 0) + 1;
+                if (GlobalCache.dashboard.stats.grades?.[grade]) {
+                    GlobalCache.dashboard.stats.grades[grade].voted++;
+                }
+                if (GlobalCache.dashboard.stats.total > 0) {
+                    GlobalCache.dashboard.stats.percentage = (
+                        (GlobalCache.dashboard.stats.voted / GlobalCache.dashboard.stats.total) * 100
+                    ).toFixed(1);
+                }
+            }
+            markDashboardDirty();
 
-        incrementDashboardMemory(validatedSelections, grade);
-        markDashboardDirty();
-
-        res.json({
-            success: true,
-            receipt: voteResult.receipt,
-            hash: voteResult.hash
-        });
-
-        if (liveSystemStatus.isQueue === true) {
+            // Asynchronous RTDB status & queue advancement (Never fails HTTP response if RTDB blips)
             setImmediate(async () => {
                 try {
-                    const queueRef = rtdb.ref(`queue/sessionG${grade}`);
-
-                    await queueRef.transaction(current => {
-                        if (!current || !current.users) return current;
-
-                        current.maxActive = QUEUE_MAX_ACTIVE;
-
-                        delete current.users[hashedLVN];
-
-                        let active = 0;
-                        let nextUser = null;
-                        let lowest = Infinity;
-
-                        for (const [uid, data] of Object.entries(current.users)) {
-                            if (data.status === "active") active++;
-
-                            if (data.status === "waiting" && data.position < lowest) {
-                                lowest = data.position;
-                                nextUser = uid;
-                            }
-                        }
-
-                        if (nextUser && active < current.maxActive) {
-                            current.users[nextUser].status = "active";
-                            active++;
-                        }
-
-                        current.activeCount = active;
-
-                        return current;
-                    });
-
-                } catch (e) {
-                    console.error("Queue cleanup failed:", e);
+                    await Promise.all([
+                        updateVoterStatusInRTDB(hashedLVN, {
+                            hasVoted: true,
+                            isMissed: false,
+                            integrityStatus: "VALID"
+                        }),
+                        rtdb.ref(`activeSessions/${hashedLVN}`).remove(),
+                        liveSystemStatus.isQueue === true ? releaseQueueSlot(hashedLVN, grade) : Promise.resolve()
+                    ]);
+                } catch (err) {
+                    console.error("[POST-VOTE RTDB SYNC]", err.message);
                 }
             });
         }
 
+        return res.json({
+            success: true,
+            receipt: voteResult.receipt,
+            hash: voteResult.hash,
+            shardId: voteResult.shardId,
+            replayed: voteResult.replayed
+        });
+
     } catch (e) {
-        console.error("Vote error:", e);
-
-        if (e.message === "ALREADY_VOTED") {
-            return res.status(403).json({ error: "Already voted." });
-        }
-
-        if (e.message === "QUEUE_NOT_ACTIVE") {
-            return res.status(403).json({ error: "Please wait for your turn." });
-        }
-
-        if (
-            /^Please vote for /.test(e.message) ||
-            /not authorised to vote for/.test(e.message) ||
-            /Multiple selections are not allowed/.test(e.message) ||
-            /Too many selections/.test(e.message) ||
-            /Duplicate selections/.test(e.message) ||
-            /Invalid candidate/.test(e.message) ||
-            /Invalid position/.test(e.message)
-        ) {
+        if (e.message === "ALREADY_VOTED") return res.status(403).json({ error: "Already voted." });
+        if (e.message === "DUPLICATE_NONCE") return res.status(409).json({ error: "Duplicate request detected." });
+        if (/^Please vote for |not authorised|Multiple selections|Too many|Duplicate|Invalid/.test(e.message)) {
             return res.status(400).json({ error: e.message });
         }
-
-        return res.status(500).json({
-            error: "System failed to record vote."
-        });
+        console.error("Vote error:", e);
+        return res.status(500).json({ error: "System failed to record vote." });
     }
 });
 
@@ -4482,41 +4542,84 @@ async function verifyAggregateConsistency() {
 }
 
 async function rebuildAggregates() {
-    console.log("🔧 Rebuilding aggregates...");
+    console.log("🔧 Rebuilding aggregates with canonical Array schema...");
+    if (Object.keys(GlobalCache.candidates || {}).length === 0) {
+        await refreshLocalCandidates();
+    }
+    if (!Array.isArray(VotersStaticCache.data) || VotersStaticCache.data.length === 0) {
+        await loadVotersStaticCache();
+    }
+
+    const stats = { total: 0, voted: 0, percentage: "0.0", grades: {} };
+    for (const voter of VotersStaticCache.data) {
+        const g = String(voter.grade || "Unknown");
+        if (!stats.grades[g]) stats.grades[g] = { total: 0, voted: 0, missed: 0 };
+        stats.total++;
+        stats.grades[g].total++;
+        if (LiveVoterStatus?.[voter.id]?.isMissed) stats.grades[g].missed++;
+    }
+
+    const leaderboard = {};
+    const candidateLookup = {};
+    for (const [pos, list] of Object.entries(GlobalCache.candidates || {})) {
+        leaderboard[pos] = (list || []).map((c) => {
+            const row = {
+                id: String(c.id),
+                name: c.name,
+                party: c.party,
+                hash: c.hash || hashCandidateId(c.id),
+                votes: 0,
+                breakdown: {}
+            };
+            candidateLookup[`${pos}:${c.id}`] = row;
+            return row;
+        });
+    }
 
     const votesSnap = await db.collection("votes").get();
-
-    const agg = {
-        stats: { total: 0, voted: 0, grades: {} },
-        leaderboard: {}
-    };
-
-    votesSnap.forEach(doc => {
+    const revokedReceipts = new Set();
+    votesSnap.forEach((doc) => {
         const v = doc.data();
+        if (v.type === "REVOCATION" && v.targetReceipt) revokedReceipts.add(v.targetReceipt);
+    });
+
+    votesSnap.forEach((doc) => {
+        const v = doc.data();
+        if (v.type === "REVOCATION" || revokedReceipts.has(v.receipt)) return;
+
         const grade = String(v.grade || "Unknown");
+        stats.voted++;
+        if (!stats.grades[grade]) stats.grades[grade] = { total: 0, voted: 0, missed: 0 };
+        stats.grades[grade].voted++;
 
-        agg.stats.voted++;
-
-        if (!agg.stats.grades[grade]) {
-            agg.stats.grades[grade] = { total: 0, voted: 0, missed: 0 };
-        }
-        agg.stats.grades[grade].voted++;
-
-        for (const pos in v.selections || {}) {
-            const selected = Array.isArray(v.selections[pos])
-                ? v.selections[pos]
-                : [v.selections[pos]];
-
-            if (!agg.leaderboard[pos]) agg.leaderboard[pos] = {};
-
-            selected.forEach(cid => {
-                agg.leaderboard[pos][cid] =
-                    (agg.leaderboard[pos][cid] || 0) + 1;
-            });
+        for (const [pos, rawSel] of Object.entries(v.selections || {})) {
+            const ids = Array.isArray(rawSel) ? rawSel : [rawSel];
+            for (const cid of ids) {
+                const row = candidateLookup[`${pos}:${cid}`];
+                if (row) {
+                    row.votes++;
+                    const gKey = `votes_${grade}`;
+                    row.breakdown[gKey] = (row.breakdown[gKey] || 0) + 1;
+                }
+            }
         }
     });
 
-    await db.collection("aggregates").doc("dashboard").set(agg);
+    if (stats.total > 0) {
+        stats.percentage = ((stats.voted / stats.total) * 100).toFixed(1);
+    }
+    for (const pos of Object.keys(leaderboard)) {
+        leaderboard[pos].sort((a, b) => (b.votes || 0) - (a.votes || 0));
+    }
+
+    GlobalCache.dashboard = {
+        isLive: liveSystemStatus?.isLive === true,
+        stats,
+        leaderboard
+    };
+    GlobalCache.timestamps.results = new Date().toISOString();
+    await saveAggregateDashboard();
+    return GlobalCache.dashboard;
 }
 
 setInterval(async () => {
@@ -4694,93 +4797,123 @@ app.post("/admin/voters/cache-refresh", async (req, res) => {
 });
 
 app.post("/admin/voters/add", async (req, res) => {
-    const grade = sanitizeInput(req.body.grade || '');
-    const section = sanitizeInput(req.body.section || '');
-    const names = Array.isArray(req.body.names) ? req.body.names.map(n => sanitizeInput(n)) : [];
-    if (!grade || isNaN(parseInt(grade))) {
-        return res.status(400).json({ error: "Invalid grade value." });
-    }
-    if (!section || !section.trim()) {
-        return res.status(400).json({ error: "Section is required." });
-    }
-    if (!names || !Array.isArray(names)) {
-        return res.status(400).json({ error: "Invalid input format" });
-    }
+    const grade = sanitizeInput(req.body.grade || "");
+    const section = sanitizeInput(req.body.section || "").toUpperCase();
+    const names = Array.isArray(req.body.names) ? req.body.names.map((n) => sanitizeInput(n)) : [];
+
+    if (!grade || isNaN(parseInt(grade))) return res.status(400).json({ error: "Invalid grade value." });
+    if (!section) return res.status(400).json({ error: "Section is required." });
+    if (names.length === 0) return res.status(400).json({ error: "At least one student name is required." });
+
     try {
-        const targetGrade = String(grade).trim();
-        const prevGrade = String(parseInt(targetGrade) - 1);
-        const sectionKey = `${targetGrade}_${section.toUpperCase()}`;
-        const sectionData = await getOrGenerateCode('section_data', sectionKey);
-        const gradePrefix = await getOrGenerateCode('grade_prefix', targetGrade);
+        const targetGrade = String(parseInt(grade));
+        const sectionKey = `${targetGrade}_${section}`;
+        const [sectionData, gradePrefix] = await Promise.all([
+            getOrGenerateCode("section_data", sectionKey),
+            getOrGenerateCode("grade_prefix", targetGrade)
+        ]);
+
         const accessCode = sectionData.access_code;
         const sectionPrefix = sectionData.prefix;
-        const batch = db.batch();
+
+        // OPTIMIZATION: Compute bcrypt & AES-GCM ONCE per section instead of 2N times inside the loop!
+        const precomputedBcryptCode = await bcrypt.hash(accessCode.toUpperCase(), 10);
+        const precomputedEncryptedCode = encryptAccessCode(accessCode);
+
+        // Build lookup map from in-memory VotersStaticCache (0 Firestore reads!)
+        const existingByName = new Map();
+        for (const v of VotersStaticCache.data) {
+            if (v.name) existingByName.set(v.name.toUpperCase().trim(), v);
+        }
+
+        const operations = [];
+        const newCacheEntries = [];
         let addedCount = 0;
         let updatedCount = 0;
-        const searchGrades = [targetGrade];
-        if (targetGrade !== "7" && parseInt(targetGrade) > 0) {
-            searchGrades.push(prevGrade);
-        }
-        const existingSnap = await db.collection("voters")
-            .where("grade", "in", searchGrades)
-            .get();
-        const existingMap = {};
-        existingSnap.forEach(doc => {
-            const data = doc.data();
-            if (data.name) existingMap[data.name.toUpperCase().trim()] = doc.ref;
-        });
-        for (const name of names) {
-            if (!name || !name.trim()) continue;
-            const cleanName = name.toUpperCase().trim();
-            const codeHashForUpdate = encryptAccessCode(accessCode);
-            const code = await bcrypt.hash(accessCode.toUpperCase(), 10);
-            if (existingMap[cleanName]) {
-                batch.update(existingMap[cleanName], {
-                    grade: targetGrade,
-                    section: section.toUpperCase(),
-                    code: code,
-                    codeHash: codeHashForUpdate,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+
+        for (const rawName of names) {
+            if (!rawName || !rawName.trim()) continue;
+            const cleanName = rawName.toUpperCase().trim();
+            const existing = existingByName.get(cleanName);
+
+            if (existing) {
+                operations.push({
+                    type: "update",
+                    ref: db.collection("voters").doc(existing.id),
+                    data: {
+                        grade: targetGrade,
+                        section,
+                        code: precomputedBcryptCode,
+                        codeHash: precomputedEncryptedCode,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    }
                 });
+                existing.grade = targetGrade;
+                existing.section = section;
+                existing.codeHash = precomputedEncryptedCode;
                 updatedCount++;
             } else {
-                const randomSuffix = Math.floor(1000000 + Math.random() * 9000000).toString();
+                const randomSuffix = crypto.randomInt(1000000, 9999999).toString();
                 const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
                 const hashedLVN = hashLVN(lvn);
-                const encryptedCode = encryptAccessCode(accessCode);
-                const codeForNewSet = await bcrypt.hash(accessCode.toUpperCase(), 10);
-                const existingLvnSnap = await db.collection("voters").doc(hashedLVN).get();
-                const voterRef = db.collection("voters").doc(hashedLVN);
-                batch.set(voterRef, {
-                    lvn: lvn,
-                    lvnEncrypted: encryptLVN(lvn),
-                    lvnLast4: lvn.slice(-4),
+                const last4 = lvn.slice(-4);
+
+                // SECURITY FIX: Plaintext `lvn` removed; only AES-256-GCM `lvnEncrypted` is stored
+                operations.push({
+                    type: "set",
+                    ref: db.collection("voters").doc(hashedLVN),
+                    data: {
+                        lvnEncrypted: encryptLVN(lvn),
+                        lvnLast4: last4,
+                        name: cleanName,
+                        nameKey: cleanName,
+                        grade: targetGrade,
+                        section,
+                        code: precomputedBcryptCode,
+                        codeHash: precomputedEncryptedCode,
+                        hasVoted: false,
+                        addedAt: admin.firestore.FieldValue.serverTimestamp()
+                    }
+                });
+
+                newCacheEntries.push({
+                    id: hashedLVN,
+                    lvnMasked: `\u2022\u2022\u2022\u2022${last4}`,
+                    lvnLast4: last4,
                     name: cleanName,
                     grade: targetGrade,
-                    section: section.toUpperCase(),
-                    code: codeForNewSet,
-                    codeHash: encryptedCode,
-                    hasVoted: false,
-                    addedAt: admin.firestore.FieldValue.serverTimestamp()
+                    section,
+                    codeHash: precomputedEncryptedCode,
+                    addedAt: new Date().toISOString()
                 });
                 addedCount++;
             }
         }
-        await batch.commit();
-        // Invalidate static cache so new voters appear on next admin load
-        setImmediate(() => invalidateVotersCache().catch(e =>
-            console.error("[CACHE] invalidateVotersCache after add failed:", e)
-        ));
-        await logAdminAction(req, "VOTERS_UPSERT", {
-            grade: targetGrade,
-            section: section.toUpperCase(),
-            totalProvided: names.length,
-            updated: updatedCount,
-            added: addedCount,
+
+        // Commit safely in chunks of 400 to never exceed Firestore's 500-op batch limit
+        for (let i = 0; i < operations.length; i += 400) {
+            const batch = db.batch();
+            for (const op of operations.slice(i, i + 400)) {
+                if (op.type === "update") batch.update(op.ref, op.data);
+                else batch.set(op.ref, op.data);
+            }
+            await batch.commit();
+        }
+
+        // Incrementally update in-memory cache (0 Firestore reads!)
+        if (newCacheEntries.length > 0) {
+            VotersStaticCache.data.push(...newCacheEntries);
+            VotersStaticCache.lastUpdated = new Date().toISOString();
+        }
+
+        await logAdminAction(req, "VOTERS_UPSERT", { grade: targetGrade, section, added: addedCount, updated: updatedCount });
+        return res.json({
+            success: true,
+            message: `Processed ${names.length}. Promoted/Updated: ${updatedCount}, New: ${addedCount}`,
+            accessCode
         });
-        res.json({ success: true, message: `Processed ${names.length}. Promoted/Updated: ${updatedCount}, New: ${addedCount}`, accessCode: accessCode });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        return res.status(500).json({ error: e.message });
     }
 });
 
@@ -5157,60 +5290,15 @@ app.post("/admin/restore", requireAdminKey, async (req, res) => {
 
 app.post("/admin/retally", async (req, res) => {
     try {
-        const candidatesSnap = await db.collection("candidates").get();
-        const votesSnap = await db.collection("votes").get();
-        const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
-        const validReceipts = {};
-        votersSnap.forEach(doc => {
-            const v = doc.data();
-            if (v.receipt) validReceipts[v.receipt] = v.grade || "Unknown";
+        const dashboard = await rebuildAggregates();
+        await alertManager.clearResolvedAlerts("vote_integrity");
+        await logAdminAction(req, "RETALLY_VOTES", { totalVoted: dashboard.stats.voted });
+        return res.json({
+            success: true,
+            message: `Re-tally complete. Verified Votes: ${dashboard.stats.voted}.`
         });
-        const newResults = {};
-        candidatesSnap.forEach(doc => {
-            const options = doc.data().options || [];
-            options.forEach(c => {
-                newResults[String(c.id)] = { votes: 0 };
-            });
-        });
-        let validVotesCount = 0;
-        let orphanedVotesCount = 0;
-        votesSnap.forEach(doc => {
-            const ballot = doc.data();
-            const receipt = ballot.receipt;
-            if (!validReceipts.hasOwnProperty(receipt)) {
-                orphanedVotesCount++;
-                return;
-            }
-            validVotesCount++;
-            const voterGrade = validReceipts[receipt];
-            const selections = ballot.selections || {};
-            Object.values(selections).forEach((candidateIdOrArray) => {
-                if (!candidateIdOrArray) return;
-                const ids = Array.isArray(candidateIdOrArray) ? candidateIdOrArray : [candidateIdOrArray];
-                ids.forEach((candidateId) => {
-                    if (!candidateId) return;
-                    const cid = String(candidateId);
-                    if (!newResults[cid]) newResults[cid] = { votes: 0 };
-                    newResults[cid].votes++;
-                    if (voterGrade !== "Unknown") {
-                        const gradeKey = `votes_${voterGrade}`;
-                        if (!newResults[cid][gradeKey]) newResults[cid][gradeKey] = 0;
-                        newResults[cid][gradeKey]++;
-                    }
-                });
-            });
-        });
-        const batch = db.batch();
-        for (const [cid, data] of Object.entries(newResults)) {
-            const docRef = db.collection("results").doc(cid);
-            batch.set(docRef, { ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        }
-        await batch.commit();
-        await refreshLocalResults();
-        res.json({ success: true, message: `Re-tally complete. Database updated. Valid Votes: ${validVotesCount}, Invalid Votes: ${orphanedVotesCount}.` });
-        await alertManager.clearResolvedAlerts('vote_integrity');
     } catch (e) {
-        res.status(500).json({ error: "Re-tally failed." });
+        return res.status(500).json({ error: "Re-tally failed." });
     }
 });
 
@@ -5434,102 +5522,41 @@ app.post("/admin/election/reset", requireAdminKey, async (req, res) => {
     }
 });
 
-app.post("/admin/settings/session", requireAuth, requireRole("admin"), async (req, res) => {
+app.post("/admin/settings/session", async (req, res) => {
     try {
-        const voterTime = req.body.voterTime;
-        const activeGrade = req.body.activeGrade;
-        const isLive = req.body.isLive;
-        const isQueue = req.body.isQueue;
-        const isMockElection = req.body.isMockElection;
-
+        const { voterTime, activeGrade, isLive, isQueue, isMockElection } = req.body;
         const firestoreUpdate = {};
         const rtdbUpdates = {};
 
-        // =========================
-        // 🔥 RTDB (ONLY REALTIME FLAGS)
-        // =========================
-        if (typeof isLive === 'boolean') {
-            rtdbUpdates["status/isLive"] = isLive;
-        }
+        if (typeof isLive === "boolean") rtdbUpdates["status/isLive"] = isLive;
+        if (typeof isQueue === "boolean") rtdbUpdates["status/isQueue"] = isQueue;
+        if (typeof isMockElection === "boolean") rtdbUpdates["status/isMockElection"] = isMockElection;
 
-        if (typeof isQueue === 'boolean') {
-            rtdbUpdates["status/isQueue"] = isQueue;
-        }
-
-        if (typeof isMockElection === 'boolean') {
-            rtdbUpdates["status/isMockElection"] = isMockElection;
-        }
-
-        // =========================
-        // 🔥 FIRESTORE (GRADE + TIMER)
-        // =========================
         if (activeGrade !== undefined) {
-            firestoreUpdate.activeGrade =
-                (activeGrade === "ALL") ? "ALL" : Number(activeGrade);
+            firestoreUpdate.activeGrade = activeGrade === "ALL" ? "ALL" : Number(activeGrade);
         }
 
+        // CRITICAL FIX: Sync endTime to RTDB `status/endTime` so /vote actually enforces the countdown timer!
         if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
-            const minutes = Number(voterTime);
-            const futureDate = new Date(Date.now() + (minutes * 60 * 1000));
-
-            firestoreUpdate.sessionTimer = futureDate.toISOString();
-        } else if (voterTime == 0) {
+            const endTimeMs = Date.now() + Number(voterTime) * 60 * 1000;
+            firestoreUpdate.sessionTimer = new Date(endTimeMs).toISOString();
+            rtdbUpdates["status/endTime"] = endTimeMs;
+        } else if (Number(voterTime) === 0) {
             firestoreUpdate.sessionTimer = admin.firestore.FieldValue.delete();
+            rtdbUpdates["status/endTime"] = null;
         }
 
-        // =========================
-        // 🔥 WRITE UPDATES
-        // =========================
-        if (Object.keys(rtdbUpdates).length > 0) {
-            await rtdb.ref("/").update(rtdbUpdates);
-        }
+        await Promise.all([
+            Object.keys(rtdbUpdates).length > 0 ? rtdb.ref("/").update(rtdbUpdates) : Promise.resolve(),
+            Object.keys(firestoreUpdate).length > 0
+                ? db.collection("settings").doc("electionStatus").set(firestoreUpdate, { merge: true })
+                : Promise.resolve()
+        ]);
 
-        if (Object.keys(firestoreUpdate).length > 0) {
-            await db.collection("settings").doc("electionStatus")
-                .set(firestoreUpdate, { merge: true });
-        }
-
-        // =========================
-        // 🔥 CACHE
-        // =========================
-        if (typeof isLive === 'boolean') {
-            GlobalCache.dashboard.isLive = isLive;
-        }
-
-        if (typeof isQueue === 'boolean') {
-            GlobalCache.dashboard.isQueue = isQueue;
-        }
-
-        if (typeof isMockElection === 'boolean') {
-            GlobalCache.dashboard.isMockElection = isMockElection;
-        }
-
-        if (activeGrade !== undefined) {
-            GlobalCache.dashboard.activeGrade = activeGrade;
-        }
-
-        // =========================
-        // 🔥 LOGS
-        // =========================
-        await logAdminAction(req, "SET_ELECTION_SESSION", {
-            isLive,
-            isQueue,
-            isMockElection,
-            activeGrade,
-            voterTime
-        });
-
-        res.json({
-            success: true,
-            isLive,
-            isQueue,
-            isMockElection,
-            activeGrade
-        });
-
+        await logAdminAction(req, "SET_ELECTION_SESSION", { isLive, isQueue, isMockElection, activeGrade, voterTime });
+        return res.json({ success: true, isLive, isQueue, isMockElection, activeGrade });
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: "Failed to update election status" });
+        return res.status(500).json({ error: "Failed to update election status" });
     }
 });
 
@@ -6348,14 +6375,12 @@ setInterval(() => {
     }
 }, 30 * 60 * 1000);
 
-function getDeviceFingerprint(req) {
-    const ip = req.ip || req.connection.remoteAddress || '';
-    const ua = req.headers['user-agent'] || '';
-    return crypto.createHash('sha256').update(`${ip}:${ua}`).digest('hex').substring(0, 16);
+function getDeviceFingerprint(req, res) {
+    return getOrSetDeviceToken(req, res);
 }
 
-function checkDeviceLimit(req) {
-    const deviceId = getDeviceFingerprint(req);
+function checkDeviceLimit(req, res) {
+    const deviceId = getDeviceFingerprint(req, res);
     const now = Date.now();
     const oneHourAgo = now - (60 * 60 * 1000);
 
@@ -6373,8 +6398,8 @@ function checkDeviceLimit(req) {
     return { deviceId, attempts: record.count, remaining: Math.max(0, 2 - record.count), limit: 2, limited: record.count >= 2 };
 }
 
-function trackDeviceAttempt(req) {
-    const deviceId = getDeviceFingerprint(req);
+function trackDeviceAttempt(req, res) {
+    const deviceId = getDeviceFingerprint(req, res);
     const now = Date.now();
 
     let record = deviceValidationStore.get(deviceId);
@@ -6539,7 +6564,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
             });
         }
 
-        const limitCheck = checkDeviceLimit(req);
+        const limitCheck = checkDeviceLimit(req, res);
 
         if (limitCheck.limited) {
             return res.status(429).json({
@@ -6550,7 +6575,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
             });
         }
 
-        trackDeviceAttempt(req);
+        trackDeviceAttempt(req, res);
 
         try {
             const validation = await validateNameWithKimi(name);
@@ -6600,7 +6625,7 @@ app.post("/ai/validate-name", requireAIServiceOnly, async (req, res) => {
 // GET DEVICE VALIDATION STATUS
 // ============================================
 app.get("/ai/validation-status", requireAIServiceOnly, (req, res) => {
-    const status = checkDeviceLimit(req);
+    const status = checkDeviceLimit(req, res);
 
     res.json({
         success: true,
@@ -6617,6 +6642,123 @@ app.get("/ai/validation-status", requireAIServiceOnly, (req, res) => {
 // ============================================
 // MANUAL VERIFICATION SUBMISSION
 // ============================================
+app.get("/admin/manual-verifications", async (req, res) => {
+    try {
+        const status = sanitizeInput(req.query.status || "PENDING").toUpperCase();
+        const snap = await db.collection("manual_verifications")
+            .where("status", "==", status)
+            .orderBy("submittedAt", "desc")
+            .limit(100)
+            .get();
+
+        const items = snap.docs.map((d) => ({
+            id: d.id,
+            ...d.data(),
+            submittedAt: d.data().submittedAt?.toDate ? d.data().submittedAt.toDate().toISOString() : null
+        }));
+        return res.json({ success: true, items });
+    } catch (e) {
+        return res.status(500).json({ error: "Failed to load manual verifications." });
+    }
+});
+
+app.post("/admin/manual-verifications/:id/approve", async (req, res) => {
+    try {
+        const reqRef = db.collection("manual_verifications").doc(req.params.id);
+        const reqSnap = await reqRef.get();
+        if (!reqSnap.exists) return res.status(404).json({ error: "Verification request not found." });
+
+        const data = reqSnap.data();
+        if (data.status === "APPROVED") {
+            return res.json({ success: true, alreadyApproved: true, lvn: decryptLVN(data.issuedLvnEncrypted), accessCode: decryptAccessCode(data.issuedAccessCodeEncrypted) });
+        }
+
+        const targetGrade = String(parseInt(data.grade));
+        const upperSection = String(data.section || "").toUpperCase().trim();
+        const cleanName = String(req.body.correctedName || data.name || "").toUpperCase().trim();
+
+        const [sectionData, gradePrefix] = await Promise.all([
+            getOrGenerateCode("section_data", `${targetGrade}_${upperSection}`),
+            getOrGenerateCode("grade_prefix", targetGrade)
+        ]);
+
+        const lvn = `${gradePrefix}${sectionData.prefix}${crypto.randomInt(1000000, 9999999)}`;
+        const hashedLVN = hashLVN(lvn);
+        const bcryptCode = await bcrypt.hash(sectionData.access_code.toUpperCase(), 10);
+        const encryptedCode = encryptAccessCode(sectionData.access_code);
+
+        const batch = db.batch();
+        batch.set(db.collection("voters").doc(hashedLVN), {
+            lvnEncrypted: encryptLVN(lvn),
+            lvnLast4: lvn.slice(-4),
+            name: cleanName,
+            nameKey: cleanName,
+            grade: targetGrade,
+            section: upperSection,
+            code: bcryptCode,
+            codeHash: encryptedCode,
+            hasVoted: false,
+            addedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        batch.update(reqRef, {
+            status: "APPROVED",
+            approvedBy: req.user?.email || "admin",
+            approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+            voterId: hashedLVN,
+            issuedLvnEncrypted: encryptLVN(lvn),
+            issuedAccessCodeEncrypted: encryptedCode
+        });
+
+        await batch.commit();
+
+        VotersStaticCache.data.push({
+            id: hashedLVN,
+            lvnMasked: `\u2022\u2022\u2022\u2022${lvn.slice(-4)}`,
+            lvnLast4: lvn.slice(-4),
+            name: cleanName,
+            grade: targetGrade,
+            section: upperSection,
+            codeHash: encryptedCode,
+            addedAt: new Date().toISOString()
+        });
+
+        await logAdminAction(req, "APPROVE_MANUAL_VERIFICATION", { verificationId: req.params.id, voterId: hashedLVN });
+        return res.json({
+            success: true,
+            voterId: hashedLVN,
+            name: cleanName,
+            grade: targetGrade,
+            section: upperSection,
+            lvn,
+            accessCode: sectionData.access_code
+        });
+    } catch (e) {
+        return res.status(500).json({ error: "Failed to approve manual verification." });
+    }
+});
+
+app.get("/ai/manual-verification/:id/status", requireAIServiceOnly, async (req, res) => {
+    try {
+        const doc = await db.collection("manual_verifications").doc(req.params.id).get();
+        if (!doc.exists) return res.status(404).json({ error: "Not found" });
+        const d = doc.data();
+        if (d.status !== "APPROVED") {
+            return res.json({ status: d.status || "PENDING" });
+        }
+        return res.json({
+            status: "APPROVED",
+            name: d.name,
+            grade: d.grade,
+            section: d.section,
+            lvn: decryptLVN(d.issuedLvnEncrypted),
+            accessCode: decryptAccessCode(d.issuedAccessCodeEncrypted)
+        });
+    } catch (e) {
+        return res.status(500).json({ error: "Status check failed" });
+    }
+});
+
 app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     try {
         const { name, grade, section, reason, validationScore, geminiReasoning } = req.body;
