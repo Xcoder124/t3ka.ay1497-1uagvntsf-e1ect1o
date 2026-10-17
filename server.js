@@ -3147,14 +3147,42 @@ app.post("/admin/verify-key", requireAuth, requireRole("admin"), (req, res) => {
 
 // --- PURGE FUNCTION ---
 async function purgeElectionData() {
-    const votersRef = db.collection("voters");
     const votesRef = db.collection("votes");
     const resultsRef = db.collection("results");
-    const securityLogsRef = db.collection("security_logs");
-    await deleteCollectionInBatches(votersRef);
+    const usedNoncesRef = db.collection("used_nonces");
+    const recoveryRef = db.collection("receipt_recovery");
+
+    // 1. Delete all votes, nonces, and receipts
     await deleteCollectionInBatches(votesRef);
     await deleteCollectionInBatches(resultsRef);
-    await deleteCollectionInBatches(securityLogsRef);
+    await deleteCollectionInBatches(usedNoncesRef);
+    await deleteCollectionInBatches(recoveryRef);
+
+    // 2. Reset voter states back to unvoted without deleting their records
+    const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
+    if (!votersSnap.empty) {
+        let batch = db.batch();
+        let count = 0;
+        for (const doc of votersSnap.docs) {
+            batch.update(doc.ref, {
+                hasVoted: false,
+                votedAt: admin.firestore.FieldValue.delete(),
+                lastBallotId: admin.firestore.FieldValue.delete(),
+                receipt: admin.firestore.FieldValue.delete()
+            });
+            count++;
+            if (count % 400 === 0) {
+                await batch.commit();
+                batch = db.batch();
+            }
+        }
+        if (count % 400 !== 0) await batch.commit();
+    }
+
+    // 3. Clear chain heads & RTDB voter statuses
+    await deleteCollectionInBatches(db.collection("_meta"));
+    await rtdb.ref("voterStatus").remove().catch(() => {});
+    await rtdb.ref("activeSessions").remove().catch(() => {});
 }
 
 let initPromise = null;
@@ -5301,20 +5329,29 @@ app.post("/admin/purge", requireAdminKey, async (req, res) => {
 
         await purgeElectionData();
 
+        // Synchronize in-memory cache so frontend and database match 1:1
+        await invalidateVotersCache();
+        GlobalCache.dashboard = {
+            isLive: liveSystemStatus?.isLive === true,
+            stats: { total: 0, voted: 0, percentage: 0, grades: {} },
+            leaderboard: {}
+        };
+        await refreshLocalResults();
+
         await alertManager.detectSystemHealth();
 
         await alertManager.createAlert(
             'election_deleted',
             'major',
-            'Election Data Deleted',
-            'All election data has been cleared.',
+            'Election Data Reset',
+            'All votes, tallies, and receipts have been purged. Voter roster preserved.',
             {},
             null
         );
 
         res.json({
             success: true,
-            message: "Election purged with backup 🔥",
+            message: "Election data reset and archived successfully.",
             backupHash: hash,
             backupUrl: url
         });
