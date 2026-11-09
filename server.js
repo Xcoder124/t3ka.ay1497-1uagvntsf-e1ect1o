@@ -81,7 +81,7 @@ const allowedOrigins = process.env.NODE_ENV === "production"
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
-        "https://e-boto-gilt.vercel.app"
+        "https://e-boto.pages.dev"
     ]
     : [
         "http://127.0.0.1:5500",
@@ -89,7 +89,7 @@ const allowedOrigins = process.env.NODE_ENV === "production"
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
-        "https://e-boto-gilt.vercel.app"
+        "https://e-boto.pages.dev"
     ];
 
 const corsOptions = {
