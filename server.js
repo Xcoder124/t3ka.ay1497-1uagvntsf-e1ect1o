@@ -6,7 +6,6 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const crypto = require("crypto");
-// Load .env BEFORE any env validation (local development only).
 if (process.env.NODE_ENV !== "production") {
     try { require("dotenv").config(); } catch (_) { /* dotenv optional */ }
 }
