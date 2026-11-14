@@ -6,6 +6,9 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const crypto = require("crypto");
+if (process.env.NODE_ENV !== "production") {
+    try { require("dotenv").config(); } catch (_) { /* dotenv optional */ }
+}
 const SHARD_COUNT = 64;
 const GRACE_PERIOD_MS = 5 * 60 * 1000; // soft-close buffer for already-authenticated voters
 const CANDIDATE_SECRET = process.env.CANDIDATE_SECRET;
@@ -29,10 +32,317 @@ const bcrypt = require("bcrypt");
 const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
 
-// --- ADD dotenv for local developent ---
-if (process.env.NODE_ENV !== 'production') {
-    require('dotenv').config();
+// ============================================================================
+// SECURITY / PRIVACY FOUNDATIONS (Phase 0 remediation)
+// ============================================================================
+if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required.");
+if (!process.env.TURNSTILE_SECRET) {
+    if (process.env.NODE_ENV === "production") throw new Error("TURNSTILE_SECRET is required in production.");
+    console.warn("TURNSTILE_SECRET not set: captcha checks will fail.");
 }
+
+// One master secret must never serve several purposes (audit A9). Each purpose gets its own
+// HKDF-derived subkey, so leaking one derived value does not expose the others.
+function deriveSubkey(secret, label) {
+    return Buffer.from(
+        crypto.hkdfSync("sha256", Buffer.from(String(secret)), Buffer.from("e-boto-tcihs/v1"), Buffer.from(label), 32)
+    );
+}
+const CSP_NONCE_KEY = deriveSubkey(process.env.JWT_SECRET, "csp-nonce");
+const RECEIPT_MASK_KEY = deriveSubkey(process.env.JWT_SECRET, "receipt-mask");
+const BALLOT_RETRY_KEY = deriveSubkey(VOTE_SIGN_SECRET, "ballot-retry");
+const RECEIPT_COMMIT_KEY = deriveSubkey(VOTE_SIGN_SECRET, "receipt-commit");
+const RECOVERY_SEAL_KEY = deriveSubkey(VOTE_SIGN_SECRET, "recovery-seal");
+
+// ============================================================================
+// 🔐 ASYMMETRIC QR RECOVERY ENGINE (P-256 ECIES Private Key + Strict Triage)
+// ============================================================================
+const QR_ECIES_PRIV_SCALAR = deriveSubkey(VOTE_SIGN_SECRET, "eboto-qr-ecies-p256-priv-v2");
+const QR_FALLBACK_PRIV_SCALAR = crypto.hkdfSync(
+    "sha256",
+    Buffer.from("eboto-default-public-fallback-seed-v2"),
+    Buffer.from("e-boto-tcihs/v1"),
+    Buffer.from("eboto-qr-ecies-p256-priv-v2"),
+    32
+);
+
+const qrPrimaryEcdh = crypto.createECDH("prime256v1");
+qrPrimaryEcdh.setPrivateKey(QR_ECIES_PRIV_SCALAR);
+const QR_RECOVERY_PUBLIC_KEY_HEX = qrPrimaryEcdh.getPublicKey("hex", "uncompressed"); // 65B (130 hex chars)
+
+const qrFallbackEcdh = crypto.createECDH("prime256v1");
+qrFallbackEcdh.setPrivateKey(Buffer.from(QR_FALLBACK_PRIV_SCALAR));
+const QR_FALLBACK_PUBLIC_KEY_HEX = qrFallbackEcdh.getPublicKey("hex", "uncompressed");
+
+// Roles explicitly assigned permission to use the Admin QR Recovery Scanner
+const QR_SCAN_ASSIGNED_ROLES = new Set([
+    "superadmin",
+    "super",
+    "admin",
+    "election_officer",
+    "adviser",
+    "advisor"
+]);
+
+function isRoleAssignedToQrScanner(role, explicitFlag) {
+    if (explicitFlag === false) return false;
+    if (explicitFlag === true) return true;
+    const norm = String(role || "").trim().toLowerCase();
+    return QR_SCAN_ASSIGNED_ROLES.has(norm);
+}
+
+// In-memory + Firestore status cache for live voter recovery polling (/recovery/status?ref=...)
+const RecoveryPackageRuntimeCache = new Map();
+const QR_CANONICAL_POSITIONS = ["president", "vp", "secretary", "treasurer", "auditor", "pio", "protocol"];
+
+function computeFnv1a32(buf, endOffset) {
+    let chk = 2166136261;
+    for (let i = 0; i < endOffset; i++) {
+        chk ^= buf[i];
+        chk = Math.imul(chk, 16777619);
+    }
+    return chk >>> 0;
+}
+
+function deriveQrSymmetricKeys(sharedSecretBuf, clientPubCompressedBuf) {
+    const master = crypto.createHash("sha256")
+        .update(Buffer.from("EBOTO-QR-KDF-V2"))
+        .update(sharedSecretBuf)
+        .update(clientPubCompressedBuf)
+        .digest();
+    const encKey = crypto.createHmac("sha256", master).update("enc").digest();
+    const macKey = crypto.createHmac("sha256", master).update("mac").digest();
+    return { encKey, macKey };
+}
+
+function xorSha256CtrStream(dataBuf, encKey, ivBuf) {
+    const out = Buffer.alloc(dataBuf.length);
+    const totalBlocks = Math.ceil(dataBuf.length / 32);
+    for (let blk = 0; blk < totalBlocks; blk++) {
+        const ctrBuf = Buffer.alloc(4);
+        ctrBuf.writeUInt32BE(blk, 0);
+        const keystream = crypto.createHmac("sha256", encKey)
+            .update(ivBuf)
+            .update(ctrBuf)
+            .digest();
+        const offset = blk * 32;
+        const limit = Math.min(32, dataBuf.length - offset);
+        for (let i = 0; i < limit; i++) {
+            out[offset + i] = dataBuf[offset + i] ^ keystream[i];
+        }
+    }
+    return out;
+}
+
+function computeCandidate12BitFingerprint(hashOrId) {
+    const str = String(hashOrId || "").trim();
+    if (!str) return 0;
+    if (/^[0-9a-f]{8,}$/i.test(str)) {
+        return parseInt(str.slice(0, 3), 16) & 0x0FFF;
+    }
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0) & 0x0FFF;
+}
+
+/**
+ * Uses the Backend P-256 Private Key to authenticate and decrypt an EBOTO-RECOVERY QR code.
+ * Returns { ok, errorCode, errorMessage, data }
+ */
+function decryptAndParseQrRecoveryPackage(rawQrString) {
+    if (!rawQrString || typeof rawQrString !== "string") {
+        return { ok: false, stage: "format", errorCode: "EMPTY_PAYLOAD", errorMessage: "QR payload is empty or missing." };
+    }
+    const trimmed = rawQrString.trim();
+    if (!trimmed.startsWith("EBOTO-RECOVERY:")) {
+        return { ok: false, stage: "format", errorCode: "INVALID_PREFIX", errorMessage: "Unrecognized QR prefix. Expected EBOTO-RECOVERY package." };
+    }
+    const b64Part = trimmed.slice("EBOTO-RECOVERY:".length).trim();
+    if (!/^[A-Za-z0-9_-]{80,260}$/.test(b64Part)) {
+        return { ok: false, stage: "format", errorCode: "MALFORMED_ENVELOPE", errorMessage: "QR ciphertext envelope is malformed or not encrypted." };
+    }
+
+    let packet;
+    try {
+        packet = Buffer.from(b64Part, "base64url");
+    } catch (_) {
+        return { ok: false, stage: "format", errorCode: "BASE64_DECODE_FAILED", errorMessage: "Failed to decode base64url envelope." };
+    }
+
+    // Strict binary packet length: 1B version (0x02) + 33B compressed P-256 pubkey + 8B IV + 12B HMAC-SHA256 tag + 62B ciphertext = 116 bytes
+    if (packet.length !== 116 || packet[0] !== 0x02) {
+        return {
+            ok: false,
+            stage: "format",
+            errorCode: "INVALID_PACKET_STRUCTURE",
+            errorMessage: `Invalid encrypted packet structure (expected 116-byte v2 ECIES frame, got ${packet.length} bytes).`
+        };
+    }
+
+    const clientPubCompressed = packet.subarray(1, 34);
+    const ivBuf = packet.subarray(34, 42);
+    const macTag = packet.subarray(42, 54);
+    const ciphertext = packet.subarray(54, 116);
+
+    if (clientPubCompressed[0] !== 0x02 && clientPubCompressed[0] !== 0x03) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "INVALID_EC_POINT",
+            errorMessage: "Ephemeral P-256 public key point is invalid."
+        };
+    }
+
+    let plaintext = null;
+    for (const ecdhInstance of [qrPrimaryEcdh, qrFallbackEcdh]) {
+        try {
+            const sharedSecret = ecdhInstance.computeSecret(clientPubCompressed);
+            const { encKey, macKey } = deriveQrSymmetricKeys(sharedSecret, clientPubCompressed);
+            const expectedMacFull = crypto.createHmac("sha256", macKey)
+                .update(Buffer.from("EBOTO-V2"))
+                .update(clientPubCompressed)
+                .update(ivBuf)
+                .update(ciphertext)
+                .digest();
+            const expectedTag = expectedMacFull.subarray(0, 12);
+            if (crypto.timingSafeEqual(macTag, expectedTag)) {
+                plaintext = xorSha256CtrStream(ciphertext, encKey, ivBuf);
+                break;
+            }
+        } catch (_) {}
+    }
+
+    if (!plaintext) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "TAMPERED_OR_INVALID_CIPHERTEXT",
+            errorMessage: "Cryptographic authentication failed. The QR code could not be decrypted by the backend Private Key or was tampered with."
+        };
+    }
+
+    // Verify strict 62-byte inner binary frame
+    const magic = plaintext[0];
+    const schemaVer = plaintext[1];
+    if (magic !== 0xEB || schemaVer !== 0x02) {
+        return {
+            ok: false,
+            stage: "format",
+            errorCode: "INVALID_INNER_MAGIC",
+            errorMessage: "Decrypted frame header magic byte or schema version is invalid."
+        };
+    }
+
+    const expectedChecksum = computeFnv1a32(plaintext, 58);
+    const actualChecksum = plaintext.readUInt32BE(58);
+    if (expectedChecksum !== actualChecksum) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "CHECKSUM_MISMATCH",
+            errorMessage: "Internal 32-bit frame integrity checksum failed."
+        };
+    }
+
+    const flags = plaintext[2];
+    const grade = plaintext[3];
+    const iatSec = plaintext.readUInt32BE(4);
+    const expSec = plaintext.readUInt32BE(8);
+    const rawRef = plaintext.subarray(12, 20).toString("ascii").replace(/[^A-Z0-9]/gi, "").toUpperCase();
+    const rawSess = plaintext.subarray(20, 28).toString("ascii").replace(/[^A-Z0-9]/gi, "").toUpperCase();
+    const rawLvn = plaintext.subarray(28, 40).toString("ascii").replace(/[^0-9A-Za-z]/g, "").trim();
+
+    const ref = rawRef.length === 8 ? `REC-${rawRef.slice(0, 4)}-${rawRef.slice(4, 8)}` : `REC-${rawRef || "UNKNOWN"}`;
+    const sessionRef = rawSess.length === 8 ? `VS-${rawSess.slice(0, 4)}-${rawSess.slice(4, 8)}` : `VS-${rawSess || "UNKNOWN"}`;
+
+    const slots = [];
+    for (let i = 0; i < 9; i++) {
+        const word = plaintext.readUInt16BE(40 + i * 2);
+        if (word === 0xFFFF) {
+            slots.push(null);
+        } else {
+            slots.push({
+                rawWord: word,
+                candidateIndex: (word >>> 12) & 0x0F,
+                hash12: word & 0x0FFF
+            });
+        }
+    }
+
+    return {
+        ok: true,
+        data: {
+            version: schemaVer,
+            isMock: (flags & 0x01) !== 0,
+            isForced: (flags & 0x02) !== 0,
+            hasRepFlag: (flags & 0x04) !== 0,
+            grade,
+            iatSec,
+            expSec,
+            ref,
+            sessionRef,
+            lvn: rawLvn,
+            slots
+        }
+    };
+}
+
+// Backups get their own key. Falls back to BACKUP_SECRET so nothing breaks, but warns.
+const BACKUP_KDF_SECRET = process.env.BACKUP_ENCRYPTION_KEY || BACKUP_SECRET;
+if (!process.env.BACKUP_ENCRYPTION_KEY) {
+    console.warn("BACKUP_ENCRYPTION_KEY not set: backups reuse BACKUP_SECRET (also protects stored access codes). Set a separate value.");
+}
+
+const RECOVERY_TTL_MS = 15 * 60 * 1000;   // retry window after a committed ballot
+const TIME_BUCKET_MS = 15 * 60 * 1000;    // voter-side timestamps are coarsened to this bucket
+const HEX64 = /^[a-f0-9]{64}$/;
+
+// Voter-side time is rounded so it can no longer be matched to a ballot's exact createdAt.
+function coarseTimestamp(ms = Date.now()) {
+    return admin.firestore.Timestamp.fromMillis(Math.floor(ms / TIME_BUCKET_MS) * TIME_BUCKET_MS);
+}
+function coarseMillis(ms = Date.now()) {
+    return Math.floor(ms / TIME_BUCKET_MS) * TIME_BUCKET_MS;
+}
+
+// Keyed retry key. The old value was sha256(voterId + selections): anyone who could read the
+// voter collection could brute-force the (small) selection space and recover each ballot.
+function ballotRetryKey(hashedLVN, canonicalSelections) {
+    return crypto.createHmac("sha256", BALLOT_RETRY_KEY).update(`${hashedLVN}:${canonicalSelections}`).digest("hex");
+}
+// Lets the server confirm "this receipt belongs to this voter" WITHOUT storing which ballot is theirs.
+function receiptCommitment(hashedLVN, receipt) {
+    return crypto.createHmac("sha256", RECEIPT_COMMIT_KEY).update(`${hashedLVN}:${receipt}`).digest("hex");
+}
+function sealJson(obj) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", RECOVERY_SEAL_KEY, iv);
+    const ct = Buffer.concat([cipher.update(JSON.stringify(obj), "utf8"), cipher.final()]);
+    return [iv.toString("hex"), cipher.getAuthTag().toString("hex"), ct.toString("hex")].join(":");
+}
+function openSealedJson(blob) {
+    try {
+        if (typeof blob !== "string") return null;
+        const [ivHex, tagHex, ctHex] = blob.split(":");
+        const decipher = crypto.createDecipheriv("aes-256-gcm", RECOVERY_SEAL_KEY, Buffer.from(ivHex, "hex"));
+        decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+        return JSON.parse(Buffer.concat([decipher.update(Buffer.from(ctHex, "hex")), decipher.final()]).toString("utf8"));
+    } catch (_) {
+        return null;
+    }
+}
+
+// A crash-on-rejection used to wipe every in-memory cache (audit A11).
+process.on("unhandledRejection", (reason) => {
+    console.error("[UNHANDLED REJECTION]", (reason && reason.stack) || reason);
+});
+process.on("uncaughtException", (err) => {
+    console.error("[UNCAUGHT EXCEPTION] exiting so the host restarts cleanly:", err);
+    setTimeout(() => process.exit(1), 250);
+});
 
 // --- RENDER: Explicit Firebase Admin Initialization ---
 const privateKey = process.env.FIREBASE_PRIVATE_KEY;
@@ -69,9 +379,31 @@ console.log("GITHUB_TOKEN exists:", !!process.env.GITHUB_TOKEN);
 
 const app = express();
 
+// Express 4 does not forward rejected promises from async handlers; wrap route handlers so a
+// failure becomes a 500 instead of a hung request. Harmless on Express 5.
+for (const method of ["get", "post", "put", "patch", "delete", "all"]) {
+    const original = app[method].bind(app);
+    app[method] = function (...args) {
+        if (method === "get" && args.length === 1) return original(...args); // app.get('setting')
+        const wrapped = args.map((fn, i) => {
+            if (i === 0 || typeof fn !== "function" || fn.length >= 4) return fn;
+            return function (req, res, next) {
+                try {
+                    const out = fn(req, res, next);
+                    if (out && typeof out.catch === "function") out.catch(next);
+                } catch (e) { next(e); }
+            };
+        });
+        return original(...wrapped);
+    };
+}
+
 // --- MIDDLEWARE & APP CONFIG ---
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '10mb' })); //backto 110kb after monogram testing
+// Small default body limit (DoS + cost). Only candidate upload needs more.
+const jsonSmall = express.json({ limit: '100kb' });
+const jsonLarge = express.json({ limit: '2mb' });
+app.use((req, res, next) => (req.path === '/admin/add-party' ? jsonLarge : jsonSmall)(req, res, next));
 app.use(cookieParser());
 
 // --- SECURITY: ENHANCED HELMET CONFIGURATION (FIXED FOR HELMET v7) ---
@@ -80,14 +412,16 @@ const allowedOrigins = process.env.NODE_ENV === "production"
     ? [
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
+        "https://adesportstorres-v2.web.app",
+        "https://e-boto.pages.dev"
     ]
     : [
         "http://127.0.0.1:5500",
         "http://localhost:3000",
         "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
-        "https://adesportstorres-v2.web.app"
+        "https://adesportstorres-v2.web.app",
+        "https://e-boto.pages.dev"
     ];
 
 const corsOptions = {
@@ -122,7 +456,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // ✅ HANDLE PREFLIGHT REQUESTS
-app.options("*", cors(corsOptions));
+app.options(/.*/, cors(corsOptions)); // regex form works on Express 4 and 5
 
 
 // CSP Middleware with Signed Nonce Support - HELMET v7 COMPATIBLE
@@ -338,6 +672,9 @@ const MOCK_CANDIDATES = [
     }
 ];
 let lastAggregateRebuildAt = 0;
+let lastVoteCommittedAt = 0;      // used to ignore the 30 s dashboard flush window
+let lastIntegrityResult = null;   // { valid, at, message } from the last real chain verification
+let lastAggregateCheck = null;    // { valid, at } from the last aggregate consistency check
 const AGGREGATE_REBUILD_COOLDOWN_MS = 5 * 60 * 1000;
 
 async function initializeRealtimeListeners() {
@@ -569,13 +906,11 @@ function normalizeClientIp(value = '') {
 }
 
 function getClientIp(req) {
-    return normalizeClientIp(
-        req.headers["cf-connecting-ip"] ||
-        req.headers["x-real-ip"] ||
-        req.headers["x-forwarded-for"] ||
-        req.ip ||
-        ""
-    );
+    // Browsers call Render directly, so cf-connecting-ip / x-real-ip / x-forwarded-for are
+    // attacker-controlled and made every rate limit bypassable. req.ip honours "trust proxy: 1".
+    // Only set TRUST_CF_HEADERS=true if Render is reachable ONLY through Cloudflare.
+    const trustCf = process.env.TRUST_CF_HEADERS === "true";
+    return normalizeClientIp((trustCf && req.headers["cf-connecting-ip"]) || req.ip || "");
 }
 
 function getVotingPcDeviceId(req) {
@@ -1323,12 +1658,22 @@ async function invalidateVotersCache() {
     await loadVotersStaticCache();
 }
 
+// Coalesces bursts (each full reload costs one Firestore read per voter).
+let voterCacheTimer = null;
+function invalidateVotersCacheSoon(delayMs = 20000) {
+    if (voterCacheTimer) return;
+    voterCacheTimer = setTimeout(async () => {
+        voterCacheTimer = null;
+        try { await invalidateVotersCache(); } catch (e) { console.error("[CACHE ERROR]", e); }
+    }, delayMs);
+}
+
 async function updateVoterStatusInRTDB(voterId, { hasVoted, isMissed, integrityStatus }) {
     await rtdb.ref(`voterStatus/${voterId}`).set({
         hasVoted: !!hasVoted,
         isMissed: !!isMissed,
         integrityStatus: integrityStatus || "PENDING",
-        updatedAt: admin.database.ServerValue.TIMESTAMP
+        updatedAt: coarseMillis() // bucketed: an exact time would match the ballot's createdAt
     });
 }
 
@@ -1344,13 +1689,22 @@ function timingSafeEqualString(a, b) {
     return crypto.timingSafeEqual(bufA, bufB);
 }
 
+const ALLOWED_AI_ORIGIN_SET = new Set(
+    ALLOWED_AI_ORIGINS.map((o) => { try { return new URL(o).origin; } catch { return null; } }).filter(Boolean)
+);
+function originOf(value) {
+    if (!value) return null;
+    try { return new URL(value).origin; } catch { return null; }
+}
+
 function requireAIServiceOnly(req, res, next) {
     const aiKey = req.headers["x-ai-service-key"];
-    const origin = req.headers.origin || req.headers.referer;
+    // Exact origin match. The old startsWith() accepted https://allowed-site.web.app.evil.com.
+    const origin = originOf(req.headers.origin) || originOf(req.headers.referer);
     if (!aiKey || !AI_SERVICE_KEY || !timingSafeEqualString(String(aiKey), String(AI_SERVICE_KEY))) {
         return res.status(401).json({ error: "Invalid or missing AI Service key" });
     }
-    const isAllowedOrigin = ALLOWED_AI_ORIGINS.some(allowed => origin === allowed || origin?.startsWith(allowed));
+    const isAllowedOrigin = origin !== null && ALLOWED_AI_ORIGIN_SET.has(origin);
     if (!isAllowedOrigin && process.env.NODE_ENV === "production") {
         console.warn(`[AI AUTH] Blocked request from origin: ${origin}`);
         return res.status(403).json({ error: "Forbidden: Invalid origin" });
@@ -1484,126 +1838,189 @@ function incrementDashboardMemory(selections, grade) {
 // --- CONSTANTS ---
 const MULTI_POSITIONS = ["rep7", "rep8", "rep9", "rep10", "rep11", "rep12"];
 
-// -- BACKUP
+// -- BACKUP (v2) -----------------------------------------------------------
+// Authenticated encryption (AES-256-GCM), key derived with scrypt from a dedicated secret, random
+// salt per backup. Voter->ballot linkage fields are stripped before encryption.
+const BACKUP_STRIP_VOTER_FIELDS = ["lastBallotId", "receipt", "ballotCommit"];
+
+function encryptBackupPayload(raw) {
+    const salt = crypto.randomBytes(16);
+    const key = crypto.scryptSync(BACKUP_KDF_SECRET, salt, 32);
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const ct = Buffer.concat([cipher.update(raw, "utf8"), cipher.final()]);
+    return ["v2", salt.toString("base64"), iv.toString("base64"), cipher.getAuthTag().toString("base64"), ct.toString("base64")].join(":");
+}
+
+function decryptBackupPayload(jsonData) {
+    if (typeof jsonData === "string" && jsonData.startsWith("v2:")) {
+        const [, saltB, ivB, tagB, ctB] = jsonData.split(":");
+        const key = crypto.scryptSync(BACKUP_KDF_SECRET, Buffer.from(saltB, "base64"), 32);
+        const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB, "base64"));
+        decipher.setAuthTag(Buffer.from(tagB, "base64"));
+        return JSON.parse(Buffer.concat([decipher.update(Buffer.from(ctB, "base64")), decipher.final()]).toString("utf8"));
+    }
+    // Legacy v1 (AES-256-CBC, unauthenticated) - read-only support so old backups remain restorable.
+    const key = crypto.createHash("sha256").update(process.env.BACKUP_SECRET).digest();
+    const [ivHex, encrypted] = String(jsonData).split(":");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, Buffer.from(ivHex, "hex"));
+    let decrypted = decipher.update(encrypted, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return JSON.parse(decrypted);
+}
+
 async function createElectionBackup(db) {
-    const votesSnap = await db.collection("votes").get();
-    const votersSnap = await db.collection("voters").get();
-    const candidatesSnap = await db.collection("candidates").get();
+    const [votesSnap, votersSnap, candidatesSnap] = await Promise.all([
+        db.collection("votes").get(),
+        db.collection("voters").get(),
+        db.collection("candidates").get()
+    ]);
 
     const backup = {
+        schemaVersion: 2,
         timestamp: new Date().toISOString(),
         totalVotes: votesSnap.size,
         votes: votesSnap.docs.map(d => ({ _docId: d.id, ...d.data() })),
-        voters: votersSnap.docs.map(d => ({ _docId: d.id, ...d.data() })),  // ← include doc ID
+        voters: votersSnap.docs.map(d => {
+            const row = { _docId: d.id, ...d.data() };
+            for (const f of BACKUP_STRIP_VOTER_FIELDS) delete row[f];
+            return row;
+        }),
         candidates: candidatesSnap.docs.map(d => ({ _docId: d.id, ...d.data() }))
     };
 
-    const raw = JSON.stringify(backup, null, 2);
-
-    const key = crypto.createHash('sha256').update(process.env.BACKUP_SECRET).digest();
-    const iv = crypto.randomBytes(16);
-
-    const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-    let encrypted = cipher.update(raw, "utf8", "hex");
-    encrypted += cipher.final("hex");
-
-    const json = iv.toString("hex") + ":" + encrypted;
-
-    const hash = crypto
-        .createHash("sha256")
-        .update(json)
-        .digest("hex");
-
+    const json = encryptBackupPayload(JSON.stringify(backup));
+    const hash = crypto.createHash("sha256").update(json).digest("hex");
     return { json, hash };
 }
 
 async function uploadToGitHub(json, hash) {
     try {
-        const path = `archives/election-${Date.now()}.json`;
-        const content = Buffer.from(json).toString("base64");
+        if (!process.env.GITHUB_REPO || !process.env.GITHUB_TOKEN) {
+            throw new Error("GITHUB_REPO / GITHUB_TOKEN not configured.");
+        }
+        const headers = {
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            Accept: "application/vnd.github+json"
+        };
+        // Refuse to put election data in a public repository (audit B3). One free API call.
+        const repoInfo = await axios.get(`https://api.github.com/repos/${process.env.GITHUB_REPO}`, { headers, timeout: 15000 });
+        if (repoInfo.data?.private !== true) {
+            throw new Error("BACKUP_REPO_NOT_PRIVATE: refusing to upload election data to a public repository.");
+        }
 
+        const path = `archives/election-${Date.now()}.json`;
         const res = await axios.put(
             `https://api.github.com/repos/${process.env.GITHUB_REPO}/contents/${path}`,
             {
                 message: `Election backup | ${new Date().toISOString()} | Hash: ${hash}`,
-                content: content
+                content: Buffer.from(json).toString("base64")
             },
-            {
-                headers: {
-                    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                    "Content-Type": "application/json"
-                }
-            }
+            { headers: { ...headers, "Content-Type": "application/json" }, timeout: 60000, maxBodyLength: Infinity }
         );
-
-        await alertManager.detectSystemHealth();
-
         return res.data.content.html_url;
-
-
     } catch (e) {
         console.error("GITHUB UPLOAD ERROR:", e.response?.data || e.message);
         throw e;
     }
 }
 
+function reviveTimestamps(value) {
+    if (Array.isArray(value)) return value.map(reviveTimestamps);
+    if (value && typeof value === "object") {
+        const keys = Object.keys(value);
+        if (keys.length === 2 && typeof value._seconds === "number" && typeof value._nanoseconds === "number") {
+            return new admin.firestore.Timestamp(value._seconds, value._nanoseconds);
+        }
+        const out = {};
+        for (const k of keys) out[k] = reviveTimestamps(value[k]);
+        return out;
+    }
+    return value;
+}
+
+// Validates the hash chain of a backup in memory, BEFORE anything is deleted.
+function verifyBackupVotes(votes) {
+    const prev = {};
+    const heads = {};
+    let invalid = 0;
+    const ordered = [...votes].sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0));
+    for (const v of ordered) {
+        const key = v.shardId || "LEGACY_SINGLE_CHAIN";
+        const expectedPrev = prev[key] || (v.shardId ? `GENESIS_${v.shardId}` : "GENESIS");
+        const payload = v.type === "REVOCATION"
+            ? `REVOKE:${v.targetReceipt}:${v.prevHash}`
+            : v.receipt + v.prevHash + stableStringify(v.selections || {});
+        const expectedHash = crypto.createHash("sha256").update(payload).digest("hex");
+        if (v.prevHash !== expectedPrev || v.hash !== expectedHash) invalid++;
+        prev[key] = v.hash;
+        if (v.shardId) heads[v.shardId] = { hash: v.hash, count: Number(v.sequence || 0) };
+    }
+    return { valid: invalid === 0, invalid, heads };
+}
+
 async function restoreElectionFromBackup(jsonData, providedHash) {
     const actualHash = crypto.createHash("sha256").update(jsonData).digest("hex");
-    if (!crypto.timingSafeEqual(Buffer.from(actualHash), Buffer.from(providedHash))) {
+    const a = Buffer.from(actualHash);
+    const b = Buffer.from(String(providedHash || ""));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
         throw new Error("BACKUP_INTEGRITY_FAIL: Hash mismatch. Restore aborted.");
     }
 
-    const key = crypto.createHash("sha256").update(process.env.BACKUP_SECRET).digest();
-    const [ivHex, encrypted] = jsonData.split(":");
-    const iv = Buffer.from(ivHex, "hex");
-    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
-    let decrypted = decipher.update(encrypted, "hex", "utf8");
-    decrypted += decipher.final("utf8");
-    const data = JSON.parse(decrypted);
+    // 1. Decrypt + validate EVERYTHING before touching the database.
+    const data = decryptBackupPayload(jsonData);
+    if (!Array.isArray(data.votes) || !Array.isArray(data.voters) || !Array.isArray(data.candidates)) {
+        throw new Error("BACKUP_INVALID: missing votes/voters/candidates. Restore aborted.");
+    }
+    const chain = verifyBackupVotes(data.votes);
+    if (!chain.valid) {
+        throw new Error(`BACKUP_CHAIN_INVALID: ${chain.invalid} broken record(s). Restore aborted.`);
+    }
+    for (const v of data.voters) if (!v._docId) throw new Error("Voter backup is missing document ID. Restore aborted.");
+    for (const v of data.votes) if (!v._docId) throw new Error("Vote backup is missing document ID. Restore aborted.");
 
-    // Helper: commit in chunks of 499
     async function commitInChunks(operations) {
-        const CHUNK_SIZE = 499;
+        const CHUNK_SIZE = 400;
         for (let i = 0; i < operations.length; i += CHUNK_SIZE) {
-            const chunk = operations.slice(i, i + CHUNK_SIZE);
             const batch = db.batch();
-            chunk.forEach(({ ref, doc }) => batch.set(ref, doc));
+            operations.slice(i, i + CHUNK_SIZE).forEach(({ ref, doc }) => batch.set(ref, doc));
             await batch.commit();
         }
     }
+    const toDoc = (row) => { const { _docId, ...rest } = reviveTimestamps(row); return rest; };
 
-    await deleteCollectionInBatches(db.collection("votes"), 400);
-    await deleteCollectionInBatches(db.collection("voters"), 400);
-    await deleteCollectionInBatches(db.collection("candidates"), 400);
+    // 2. Wipe everything the old election state depended on (not just votes/voters).
+    for (const name of ["votes", "voters", "candidates", "_meta", "used_nonces", "receipt_recovery"]) {
+        await deleteCollectionInBatches(db.collection(name), 400);
+    }
 
+    // 3. Restore with ORIGINAL document IDs (votes used to get random IDs, orphaning every receipt).
+    await commitInChunks(data.voters.map(v => ({ ref: db.collection("voters").doc(v._docId), doc: toDoc(v) })));
+    await commitInChunks(data.candidates.map(c => ({ ref: db.collection("candidates").doc(c._docId || c.position), doc: toDoc(c) })));
+    await commitInChunks(data.votes.map(v => ({ ref: db.collection("votes").doc(v._docId), doc: toDoc(v) })));
 
-    await db.collection("_meta").doc("chain_head").delete();
+    // 4. Rebuild the chain heads so the next ballot continues the restored chain.
+    await commitInChunks(Object.entries(chain.heads).map(([shardId, h]) => ({
+        ref: db.collection("_meta").doc(shardId),
+        doc: { hash: h.hash, count: h.count, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+    })));
 
-    const voterOps = (data.voters || []).map(v => {
-        const docId = v._docId;                      // ← store _docId in backup
-        if (!docId) throw new Error("Voter backup is missing document ID. Restore aborted.");
-        return { ref: db.collection("voters").doc(docId), doc: v };
-    });
+    // 5. Rebuild RTDB voter status + caches.
+    const status = {};
+    for (const v of data.voters) {
+        status[v._docId] = {
+            hasVoted: v.hasVoted === true, isMissed: v.isMissed === true,
+            integrityStatus: v.hasVoted === true ? "VALID" : "PENDING", updatedAt: coarseMillis()
+        };
+    }
+    await rtdb.ref("voterStatus").set(status);
+    await rtdb.ref("activeSessions").remove().catch(() => {});
+    VerifiedShardCheckpoints.clear();
+    await invalidateVotersCache();
+    await refreshLocalCandidates();
+    await rebuildAggregates();
 
-
-    const candidateOps = (data.candidates || []).map(c => ({
-        ref: db.collection("candidates").doc(c.position),
-        doc: { options: c.options || [] }
-    }));
-    const voteOps = (data.votes || []).map(vote => ({
-        ref: db.collection("votes").doc(),
-        doc: vote
-    }));
-
-    await commitInChunks(voterOps);
-    await commitInChunks(candidateOps);
-    await commitInChunks(voteOps);
-
-    return {
-        voters: data.voters?.length || 0,
-        votes: data.votes?.length || 0,
-        candidates: data.candidates?.length || 0
-    };
+    return { voters: data.voters.length, votes: data.votes.length, candidates: data.candidates.length };
 }
 
 app.get('/api/firebase-config', (req, res) => {
@@ -1808,17 +2225,18 @@ class AlertManager {
         let critical = 0;
         let warnings = 0;
 
+        // null = "not measured". These used to be hard-coded true, i.e. fabricated verification results.
         const indicators = {
             database: true,
             auth: true,
-            voteChain: true,
-            antiMultipleVote: true,
-            tamperDetection: true,
-            replayProtection: true,
-            backups: true,
-            anomalyDetection: true,
-            tallyVerification: true,
-            voteConsistency: true
+            voteChain: lastIntegrityResult ? lastIntegrityResult.valid : null,
+            antiMultipleVote: null,
+            tamperDetection: lastIntegrityResult ? lastIntegrityResult.valid : null,
+            replayProtection: null,
+            backups: null,
+            anomalyDetection: null,
+            tallyVerification: lastAggregateCheck ? lastAggregateCheck.valid : null,
+            voteConsistency: lastAggregateCheck ? lastAggregateCheck.valid : null
         };
 
         try {
@@ -1886,24 +2304,19 @@ class AlertManager {
                 await this.clearResolvedAlerts('env_error');
             }
 
-            // 🔍 4. HASH CHAIN CHECK (IMPORTANT FOR PAGE 7)
-            let hashStatus = "verified";
+            // 4. HASH CHAIN STATUS - taken from the last REAL verification (monitorIntegrity), never assumed.
+            //    The sharded flow never writes the legacy _meta/chain_head, so checking it always failed.
+            let hashStatus = "not measured";
             let anomalies = 0;
-
-            try {
-                const chainDoc = await db.collection("_meta").doc("chain_head").get();
-
-                if (!chainDoc.exists) {
-                    hashStatus = "not verified";
+            if (lastIntegrityResult) {
+                if (lastIntegrityResult.valid) {
+                    hashStatus = "verified";
+                } else {
+                    hashStatus = "broken";
                     anomalies++;
-                    warnings++;
+                    critical++;
                     indicators.voteChain = false;
                 }
-            } catch (e) {
-                hashStatus = "error";
-                anomalies++;
-                critical++;
-                indicators.voteChain = false;
             }
 
             // 🔍 5. FINAL STATUS DECISION
@@ -1918,7 +2331,7 @@ class AlertManager {
                 status: overallStatus,
                 trust:
                     critical > 0 ? "cannot" :
-                        warnings > 0 ? "can be" : "can",
+                        (warnings > 0 || !lastIntegrityResult) ? "can be" : "can",
 
                 hashStatus,
                 anomalies,
@@ -1957,7 +2370,7 @@ class AlertManager {
         }
     }
 
-    async dismissAlert(alertId, adminId = 'system') {
+    async dismissAlert(alertId, adminId = 'system', actorRole = 'system') {
         try {
             const alertRef = db.collection("system_alerts").doc(alertId);
             const alertDoc = await alertRef.get();
@@ -1967,6 +2380,10 @@ class AlertManager {
             }
 
             const alertData = alertDoc.data();
+
+            if (alertData.level === 'critical' && actorRole !== 'system' && actorRole !== 'superadmin') {
+                return { success: false, error: 'Critical alerts can only be dismissed by a superadmin after investigation.' };
+            }
 
             // Move to alert logs
             const logEntry = {
@@ -2353,14 +2770,12 @@ setInterval(async () => {
         if (count >= 800) {
             currentState = "degraded";
 
-            await rtdb.ref("system/queueEnabled").set(true);
-
             if (lastLoadState !== currentState) {
                 await alertManager.createAlert(
                     "high_load",
                     "critical",
                     "Degraded performance",
-                    `The system has exceeded the defined threshold of ${count} concurrent active sessions, resulting in degraded application performance. To ensure stability and recover latency, the automated request queue system has been enabled. System traffic is being managed to return to operational parameters. No immediate action required; monitoring.`,
+                    `The system has exceeded the defined threshold of ${count} concurrent active sessions, resulting in degraded application performance. The automatic queue is NOT switched on by this alert: enable the voter queue from the admin session settings if latency keeps rising.`,
                     { count }
                 );
             }
@@ -2393,8 +2808,6 @@ setInterval(async () => {
 
         } else {
             currentState = "normal";
-
-            await rtdb.ref("system/queueEnabled").set(false);
 
             if (lastLoadState !== currentState) {
                 await alertManager.clearResolvedAlerts("high_load");
@@ -2429,7 +2842,7 @@ if (!ADMIN_KEY) {
 function generateNonce() {
     const raw = crypto.randomBytes(16).toString('base64');
     const window = Math.floor(Date.now() / (5 * 60 * 1000));
-    const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'fallback')
+    const sig = crypto.createHmac('sha256', CSP_NONCE_KEY)
         .update(`${raw}:${window}`)
         .digest('base64url');
     return `${raw}.${sig}`;
@@ -2440,7 +2853,7 @@ function verifyNonce(nonce) {
     const [raw, sig] = nonce.split('.');
     const now = Math.floor(Date.now() / (5 * 60 * 1000));
     for (const w of [now, now - 1]) {
-        const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || 'fallback')
+        const expected = crypto.createHmac('sha256', CSP_NONCE_KEY)
             .update(`${raw}:${w}`)
             .digest('base64url');
         try {
@@ -2495,7 +2908,31 @@ function sanitizeObjectEnhanced(obj) {
 
 // --- SECURITY: PER-USER (LVN) BRUTE FORCE PROTECTION ---
 const USER_LOCK_ATTEMPTS = 5;
-const USER_LOCK_DURATION_MS = 30 * 60 * 1000;
+const USER_LOCK_DURATION_MS = 10 * 60 * 1000; // short on purpose: a long lock lets an attacker lock students out mid-election
+const failedLogins = new Map(); // hashedLVN -> { count, firstAt, lockedUntil }  (in memory: zero DB cost)
+
+function getLoginLock(hashedLVN) {
+    const rec = failedLogins.get(hashedLVN);
+    if (rec && rec.lockedUntil && rec.lockedUntil > Date.now()) return rec.lockedUntil;
+    return 0;
+}
+// Counted for unknown LVNs too, so a lock does not reveal whether an LVN exists.
+function recordFailedLogin(hashedLVN) {
+    const now = Date.now();
+    let rec = failedLogins.get(hashedLVN);
+    if (!rec || now - rec.firstAt > 15 * 60 * 1000) rec = { count: 0, firstAt: now, lockedUntil: 0 };
+    rec.count++;
+    if (rec.count >= USER_LOCK_ATTEMPTS) rec.lockedUntil = now + USER_LOCK_DURATION_MS;
+    failedLogins.set(hashedLVN, rec);
+    if (failedLogins.size > 50000) failedLogins.clear(); // hard memory cap
+}
+function clearFailedLogin(hashedLVN) { failedLogins.delete(hashedLVN); }
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of failedLogins) {
+        if ((!v.lockedUntil || v.lockedUntil < now) && now - v.firstAt > 15 * 60 * 1000) failedLogins.delete(k);
+    }
+}, 5 * 60 * 1000).unref();
 
 // --- SECURITY: HASH FUNCTION FOR LVN ENCRYPTION ---
 const LVN_SECRET = process.env.LVN_SECRET;
@@ -2596,6 +3033,36 @@ const loginLimiter = rateLimit({
     legacyHeaders: false
 });
 
+// Counts only FAILED logins per IP (changing the LVN no longer gives a fresh bucket).
+// Generous because a whole school may share one NAT address.
+const loginFailLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 80,
+    skipSuccessfulRequests: true,
+    keyGenerator: (req) => `fail:${getClientIp(req)}`,
+    message: { error: "Too many failed login attempts from this network. Please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+const aiMutationLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 20,
+    keyGenerator: (req) => `ai:${getClientIp(req)}`,
+    message: { error: "Too many requests." },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+const publicReadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    keyGenerator: (req) => `pub:${getClientIp(req)}`,
+    message: { error: "Too many requests. Please slow down." },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
 const voteLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 10,
@@ -2607,8 +3074,10 @@ const voteLimiter = rateLimit({
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 4500,
     message: { error: "Too many admin requests. Please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false
 });
 
 const revealLvnLimiter = rateLimit({
@@ -2750,7 +3219,7 @@ async function getOrGenerateCode(type, key) {
             if (data.grades[key]) {
                 returnValue = data.grades[key];
             } else {
-                returnValue = Math.floor(100 + Math.random() * 900).toString();
+                returnValue = crypto.randomInt(100, 1000).toString();
                 t.set(registryRef, { grades: { [key]: returnValue } }, { merge: true });
             }
         }
@@ -2758,10 +3227,10 @@ async function getOrGenerateCode(type, key) {
             if (data.sections[key]) {
                 returnValue = data.sections[key];
             } else {
-                const secPrefix = Math.floor(100 + Math.random() * 900).toString();
+                const secPrefix = crypto.randomInt(100, 1000).toString();
                 const sectionName = key.split('_')[1] || "A";
                 const letter = sectionName.charAt(0).toUpperCase();
-                const nums = Math.floor(10000 + Math.random() * 90000);
+                const nums = crypto.randomInt(10000, 100000);
                 const accessCode = `${letter}-${nums}`;
                 returnValue = { prefix: secPrefix, access_code: accessCode };
                 t.set(registryRef, { sections: { [key]: returnValue } }, { merge: true });
@@ -3027,10 +3496,14 @@ async function isJtiRevoked(jti) {
 // Make requireAuth async and use await properly:
 async function requireAuth(req, res, next) {
     try {
-        let token = req.cookies.__session;
-        if (!token && req.headers.authorization?.startsWith("Bearer "))
+        let token = null;
+        if (req.headers.authorization?.startsWith("Bearer ")) {
             token = req.headers.authorization.split(" ")[1];
-        if (!token) return res.status(401).end();
+        }
+        if (!token) {
+            token = req.cookies?.__session;
+        }
+        if (!token || token === "undefined" || token === "null") return res.status(401).end();
 
         const decoded = jwt.verify(token, SECRET);
         if (!decoded.jti) {
@@ -3046,18 +3519,53 @@ async function requireAuth(req, res, next) {
     }
 }
 
+// Resolves to true only for a valid, non-revoked admin session. Never writes a response.
+async function isAdminRequest(req) {
+    try {
+        let token = null;
+        if (req.headers.authorization?.startsWith("Bearer ")) token = req.headers.authorization.split(" ")[1];
+        if (!token) token = req.cookies?.__session;
+        if (!token || token === "undefined" || token === "null") return false;
+        const decoded = jwt.verify(token, SECRET);
+        if (!decoded.jti || (await isJtiRevoked(decoded.jti))) return false;
+        return decoded.role === "admin" || decoded.role === "superadmin" || decoded.admin === true;
+    } catch (_) {
+        return false;
+    }
+}
+
 function requireRole(role) {
     return (req, res, next) => {
-        if (!req.user || req.user.role !== role) {
+        const userRole = String(req.user?.role || "").toLowerCase();
+        const portalRoles = ["admin", "superadmin", "election_officer", "adviser", "advisor", "encoder"];
+        const hasPermission = userRole === role ||
+                             (role === "admin" && (userRole === "superadmin" || req.user?.admin === true)) ||
+                             (role === "portal_staff" && portalRoles.includes(userRole));
+
+        if (!req.user || !hasPermission) {
             logSecurityEvent("UNAUTHORIZED_ACCESS", req, { 
                 requiredRole: role, 
-                userRole: req.user?.role,
+                userRole: userRole,
                 userEmail: req.user?.email 
             });
             return res.status(403).json({ error: "Forbidden: Insufficient privileges" });
         }
         next();
     };
+}
+
+function requireQrRecoveryRole(req, res, next) {
+    const userRole = req.user?.role;
+    if (!req.user || !isRoleAssignedToQrScanner(userRole, req.user.canScanQr)) {
+        logSecurityEvent("UNAUTHORIZED_QR_RECOVERY_ACCESS", req, {
+            userRole: userRole || "none",
+            userEmail: req.user?.email || null
+        });
+        return res.status(403).json({
+            error: "Forbidden: Your role is not assigned to the QR Ballot Recovery Scanner."
+        });
+    }
+    next();
 }
 
 /**
@@ -3114,23 +3622,66 @@ async function verifyFirebaseAdmin(req, res, next) {
 
 function requireAdminKey(req, res, next) {
     const adminKey = req.headers["x-admin-key"];
-    if (!adminKey || !ADMIN_KEY || !timingSafeEqualString(String(adminKey), String(ADMIN_KEY))) {
+    const isKeyValid = adminKey && ADMIN_KEY && timingSafeEqualString(String(adminKey), String(ADMIN_KEY));
+    const isSuperAdmin = req.user?.role === "superadmin" || req.user?.admin === true;
+
+    if (!isKeyValid && !isSuperAdmin) {
         logSecurityEvent("ADMIN_KEY_FAILED", req, { hasKey: !!adminKey, path: req.originalUrl });
-        return res.status(403).json({ error: "Forbidden: Invalid admin key" });
+        return res.status(403).json({ error: "Forbidden: Invalid admin key or insufficient role privileges." });
     }
     next();
 }
 
+// Dedicated endpoint to verify admin credentials before critical modal actions
+app.post("/admin/verify-key", requireAuth, requireRole("admin"), (req, res) => {
+    const key = req.body?.key || req.headers["x-admin-key"];
+    const isKeyValid = key && ADMIN_KEY && timingSafeEqualString(String(key), String(ADMIN_KEY));
+    const isSuperAdmin = req.user?.role === "superadmin";
+
+    if (isKeyValid || isSuperAdmin) {
+        return res.json({ success: true, verified: true });
+    }
+    return res.status(403).json({ success: false, error: "Invalid administrator key." });
+});
+
 // --- PURGE FUNCTION ---
 async function purgeElectionData() {
-    const votersRef = db.collection("voters");
     const votesRef = db.collection("votes");
     const resultsRef = db.collection("results");
-    const securityLogsRef = db.collection("security_logs");
-    await deleteCollectionInBatches(votersRef);
+    const usedNoncesRef = db.collection("used_nonces");
+    const recoveryRef = db.collection("receipt_recovery");
+
+    // 1. Delete all votes, nonces, and receipts
     await deleteCollectionInBatches(votesRef);
     await deleteCollectionInBatches(resultsRef);
-    await deleteCollectionInBatches(securityLogsRef);
+    await deleteCollectionInBatches(usedNoncesRef);
+    await deleteCollectionInBatches(recoveryRef);
+
+    // 2. Reset voter states back to unvoted without deleting their records
+    const votersSnap = await db.collection("voters").where("hasVoted", "==", true).get();
+    if (!votersSnap.empty) {
+        let batch = db.batch();
+        let count = 0;
+        for (const doc of votersSnap.docs) {
+            batch.update(doc.ref, {
+                hasVoted: false,
+                votedAt: admin.firestore.FieldValue.delete(),
+                lastBallotId: admin.firestore.FieldValue.delete(),
+                receipt: admin.firestore.FieldValue.delete()
+            });
+            count++;
+            if (count % 400 === 0) {
+                await batch.commit();
+                batch = db.batch();
+            }
+        }
+        if (count % 400 !== 0) await batch.commit();
+    }
+
+    // 3. Clear chain heads & RTDB voter statuses
+    await deleteCollectionInBatches(db.collection("_meta"));
+    await rtdb.ref("voterStatus").remove().catch(() => {});
+    await rtdb.ref("activeSessions").remove().catch(() => {});
 }
 
 let initPromise = null;
@@ -3159,14 +3710,21 @@ async function ensureSystemReady() {
 
 // -- VERIFY CLOUDFLARE
 async function verifyCaptcha(token) {
-    const res = await axios.post(
-        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-        new URLSearchParams({
-            secret: process.env.TURNSTILE_SECRET,
-            response: token
-        })
-    );
-    return res.data.success;
+    if (!token || typeof token !== "string") return false;
+    try {
+        const res = await axios.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            new URLSearchParams({
+                secret: process.env.TURNSTILE_SECRET,
+                response: token
+            }),
+            { timeout: 8000 }
+        );
+        return res.data?.success === true;
+    } catch (e) {
+        console.error("[CAPTCHA] verification request failed:", e.message);
+        return false; // fail closed
+    }
 }
 
 // -- ALERTS
@@ -3215,7 +3773,7 @@ app.post("/admin/correct-name", requireAuth, requireRole("admin"), verifyCSRF, a
     }
 });
 
-app.get("/admin/test-alert", requireAuth, requireRole("admin"), async (req, res) => {
+app.post("/admin/test-alert", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
     await alertManager.createAlert(
         'api_error',
         'major',
@@ -3232,7 +3790,7 @@ app.post("/admin/alerts/:id/dismiss", requireAuth, requireRole("admin"), async (
     try {
         const alertId = req.params.id;
         const adminId = req.user?.uid || req.user?.email || 'unknown';
-        const result = await alertManager.dismissAlert(alertId, adminId);
+        const result = await alertManager.dismissAlert(alertId, adminId, req.user?.role);
         if (result.success) {
             res.json({ success: true, message: "Alert dismissed and logged" });
         } else {
@@ -3399,21 +3957,6 @@ app.post("/client-error-report", requireAuth, requireRole("admin"), async (req, 
     }
 });
 
-// --- ADMIN ROLE RESOLUTION (from the VERIFIED Firebase ID token's custom claim "role") ---
-function normalizeAdminRole(r) {
-    const k = String(r || "").toLowerCase().replace(/[^a-z]/g, "");
-    if (["superadmin", "super", "owner"].includes(k)) return "super";
-    if (["admin", "electionadmin"].includes(k)) return "admin";
-    if (["adviser", "advisor", "encoder"].includes(k)) return "adviser";
-    if (["electionofficer", "recoveryofficer", "officer", "facilitator"].includes(k)) return "election_officer";
-    return null;
-}
-function resolveAdminRole(decoded) {
-    if (!decoded) return null;
-    const adminClaim = decoded.admin && typeof decoded.admin === "object" ? decoded.admin.role : null;
-    return normalizeAdminRole(decoded.role || adminClaim);
-}
-
 // --- ADMIN AUTH ROUTES ---
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     const { idToken, captchaToken } = req.body;
@@ -3431,18 +3974,33 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const allowedAdmins = (process.env.ADMIN_EMAIL || "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean);
-    if (allowedAdmins.length === 0) {
-        console.error("[SECURITY] ADMIN_EMAIL environment variable is not configured!");
-        return res.status(500).json({ error: "Server admin configuration error." });
+    const userEmail = (decodedToken.email || "").trim().toLowerCase();
+    
+    // 1. Resolve role from Firebase Auth Custom Claims, fallback to ADMIN_EMAIL allowlist if set
+    let assignedRole = decodedToken.role || (decodedToken.admin === true ? "admin" : null);
+
+    // Optional Firestore fallback if roles are stored in a `users` or `admins` collection:
+    if (!assignedRole) {
+        const adminDoc = await db.collection("admins").doc(decodedToken.uid).get();
+        if (adminDoc.exists) {
+            assignedRole = adminDoc.data().role || "admin";
+        }
     }
 
-    const userEmail = (decodedToken.email || "").trim().toLowerCase();
-    const isAuthorizedAdmin = (userEmail && allowedAdmins.includes(userEmail)) || decodedToken.admin === true;
-    if (!isAuthorizedAdmin) {
-        await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: decodedToken.email || "none" });
+    // Fallback to environment variable allowlist if configured
+    if (!assignedRole && process.env.ADMIN_EMAIL) {
+        const allowedAdmins = process.env.ADMIN_EMAIL.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+        if (allowedAdmins.includes(userEmail)) {
+            assignedRole = "admin";
+        }
+    }
+
+    // Allow designated administrative roles through the admin portal
+    const allowedPortalRoles = ["admin", "superadmin", "election_officer", "adviser", "advisor", "encoder"];
+    if (!assignedRole || !allowedPortalRoles.includes(String(assignedRole).toLowerCase())) {
+        await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: userEmail, role: assignedRole || "none" });
         await new Promise(r => setTimeout(r, 400));
-        return res.status(403).json({ error: "Forbidden: Not an authorized administrator." });
+        return res.status(403).json({ error: "Forbidden: Account does not have an administrative role assigned in Firebase." });
     }
 
     try {
@@ -3458,23 +4016,46 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
 
     const adminJti = crypto.randomBytes(16).toString("hex");
     const adminCsrfToken = crypto.randomBytes(32).toString("hex");
-    const adminRole = resolveAdminRole(decodedToken);
+    const canScanQr = isRoleAssignedToQrScanner(assignedRole, decodedToken.qrScanAssigned);
     const token = jwt.sign({
-        uid: decodedToken.uid, email: decodedToken.email, role: "admin", adminRole,
-        jti: adminJti, csrfToken: adminCsrfToken, iat: Math.floor(Date.now() / 1000)
+        uid: decodedToken.uid,
+        email: decodedToken.email,
+        role: assignedRole,
+        canScanQr,
+        jti: adminJti,
+        csrfToken: adminCsrfToken,
+        iat: Math.floor(Date.now() / 1000)
     }, SECRET, { expiresIn: "2h" });
 
     res.cookie("__session", token, {
-        httpOnly: true, secure: true, sameSite: "none", path: "/", maxAge: 2 * 60 * 60 * 1000
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        path: "/",
+        maxAge: 2 * 60 * 60 * 1000
     });
     await logSecurityEvent("ADMIN_LOGIN_SUCCESS", req, { email: decodedToken.email, uid: decodedToken.uid });
-    return res.json({ success: true, csrfToken: adminCsrfToken, role: adminRole, email: decodedToken.email });
+    // The session lives in the HttpOnly cookie. Returning the JWT to JavaScript makes it stealable
+    // by XSS, so it is opt-in only (ADMIN_TOKEN_IN_BODY=true) for browsers that block 3rd-party cookies.
+    return res.json({
+        success: true,
+        role: assignedRole,
+        canScanQr,
+        csrfToken: adminCsrfToken,
+        ...(process.env.ADMIN_TOKEN_IN_BODY === "true" ? { token } : {})
+    });
 });
 
-app.post("/admin/logout", async (req, res) => {
+app.post("/logout", async (req, res) => {
     try {
-        if (req.user?.jti) {
-            await revokeJti(req.user.jti);
+        const token = req.cookies?.__session ||
+            (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.split(" ")[1] : null);
+        if (token) {
+            try {
+                const decoded = jwt.verify(token, SECRET);
+                if (decoded?.jti) await revokeJti(decoded.jti);
+                if (decoded?.uid) await rtdb.ref(`activeSessions/${decoded.uid}`).remove().catch(() => {});
+            } catch (_) {}
         }
 
         res.clearCookie("__session", {
@@ -3484,33 +4065,41 @@ app.post("/admin/logout", async (req, res) => {
             path: "/"
         });
 
-        res.json({ success: true });
-
+        return res.json({ success: true });
     } catch (err) {
-        console.error("Logout error:", err);
-        res.status(500).json({ error: "Logout failed" });
+        console.error("Voter logout error:", err);
+        return res.status(500).json({ error: "Logout failed" });
     }
 });
 
-// Plain session check (page load / session restore). Returns the role resolved at login.
-app.get("/admin/verify", requireAuth, requireRole("admin"), (req, res) => {
+// Plain session check (page load / session restore). A wrong "password" can no longer surface
+// here as a 403, which the dashboard used to read as "session expired".
+app.get("/admin/verify", requireAuth, requireRole("portal_staff"), async (req, res) => {
+    const canScanQr = isRoleAssignedToQrScanner(req.user.role, req.user.canScanQr);
     res.json({
         success: true,
-        role: req.user.adminRole || null,
-        email: req.user.email,
+        role: req.user.role,
+        canScanQr,
         csrfToken: req.user.csrfToken,
-        user: { email: req.user.email, uid: req.user.uid }
+        user: {
+            email: req.user.email,
+            uid: req.user.uid,
+            role: req.user.role,
+            canScanQr
+        }
     });
 });
 
 // ---------------------------------------------------------------------------
 // SUPER-ADMIN PASSWORD CONFIRMATION (step-up auth via Firebase)
-// The dashboard re-authenticates the CURRENTLY LOGGED-IN account with its own Firebase
-// password, then sends the fresh ID token here. We only accept it if it belongs to the same
-// account as the session, was issued by a password sign-in within the last 3 minutes, and the
-// account is a Super Admin. On success we hand back a 2-minute proof bound to this session.
-// Wrong passwords fail inside Firebase and never reach this route.
+// The dashboard re-authenticates the CURRENTLY LOGGED-IN account with its own Firebase password
+// and sends the fresh ID token here. It is accepted only if it belongs to the same account as the
+// session, came from a password sign-in within the last 3 minutes, and the session is a
+// superadmin. On success we return a 2-minute proof bound to this session. Wrong passwords fail
+// inside Firebase and never reach this route.
 // ---------------------------------------------------------------------------
+const ADMIN_REAUTH_KEY = deriveSubkey(SECRET, "admin-reauth");
+
 const adminReauthLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -3521,10 +4110,14 @@ const adminReauthLimiter = rateLimit({
     keyGenerator: (req) => getClientIp(req),
 });
 
+function isSuperAdminSession(req) {
+    return String(req.user?.role || "").toLowerCase() === "superadmin";
+}
+
+// Error messages below intentionally avoid the words "CSRF" and "insufficient privileges" so the
+// dashboard shows them in place instead of logging the admin out.
 app.post("/admin/reauth", requireAuth, requireRole("admin"), verifyCSRF, adminReauthLimiter, async (req, res) => {
-    // Status codes here are deliberately 400/403 with messages that do NOT mention CSRF or
-    // "insufficient privileges", so the dashboard shows the error instead of logging out.
-    if (req.user.adminRole !== "super") {
+    if (!isSuperAdminSession(req)) {
         return res.status(403).json({ success: false, error: "Only Super Admins can perform this action." });
     }
 
@@ -3545,27 +4138,26 @@ app.post("/admin/reauth", requireAuth, requireRole("admin"), verifyCSRF, adminRe
     const isSamePerson = decoded.uid === req.user.uid;
     const usedPassword = decoded.firebase && decoded.firebase.sign_in_provider === "password";
     const isFresh = typeof decoded.auth_time === "number" && (nowSec - decoded.auth_time) <= 180;
-    const stillSuper = resolveAdminRole(decoded) === "super";
 
-    if (!isSamePerson || !usedPassword || !isFresh || !stillSuper) {
+    if (!isSamePerson || !usedPassword || !isFresh) {
         await logSecurityEvent("ADMIN_REAUTH_FAILED", req, {
-            uid: req.user.uid, isSamePerson, usedPassword, isFresh, stillSuper
+            uid: req.user.uid, isSamePerson, usedPassword, isFresh
         });
         return res.status(403).json({ success: false, error: "Password confirmation was not accepted for this account." });
     }
 
     const reauthToken = jwt.sign(
         { purpose: "admin_reauth", uid: req.user.uid, sid: req.user.jti },
-        SECRET,
+        ADMIN_REAUTH_KEY,
         { expiresIn: 120 }
     );
     await logSecurityEvent("ADMIN_REAUTH_SUCCESS", req, { uid: req.user.uid, email: req.user.email });
     return res.json({ success: true, reauthToken, expiresIn: 120 });
 });
 
-// Server-side enforcement: only a Super Admin holding a fresh reauth proof for THIS session passes.
+// Server-side enforcement: only a superadmin holding a fresh reauth proof for THIS session passes.
 function requireSuperReauth(req, res, next) {
-    if (!req.user || req.user.adminRole !== "super") {
+    if (!isSuperAdminSession(req)) {
         return res.status(403).json({ error: "Only Super Admins can perform this action." });
     }
     const proof = req.headers["x-reauth-token"];
@@ -3573,7 +4165,7 @@ function requireSuperReauth(req, res, next) {
         return res.status(403).json({ error: "Password confirmation required." });
     }
     try {
-        const d = jwt.verify(String(proof), SECRET);
+        const d = jwt.verify(String(proof), ADMIN_REAUTH_KEY);
         if (d.purpose !== "admin_reauth" || d.uid !== req.user.uid || d.sid !== req.user.jti) {
             throw new Error("proof mismatch");
         }
@@ -3611,7 +4203,7 @@ app.get("/settings", async (req, res) => {
         const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
         const strictProtocols = strictProtocolsDoc.exists ? strictProtocolsDoc.data() : { maxDevices: STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES };
 
-        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection });
+        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection, qrRecoveryPublicKey: QR_RECOVERY_PUBLIC_KEY_HEX });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -3692,7 +4284,7 @@ app.get("/mock/candidates", (req, res) => {
     return res.json(MOCK_CANDIDATES);
 });
 
-app.get("/dashboard", (req, res) => {
+app.get("/dashboard", async (req, res) => {
     try {
         const dashboard = GlobalCache.dashboard;
 
@@ -3704,6 +4296,20 @@ app.get("/dashboard", (req, res) => {
         }
 
         res.set("Cache-Control", "no-store");
+
+        // While voting is open the public sees turnout only. Live candidate tallies allow vote-steering
+        // and make small groups identifiable. Admins always see everything; set PUBLIC_LIVE_RESULTS=true
+        // to restore the old public behaviour.
+        if (liveSystemStatus.isLive === true && process.env.PUBLIC_LIVE_RESULTS !== "true" &&
+            !(await isAdminRequest(req))) {
+            return res.json({
+                isLive: true,
+                resultsHidden: true,
+                stats: dashboard.stats || {},
+                leaderboard: {},
+                lastUpdated: GlobalCache.timestamps.results || null
+            });
+        }
 
         return res.json({
             ...dashboard,
@@ -3717,10 +4323,10 @@ app.get("/dashboard", (req, res) => {
 });
 
 // --- VERIFIABLE VOTING: PUBLIC BULLETIN BOARD ---
-app.get("/public-receipts", async (req, res) => {
+app.get("/public-receipts", publicReadLimiter, async (req, res) => {
     try {
         // Pagination controls (safe limits)
-        const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
         const cursor = req.query.cursor || null;
 
         let query = db.collection("votes")
@@ -3769,7 +4375,8 @@ app.get("/public-receipts", async (req, res) => {
             pageSize: receipts.length,
             nextCursor: lastTimestamp,
             chainValid: chainInfo ? chainInfo.valid : undefined,
-            totalVerified: chainInfo ? chainInfo.totalVotes : undefined,
+            pageVerified: chainInfo ? chainInfo.totalVotes : undefined, // was "totalVerified": it only ever covered this page
+            verificationScope: chainInfo ? "first_page_only" : undefined,
             pageIntegrity: crypto.createHash('sha256')
                 .update(JSON.stringify(receipts.map(r => r.blockHash)))
                 .digest('hex')
@@ -3948,7 +4555,9 @@ async function verifyHashChain(shardFilter = null, forceFullScan = false) {
 }
 
 async function monitorIntegrity() {
+  try {
     const result = await verifyHashChain();
+    lastIntegrityResult = { valid: result.valid === true, at: Date.now(), message: result.message };
 
     if (!result.valid) {
         await createAlert(
@@ -3959,6 +4568,9 @@ async function monitorIntegrity() {
             result
         );
     }
+  } catch (e) {
+    console.error("[INTEGRITY MONITOR]", e.message);
+  }
 }
 setInterval(monitorIntegrity, 30 * 60 * 1000);
 
@@ -3971,7 +4583,7 @@ app.get("/admin/verify-chain", requireAuth, requireRole("admin"), async (req, re
     }
 });
 
-app.post("/verify", loginLimiter, async (req, res) => {
+app.post("/verify", loginLimiter, loginFailLimiter, async (req, res) => {
     if (!(await verifyCaptcha(req.body.captchaToken))) {
         return res.status(403).json({ error: "Captcha verification failed" });
     }
@@ -3985,6 +4597,11 @@ app.post("/verify", loginLimiter, async (req, res) => {
         }
 
         const hashedLVN = hashLVN(lvn);
+
+        // Cheap in-memory lock check first: a locked LVN costs no Firestore reads.
+        if (getLoginLock(hashedLVN)) {
+            return res.status(429).json({ error: "Too many failed attempts. Please wait a few minutes and try again." });
+        }
 
         const deviceFingerprint = getAssistedDeviceFingerprint(req);
         const assistedDeviceFingerprints = getAssistedDeviceFingerprintCandidates(req);
@@ -4047,6 +4664,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const voterSnap = await voterRef.get();
 
         if (!voterSnap.exists) {
+            recordFailedLogin(hashedLVN);
             return res.status(401).json({ error: "Invalid Credentials." });
         }
 
@@ -4056,9 +4674,11 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const isCodeValid = await bcrypt.compare(inputCode, d.code);
 
         if (!isCodeValid) {
+            recordFailedLogin(hashedLVN);
             await logSecurityEvent("FAILED_LOGIN", req, { reason: "Invalid code" });
             return res.status(401).json({ error: "Invalid Credentials." });
         }
+        clearFailedLogin(hashedLVN);
 
         if (d.isMissed === true) {
             return res.status(403).json({
@@ -4181,7 +4801,14 @@ app.post("/verify", loginLimiter, async (req, res) => {
         const jti = crypto.randomBytes(16).toString("hex");
 
         const sessionToken = jwt.sign(
-            { uid: hashedLVN, grade: d.grade, role: "voter", csrfToken, jti },
+            {
+                uid: hashedLVN,
+                grade: d.grade,
+                role: "voter",
+                csrfToken,
+                jti,
+                queueBypass: hasQueueBypassDevice === true
+            },
             SECRET,
             { expiresIn: "60m" }
         );
@@ -4221,6 +4848,7 @@ app.post("/verify", loginLimiter, async (req, res) => {
 });
 
 const QUEUE_ACTIVE_LEASE_MS = 15 * 60 * 1000;
+const queueEligibleSince = new Map(); // `${session}:${userId}` -> first time seen eligible
 
 setInterval(async () => {
     const grades = ["G7", "G8", "G9", "G10", "G11", "G12"];
@@ -4240,10 +4868,19 @@ setInterval(async () => {
 
             for (const [userId, userData] of Object.entries(users)) {
                 if (!userData) continue;
-                const joinedAt = Number(userData.joinedAt || 0);
                 const isEligibleActive = userData.status === "active" ||
                     (Number(userData.position) > 0 && Number(userData.position) <= currentServingUpTo);
-                const isExpiredActive = isEligibleActive && joinedAt > 0 && (now - joinedAt > QUEUE_ACTIVE_LEASE_MS);
+                // The 15-minute lease must start when the voter becomes ACTIVE. Measuring from joinedAt
+                // evicted anyone who had waited >15 min in line the moment their turn came.
+                const eligKey = `${gradeKey}:${userId}`;
+                if (isEligibleActive) {
+                    if (!queueEligibleSince.has(eligKey)) queueEligibleSince.set(eligKey, Number(userData.activatedAt) || now);
+                } else {
+                    queueEligibleSince.delete(eligKey);
+                }
+                const eligibleSince = queueEligibleSince.get(eligKey) || now;
+                const isExpiredActive = isEligibleActive && (now - eligibleSince > QUEUE_ACTIVE_LEASE_MS);
+                if (isExpiredActive || userData.status === "done") queueEligibleSince.delete(eligKey);
                 if (userData.status === "done") {
                     updates[userId] = null;
                 } else if (isExpiredActive) {
@@ -4272,7 +4909,7 @@ function maskReceipt(receipt) {
         return { mask: "***", hash: null };
     }
     const mask = receipt.substring(0, 4) + "⋯" + receipt.substring(receipt.length - 4);
-    const hash = crypto.createHmac("sha256", MASK_SECRET)
+    const hash = crypto.createHmac("sha256", RECEIPT_MASK_KEY)
         .update(receipt)
         .digest("hex")
         .substring(0, 16);
@@ -4283,22 +4920,22 @@ app.post("/verify-vote", rateLimit({
     windowMs: 60 * 1000,
     max: 20
 }), async (req, res) => {
+  try {
     const { receipt, verificationCode } = req.body;
 
-    if (!receipt || !verificationCode) {
-        return res.status(400).json({ error: "Missing data" });
+    if (typeof receipt !== "string" || typeof verificationCode !== "string" ||
+        !HEX64.test(receipt) || verificationCode.length > 64) {
+        return res.status(400).json({ error: "Missing or invalid data" });
     }
 
-    const voteSnap = await db.collection("votes")
-        .where("receipt", "==", receipt)
-        .limit(1)
-        .get();
+    // The receipt is the document ID: a direct get, no query needed.
+    const voteSnap = await db.collection("votes").doc(receipt).get();
 
-    if (voteSnap.empty) {
+    if (!voteSnap.exists || voteSnap.data().type === "REVOCATION") {
         return res.json({ found: false });
     }
 
-    const vote = voteSnap.docs[0].data();
+    const vote = voteSnap.data();
 
     const expectedCode = crypto.createHash("sha256")
         .update(receipt + stableStringify(vote.selections))
@@ -4320,6 +4957,10 @@ app.post("/verify-vote", rateLimit({
         found: true,
         contentMatches
     });
+  } catch (e) {
+    console.error("[VERIFY-VOTE]", e.message);
+    res.status(500).json({ error: "Verification failed" });
+  }
 });
 
 function stableStringify(obj) {
@@ -4345,7 +4986,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
 
         const hashedLVN = req.user.uid;
         const grade = String(req.user.grade);
-        const { selections, timestamp, nonce, ballotId } = req.body;
+        const { selections, timestamp, nonce } = req.body; // client-supplied ballotId is ignored (audit S3)
 
         if (!selections || typeof selections !== "object") {
             return res.status(400).json({ error: "Invalid ballot format." });
@@ -4366,12 +5007,13 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
 
         const validatedSelections = await validateSelections(selections, grade);
         const canonicalSelections = stableStringify(validatedSelections);
-        const deterministicBallotId = ballotId || crypto.createHash("sha256")
-            .update(`${hashedLVN}:${canonicalSelections}`)
-            .digest("hex");
+        // Keyed retry key (HMAC). The old unkeyed sha256(voter + selections) could be brute-forced
+        // from the voters collection to recover each voter's choices (audit S1).
+        const retryKey = ballotRetryKey(hashedLVN, canonicalSelections);
 
-        // Route deterministically to 1 of 64 chain shards (320+ writes/sec throughput)
-        const shardIndex = parseInt(hashedLVN.slice(0, 4), 16) % SHARD_COUNT;
+        // Random shard: the shard used to be derived from the voter ID, which leaked 6 bits of
+        // identity into every ballot (audit S4). Throughput is unchanged (uniform spread).
+        const shardIndex = crypto.randomInt(SHARD_COUNT);
         const shardId = `chain_shard_${String(shardIndex).padStart(2, "0")}`;
 
         const voterRef = db.collection("voters").doc(hashedLVN);
@@ -4388,7 +5030,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
             ]);
             const isIdempotentRetry =
                 existingRecoverySnap.exists &&
-                existingRecoverySnap.data()?.ballotId === deterministicBallotId;
+                existingRecoverySnap.data()?.ballotKey === retryKey;
 
             if (!isIdempotentRetry) {
                 const qUser = qSnap.val();
@@ -4412,9 +5054,12 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
             // IDEMPOTENT CONNECTION-LOSS RECOVERY:
             // If the previous request committed in Firestore but the response dropped, return the saved receipt!
             if (voterDoc.data().hasVoted === true) {
-                if (recoveryDoc.exists && recoveryDoc.data().ballotId === deterministicBallotId) {
-                    const saved = recoveryDoc.data();
-                    return { receipt: saved.receipt, hash: saved.hash, shardId: saved.shardId, replayed: true };
+                if (recoveryDoc.exists && recoveryDoc.data().ballotKey === retryKey &&
+                    (recoveryDoc.data().expiresAt?.toMillis?.() || 0) > Date.now()) {
+                    const saved = openSealedJson(recoveryDoc.data().sealed);
+                    if (saved?.receipt) {
+                        return { receipt: saved.receipt, hash: saved.hash, shardId: saved.shardId, replayed: true };
+                    }
                 }
                 throw new Error("ALREADY_VOTED");
             }
@@ -4445,19 +5090,21 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
             });
 
             // 2. Mark voter as voted WITHOUT storing plaintext receipt on voter doc (Preserves Ballot Secrecy)
+            // - votedAt is bucketed (15 min) so it cannot be matched to the ballot's exact createdAt.
+            // - ballotCommit is an HMAC that lets an admin PROVE a receipt belongs to this voter, but it
+            //   does not reveal which ballot is theirs. It replaces lastBallotId (audit S1).
             t.update(voterRef, {
                 hasVoted: true,
-                votedAt: admin.firestore.FieldValue.serverTimestamp(),
-                lastBallotId: deterministicBallotId
+                votedAt: coarseTimestamp(),
+                ballotCommit: receiptCommitment(hashedLVN, receipt)
             });
 
-            // 3. Write 15-minute TTL receipt recovery doc for idempotent retry support
+            // 3. Short-lived retry record. The receipt is AES-GCM sealed with a server-only key, so a
+            //    database reader can no longer map voter -> receipt -> ballot (audit S2). TTL 15 min.
             t.set(recoveryRef, {
-                ballotId: deterministicBallotId,
-                receipt,
-                hash: currentHash,
-                shardId,
-                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 60 * 60 * 1000)
+                ballotKey: retryKey,
+                sealed: sealJson({ receipt, hash: currentHash, shardId }),
+                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + RECOVERY_TTL_MS)
             });
 
             // 4. Burn nonce inside the transaction & update shard head
@@ -4472,6 +5119,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
         });
 
         if (!voteResult.replayed) {
+            lastVoteCommittedAt = Date.now();
             // Update in-memory dashboard immediately
             incrementDashboardMemory(validatedSelections, grade);
             if (GlobalCache.dashboard?.stats) {
@@ -4514,7 +5162,7 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
         });
 
     } catch (e) {
-        if (e.message === "ALREADY_VOTED") return res.status(403).json({ error: "Already voted." });
+        if (e.message === "ALREADY_VOTED") return res.status(403).json({ error: "Already voted.", code: "ALREADY_VOTED" });
         if (e.message === "DUPLICATE_NONCE") return res.status(409).json({ error: "Duplicate request detected." });
         if (/^Please vote for |not authorised|Multiple selections|Too many|Duplicate|Invalid/.test(e.message)) {
             return res.status(400).json({ error: e.message });
@@ -4524,55 +5172,64 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
     }
 });
 
+let aggregateMismatchStreak = 0;
+
 async function verifyAggregateConsistency() {
     try {
-        // 🔢 Get real counts
-        const [voteCountSnap, votedSnap] = await Promise.all([
+        // The dashboard flushes every 30 s; comparing during that window raised false critical alerts.
+        if (dashboardDirty || dashboardSaving || Date.now() - lastVoteCommittedAt < 45000) {
+            return { valid: true, skipped: true };
+        }
+
+        // Count queries are billed per 1000 index entries, not per document.
+        const [totalSnap, revocationSnap, votedSnap] = await Promise.all([
             db.collection("votes").count().get(),
+            db.collection("votes").where("type", "==", "REVOCATION").count().get(),
             db.collection("voters").where("hasVoted", "==", true).count().get()
         ]);
 
-        const realVotes = voteCountSnap.data().count;
+        // Each revocation record cancels exactly one ballot, so it removes two docs from the live count.
+        const realVotes = totalSnap.data().count - 2 * revocationSnap.data().count;
         const realVoted = votedSnap.data().count;
 
-        // 📊 Get aggregate
         const aggSnap = await db.collection("aggregates").doc("dashboard").get();
+        if (!aggSnap.exists) throw new Error("Aggregate missing");
+        const aggVotes = aggSnap.data().stats?.voted || 0;
 
-        if (!aggSnap.exists) {
-            throw new Error("Aggregate missing");
-        }
-
-        const agg = aggSnap.data();
-
-        const aggVotes = agg.stats?.voted || 0;
-
-        // 🚨 MISMATCH DETECTED
         if (aggVotes !== realVotes || aggVotes !== realVoted) {
-            await createAlert(
-                "vote_integrity",
-                "critical",
-                "Aggregate Mismatch Detected",
-                "Dashboard data does not match actual votes.",
-                {
-                    aggregateVotes: aggVotes,
-                    actualVotes: realVotes,
-                    actualVoters: realVoted
-                }
-            );
-
-            return {
-                valid: false,
-                aggVotes,
-                realVotes
-            };
+            aggregateMismatchStreak++;
+            lastAggregateCheck = { valid: false, at: Date.now() };
+            // Alert only when the mismatch persists across two quiet checks.
+            if (aggregateMismatchStreak >= 2) {
+                await createAlert(
+                    "vote_integrity",
+                    "critical",
+                    "Aggregate Mismatch Detected",
+                    "Dashboard data does not match actual votes.",
+                    { aggregateVotes: aggVotes, actualVotes: realVotes, actualVoters: realVoted }
+                );
+            }
+            return { valid: false, aggVotes, realVotes, confirmed: aggregateMismatchStreak >= 2 };
         }
 
+        aggregateMismatchStreak = 0;
+        lastAggregateCheck = { valid: true, at: Date.now() };
         return { valid: true };
 
     } catch (e) {
         console.error("Aggregate verification failed:", e);
         return { valid: false, error: e.message };
     }
+}
+
+// Debounced rebuild used after resets (a rebuild reads every ballot).
+let rebuildTimer = null;
+function scheduleAggregateRebuild(delayMs = 30000) {
+    if (rebuildTimer) return;
+    rebuildTimer = setTimeout(async () => {
+        rebuildTimer = null;
+        try { await rebuildAggregates(); } catch (e) { console.error("[AGGREGATE] scheduled rebuild failed:", e); }
+    }, delayMs);
 }
 
 async function rebuildAggregates() {
@@ -4656,19 +5313,21 @@ async function rebuildAggregates() {
     return GlobalCache.dashboard;
 }
 
+let aggregateTick = 0;
 setInterval(async () => {
     try {
+        // Off-hours the system is idle: check every 10th minute instead of every minute.
+        aggregateTick++;
+        const idle = liveSystemStatus.isLive !== true && Date.now() - lastVoteCommittedAt > 10 * 60 * 1000;
+        if (idle && aggregateTick % 10 !== 0) return;
+
         const result = await verifyAggregateConsistency();
 
-        if (!result.valid) {
+        if (!result.valid && !result.error && result.confirmed) {
             const now = Date.now();
-            if (now - lastAggregateRebuildAt < AGGREGATE_REBUILD_COOLDOWN_MS) {
-                // Mismatch is likely a dirty-window artefact from an in-flight vote.
-                // Do not rebuild until cooldown expires.
-                return;
-            }
+            if (now - lastAggregateRebuildAt < AGGREGATE_REBUILD_COOLDOWN_MS) return;
             lastAggregateRebuildAt = now;
-            console.log('[AGGREGATE] Mismatch confirmed after cooldown — rebuilding...');
+            console.log('[AGGREGATE] Mismatch confirmed after cooldown - rebuilding...');
             await rebuildAggregates();
         }
     } catch (e) {
@@ -4736,6 +5395,769 @@ app.post("/submit-review", submitReviewLimiter, submissionLimiter, requireAuth, 
 });
 
 // --- ADMIN ROUTES ---
+app.get("/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
+    try {
+        const listResult = await admin.auth().listUsers(100);
+        // Exclude voter records, display accounts with email or assigned claims
+        const adminAccounts = listResult.users.filter(u => u.email && (u.customClaims?.admin === true || u.customClaims?.role));
+        res.json({ users: adminAccounts });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Create Admin with Custom Claim
+const ASSIGNABLE_ROLES = ["admin", "superadmin", "election_officer"];
+
+app.post("/admin/users/create", requireAuth, requireRole("superadmin"), verifyCSRF, async (req, res) => {
+    try {
+        const { email, password, role } = req.body;
+        if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+        if (role && !ASSIGNABLE_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role." });
+
+        const user = await admin.auth().createUser({ email, password, emailVerified: true });
+        await admin.auth().setCustomUserClaims(user.uid, {
+            role: role || "admin",
+            admin: role === "admin" || role === "superadmin"
+        });
+
+        await logAdminAction(req, "CREATE_ADMIN_USER", { email, role });
+        res.json({ success: true, uid: user.uid });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update or Revoke Claims
+app.post("/admin/users/set-role", requireAuth, requireRole("superadmin"), verifyCSRF, async (req, res) => {
+    try {
+        const { uid, role } = req.body;
+        if (!uid) return res.status(400).json({ error: "User UID is required." });
+        if (uid === req.user.uid) return res.status(400).json({ error: "You cannot change your own role." });
+        if (role !== "revoke" && !ASSIGNABLE_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role." });
+
+        if (role === "revoke") {
+            await admin.auth().setCustomUserClaims(uid, null);
+        } else {
+            await admin.auth().setCustomUserClaims(uid, {
+                role,
+                admin: role === "admin" || role === "superadmin"
+            });
+        }
+
+        await logAdminAction(req, "UPDATE_USER_ROLE", { uid, role });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete Admin Account
+app.post("/admin/users/delete", requireAuth, requireRole("superadmin"), verifyCSRF, async (req, res) => {
+    try {
+        const { uid } = req.body;
+        if (!uid) return res.status(400).json({ error: "User UID is required." });
+        if (uid === req.user.uid) return res.status(400).json({ error: "You cannot delete your own account." });
+
+        await admin.auth().deleteUser(uid);
+        await logAdminAction(req, "DELETE_ADMIN_USER", { uid });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================================
+// 🛡️ BACKEND QR RECOVERY PROCESSOR (Private Key Decryption + Triage + ASSISTED VOTED)
+// ============================================================================
+async function evaluateDecryptedQrPackage(decrypted) {
+    const issues = [];
+    const anomalies = [];
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // 1. Check existing processed record for idempotency
+    const existingRecSnap = await db.collection("qr_recoveries").doc(decrypted.ref).get();
+    if (existingRecSnap.exists) {
+        const prev = existingRecSnap.data() || {};
+        return {
+            alreadyProcessed: true,
+            outcome: prev.outcome || "confirmed",
+            status: prev.statusLabel || "ASSISTED VOTED",
+            reason: prev.reason || "This recovery QR package was already processed.",
+            reference: decrypted.ref,
+            receipt: prev.receipt || null,
+            receiptMask: prev.receiptMask || null,
+            recordedAt: prev.processedAt?.toDate ? prev.processedAt.toDate().toISOString() : new Date().toISOString(),
+            checks: {
+                format: { status: "ok", label: "Valid" },
+                election: { status: "ok", label: "Verified" },
+                crypto: { status: "ok", label: "Authenticated (P-256 ECIES)" },
+                auth: { status: prev.outcome === "confirmed" ? "ok" : "pend", label: "Already processed" }
+            }
+        };
+    }
+
+    // 2. Check timestamp anomalies vs normal expiration
+    if (!Number.isFinite(decrypted.iatSec) || !Number.isFinite(decrypted.expSec) || decrypted.expSec <= decrypted.iatSec) {
+        anomalies.push("Invalid or inverted package timestamps (exp <= iat).");
+    } else if (decrypted.iatSec > nowSec + 180) {
+        anomalies.push("Package issued-at timestamp is in the future (clock manipulation or skew).");
+    } else if ((decrypted.expSec - decrypted.iatSec) > 3600) {
+        anomalies.push("Package validity window exceeds maximum allowed TTL.");
+    } else if (nowSec > decrypted.expSec) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "PACKAGE_EXPIRED",
+            reason: "Recovery QR code has expired (exceeded 15-minute validity window). Ask the student to generate a fresh QR code.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "ok", label: "Matched" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Expired" }
+            }
+        };
+    }
+
+    // 3. Check missing basic metadata
+    if (!decrypted.lvn || decrypted.lvn.length < 5 || /^0+$/.test(decrypted.lvn)) {
+        issues.push("Voter LVN identifier is missing or blank in the recovery package.");
+    }
+    if (!decrypted.grade || decrypted.grade < 7 || decrypted.grade > 12) {
+        anomalies.push(`Invalid voter grade level (${decrypted.grade}) in recovery package.`);
+    }
+
+    // 4. Verify Election Live / Mock state
+    const isMockSystem = liveSystemStatus.isMockElection === true;
+    const isLiveSystem = liveSystemStatus.isLive === true;
+    if (decrypted.isMock !== isMockSystem) {
+        anomalies.push(
+            decrypted.isMock
+                ? "Package was generated in Mock/Training Mode while the server is in Live Mode."
+                : "Package was generated in Live Mode while the server is in Mock/Training Mode."
+        );
+    }
+    if (!isMockSystem && !isLiveSystem) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "ELECTION_CLOSED",
+            reason: "The election portal is currently paused/closed. Recovery packages cannot be processed while voting is closed.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "bad", label: "Election Closed" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Not Authorized" }
+            }
+        };
+    }
+
+    // 5. Look up the actual voter in Firestore via hashedLVN
+    const hashedLVN = hashLVN(decrypted.lvn);
+    const voterRef = db.collection("voters").doc(hashedLVN);
+    const voterSnap = await voterRef.get();
+
+    if (!voterSnap.exists) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "VOTER_NOT_FOUND",
+            reason: "No registered voter matches the encrypted LVN in this QR code.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "bad", label: "Voter Not Found" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Rejected" }
+            }
+        };
+    }
+
+    const voterData = voterSnap.data() || {};
+    const liveStatus = LiveVoterStatus[hashedLVN] || {};
+
+    if (voterData.hasVoted === true || liveStatus.hasVoted === true) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "ALREADY_VOTED",
+            reason: "This voter has already cast a confirmed ballot in the election ledger.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "ok", label: `Grade ${voterData.grade}` },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Already Voted" }
+            }
+        };
+    }
+
+    if (String(voterData.grade) !== String(decrypted.grade)) {
+        anomalies.push(`Grade mismatch: QR package states Grade ${decrypted.grade}, but voter registry states Grade ${voterData.grade}.`);
+    }
+    if (voterData.isMissed === true || liveStatus.isMissed === true) {
+        anomalies.push("Voter is marked as MISSED cutoff time in the registry.");
+    }
+    if (voterData.isTrap === true) {
+        anomalies.push("Honeytoken / trap voter account detected.");
+    }
+    if (liveStatus.integrityStatus === "INVALID" || voterData.integrityStatus === "INVALID") {
+        anomalies.push("Voter account is flagged with INVALID integrity status.");
+    }
+
+    // 6. Reconstruct and verify candidate selections against GlobalCache.candidates
+    let candidateMap = GlobalCache.candidates;
+    if (!candidateMap || Object.keys(candidateMap).length === 0) {
+        await refreshLocalCandidates();
+        candidateMap = GlobalCache.candidates || {};
+    }
+
+    const resolvedSelections = {};
+    const allowedRepPos = getAllowedRepPositionForGrade(voterData.grade || decrypted.grade);
+
+    // Slots 0..6 correspond to QR_CANONICAL_POSITIONS
+    QR_CANONICAL_POSITIONS.forEach((posId, idx) => {
+        const options = Array.isArray(candidateMap[posId]) ? candidateMap[posId] : [];
+        if (options.length === 0) return;
+        const slot = decrypted.slots[idx];
+        if (!slot) {
+            issues.push(`Missing candidate selection for ${getPositionTitle(posId)}.`);
+            return;
+        }
+        // Match candidate by 12-bit hash fingerprint and/or index
+        let matchedCandidate = null;
+        if (slot.candidateIndex >= 0 && slot.candidateIndex < options.length) {
+            const byIdx = options[slot.candidateIndex];
+            const h = byIdx.hash || hashCandidateId(byIdx.id);
+            if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                matchedCandidate = { id: byIdx.id, hash: h };
+            }
+        }
+        if (!matchedCandidate) {
+            for (const c of options) {
+                const h = c.hash || hashCandidateId(c.id);
+                if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                    matchedCandidate = { id: c.id, hash: h };
+                    anomalies.push(`Candidate index shifted for ${getPositionTitle(posId)} (resolved by hash fingerprint).`);
+                    break;
+                }
+            }
+        }
+        if (!matchedCandidate) {
+            anomalies.push(`Unrecognized or tampered candidate slot for ${getPositionTitle(posId)}.`);
+        } else {
+            resolvedSelections[posId] = matchedCandidate.id;
+        }
+    });
+
+    // Slots 7..8 correspond to the voter's Grade Representative position (if applicable)
+    if (allowedRepPos) {
+        const repOptions = Array.isArray(candidateMap[allowedRepPos]) ? candidateMap[allowedRepPos] : [];
+        if (repOptions.length > 0) {
+            const reqCount = repOptions.length >= 2 ? 2 : 1;
+            const repSlots = [decrypted.slots[7], decrypted.slots[8]].filter(Boolean);
+            if (repSlots.length < reqCount) {
+                issues.push(`Missing selection for ${getPositionTitle(allowedRepPos)} (${repSlots.length} of ${reqCount} selected).`);
+            } else {
+                const repIds = [];
+                for (let rIdx = 0; rIdx < reqCount; rIdx++) {
+                    const slot = repSlots[rIdx];
+                    let matchedRep = null;
+                    if (slot.candidateIndex >= 0 && slot.candidateIndex < repOptions.length) {
+                        const byIdx = repOptions[slot.candidateIndex];
+                        const h = byIdx.hash || hashCandidateId(byIdx.id);
+                        if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                            matchedRep = { id: byIdx.id, hash: h };
+                        }
+                    }
+                    if (!matchedRep) {
+                        for (const c of repOptions) {
+                            const h = c.hash || hashCandidateId(c.id);
+                            if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                                matchedRep = { id: c.id, hash: h };
+                                break;
+                            }
+                        }
+                    }
+                    if (!matchedRep) {
+                        anomalies.push(`Unrecognized candidate selection for ${getPositionTitle(allowedRepPos)}.`);
+                    } else {
+                        repIds.push(matchedRep.id);
+                    }
+                }
+                if (new Set(repIds).size !== repIds.length) {
+                    anomalies.push(`Duplicate candidate selected twice for ${getPositionTitle(allowedRepPos)}.`);
+                } else if (repIds.length === reqCount) {
+                    resolvedSelections[allowedRepPos] = repIds;
+                }
+            }
+        }
+    }
+
+    // If any missing data or weird/anomalous data was found, require manual review!
+    if (issues.length > 0 || anomalies.length > 0) {
+        const combinedReasons = [...issues, ...anomalies];
+        return {
+            outcome: "review",
+            status: "Requires review",
+            errorCode: issues.length > 0 ? "MISSING_DATA_REQUIRES_REVIEW" : "ANOMALY_REQUIRES_REVIEW",
+            reason: combinedReasons.join(" "),
+            issues,
+            anomalies,
+            reference: decrypted.ref,
+            voterId: hashedLVN,
+            voterGrade: voterData.grade,
+            voterSection: voterData.section,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: anomalies.some(a => /Grade|Mode/i.test(a)) ? "pend" : "ok", label: `Grade ${voterData.grade}` },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "pend", label: issues.length > 0 ? "Incomplete Data" : "Flagged Anomaly" }
+            }
+        };
+    }
+
+    return {
+        outcome: "confirmed",
+        status: "ASSISTED VOTED",
+        reason: "All cryptographic, voter eligibility, and ballot structure checks passed.",
+        reference: decrypted.ref,
+        sessionRef: decrypted.sessionRef,
+        voterId: hashedLVN,
+        voterName: voterData.name || "Verified Voter",
+        voterGrade: String(voterData.grade || decrypted.grade),
+        voterSection: voterData.section || "",
+        resolvedSelections,
+        checks: {
+            format: { status: "ok", label: "Valid v2 Frame" },
+            election: { status: "ok", label: `Grade ${voterData.grade} · ${voterData.section || "Verified"}` },
+            crypto: { status: "ok", label: "Decrypted by Private Key" },
+            auth: { status: "ok", label: "Authorized" }
+        }
+    };
+}
+
+// Step 1: Inspect & Verify Scanned QR Package (Decodes with Backend Private Key & Runs Automatic Triage)
+app.post("/admin/recovery/inspect", requireAuth, requireQrRecoveryRole, verifyCSRF, async (req, res) => {
+    try {
+        const qrPayload = typeof req.body?.qrPayload === "string" ? req.body.qrPayload.trim() : "";
+        const decResult = decryptAndParseQrRecoveryPackage(qrPayload);
+
+        if (!decResult.ok) {
+            await logAdminAction(req, "QR_RECOVERY_INSPECT_REJECTED", {
+                errorCode: decResult.errorCode,
+                stage: decResult.stage
+            });
+            return res.json({
+                success: true,
+                valid: false,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-INVALID",
+                reason: decResult.errorMessage,
+                checks: {
+                    format: { status: decResult.stage === "format" ? "bad" : "ok", label: decResult.stage === "format" ? "Invalid Format" : "Valid Frame" },
+                    election: { status: "pend", label: "Unverified" },
+                    crypto: { status: decResult.stage === "crypto" ? "bad" : "pend", label: decResult.stage === "crypto" ? "Decryption Failed" : "Unverified" },
+                    auth: { status: "bad", label: "Rejected" }
+                }
+            });
+        }
+
+        const pkg = decResult.data;
+        // Mark as SCANNED so the student's waiting screen updates in real time
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "SCANNED",
+            updatedAt: Date.now(),
+            scannedBy: req.user?.email || req.user?.uid
+        });
+
+        const evaluation = await evaluateDecryptedQrPackage(pkg);
+        await logAdminAction(req, "QR_RECOVERY_INSPECT", {
+            reference: pkg.ref,
+            outcome: evaluation.outcome,
+            alreadyProcessed: !!evaluation.alreadyProcessed
+        });
+
+        return res.json({
+            success: true,
+            valid: evaluation.outcome === "confirmed",
+            alreadyProcessed: !!evaluation.alreadyProcessed,
+            outcome: evaluation.outcome,
+            status: evaluation.status,
+            reference: evaluation.reference,
+            reason: evaluation.reason,
+            checks: evaluation.checks,
+            recordedAt: evaluation.recordedAt || null
+        });
+    } catch (e) {
+        console.error("[QR RECOVERY INSPECT ERROR]", e);
+        return res.status(500).json({ error: "Failed to inspect recovery QR package." });
+    }
+});
+
+// Step 2: Process Scanned QR Package (Executes Final Decision, Records ASSISTED VOTED Ballot, and Audits Admin + Transaction)
+app.post("/admin/recovery/process", requireAuth, requireQrRecoveryRole, verifyCSRF, async (req, res) => {
+    try {
+        const qrPayload = typeof req.body?.qrPayload === "string" ? req.body.qrPayload.trim() : "";
+        const decResult = decryptAndParseQrRecoveryPackage(qrPayload);
+
+        if (!decResult.ok) {
+            await logAdminAction(req, "QR_RECOVERY_PROCESS_REJECTED", {
+                errorCode: decResult.errorCode,
+                reason: decResult.errorMessage
+            });
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-INVALID",
+                reason: decResult.errorMessage,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        const pkg = decResult.data;
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "VALIDATING",
+            updatedAt: Date.now()
+        });
+
+        const evaluation = await evaluateDecryptedQrPackage(pkg);
+
+        if (evaluation.alreadyProcessed) {
+            return res.json({
+                success: true,
+                alreadyProcessed: true,
+                outcome: evaluation.outcome,
+                status: evaluation.status,
+                reference: evaluation.reference,
+                reason: evaluation.reason,
+                receiptMask: evaluation.receiptMask || null,
+                recordedAt: evaluation.recordedAt
+            });
+        }
+
+        // CASE A: REJECTED
+        if (evaluation.outcome === "rejected") {
+            RecoveryPackageRuntimeCache.set(pkg.ref, {
+                status: "REJECTED",
+                reason: evaluation.reason,
+                updatedAt: Date.now()
+            });
+            await db.collection("qr_recoveries").doc(pkg.ref).set({
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                outcome: "rejected",
+                statusLabel: "Rejected",
+                errorCode: evaluation.errorCode || "REJECTED",
+                reason: evaluation.reason,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                processedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            await logAdminAction(req, "QR_RECOVERY_REJECTED", {
+                reference: pkg.ref,
+                errorCode: evaluation.errorCode,
+                reason: evaluation.reason
+            });
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: pkg.ref,
+                reason: evaluation.reason,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        // CASE B: REQUIRES REVIEW (Missing data or anomalous data)
+        if (evaluation.outcome === "review") {
+            RecoveryPackageRuntimeCache.set(pkg.ref, {
+                status: "REVIEW",
+                reason: evaluation.reason,
+                updatedAt: Date.now()
+            });
+            await Promise.all([
+                db.collection("recovery_reviews").doc(pkg.ref).set({
+                    reference: pkg.ref,
+                    sessionRef: pkg.sessionRef,
+                    voterId: evaluation.voterId || null,
+                    grade: evaluation.voterGrade || pkg.grade,
+                    issues: evaluation.issues || [],
+                    anomalies: evaluation.anomalies || [],
+                    reason: evaluation.reason,
+                    status: "REQUIRES_REVIEW",
+                    flaggedByUid: req.user?.uid || null,
+                    flaggedByEmail: req.user?.email || null,
+                    flaggedByRole: req.user?.role || null,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                }),
+                db.collection("qr_recoveries").doc(pkg.ref).set({
+                    reference: pkg.ref,
+                    sessionRef: pkg.sessionRef,
+                    voterId: evaluation.voterId || null,
+                    outcome: "review",
+                    statusLabel: "Requires review",
+                    reason: evaluation.reason,
+                    issues: evaluation.issues || [],
+                    anomalies: evaluation.anomalies || [],
+                    adminUid: req.user?.uid || null,
+                    adminEmail: req.user?.email || null,
+                    adminRole: req.user?.role || null,
+                    processedAt: admin.firestore.FieldValue.serverTimestamp()
+                })
+            ]);
+            await logAdminAction(req, "QR_RECOVERY_FLAGGED_FOR_REVIEW", {
+                reference: pkg.ref,
+                voterId: evaluation.voterId || null,
+                issues: evaluation.issues || [],
+                anomalies: evaluation.anomalies || []
+            });
+            return res.json({
+                success: true,
+                outcome: "review",
+                status: "Requires review",
+                reference: pkg.ref,
+                reason: evaluation.reason,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        // CASE C: CONFIRMED — Record Final Vote, Link to Actual Voter, Label as ASSISTED VOTED, and Audit
+        const hashedLVN = evaluation.voterId;
+        const grade = evaluation.voterGrade;
+        const validatedSelections = evaluation.resolvedSelections;
+        const canonicalSelections = stableStringify(validatedSelections);
+        const retryKey = ballotRetryKey(hashedLVN, canonicalSelections);
+
+        const shardIndex = crypto.randomInt(SHARD_COUNT);
+        const shardId = `chain_shard_${String(shardIndex).padStart(2, "0")}`;
+
+        const voterRef = db.collection("voters").doc(hashedLVN);
+        const chainRef = db.collection("_meta").doc(shardId);
+        const recoveryDocRef = db.collection("qr_recoveries").doc(pkg.ref);
+        const receiptRecoveryRef = db.collection("receipt_recovery").doc(hashedLVN);
+        const auditRef = db.collection("immutable_audit").doc();
+
+        const txResult = await db.runTransaction(async (t) => {
+            const [voterDoc, chainDoc, existingRecDoc] = await Promise.all([
+                t.get(voterRef),
+                t.get(chainRef),
+                t.get(recoveryDocRef)
+            ]);
+
+            if (existingRecDoc.exists) {
+                const d = existingRecDoc.data() || {};
+                return {
+                    alreadyProcessed: true,
+                    receipt: d.receipt,
+                    hash: d.hash,
+                    shardId: d.shardId,
+                    receiptMask: d.receiptMask
+                };
+            }
+
+            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
+            if (voterDoc.data().hasVoted === true) throw new Error("ALREADY_VOTED");
+
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : `GENESIS_${shardId}`;
+            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
+            const receipt = crypto.randomBytes(32).toString("hex");
+            const sequence = prevCount + 1;
+
+            const currentHash = crypto.createHash("sha256")
+                .update(receipt + prevHash + canonicalSelections)
+                .digest("hex");
+
+            const masked = maskReceipt(receipt);
+            const voteRef = db.collection("votes").doc(receipt);
+
+            // 1. Create the submission vote linked to the recovery transaction & shard chain
+            t.set(voteRef, {
+                selections: validatedSelections,
+                grade,
+                submissionMode: "ASSISTED_QR_RECOVERY",
+                votingStatus: "ASSISTED VOTED",
+                recoveryRef: pkg.ref,
+                assistedByAdminUid: req.user?.uid || null,
+                assistedByAdminEmail: req.user?.email || null,
+                assistedByRole: req.user?.role || null,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt,
+                shardId,
+                hash: currentHash,
+                prevHash,
+                sequence
+            });
+
+            // 2. Link to the actual voter and label status as ASSISTED VOTED
+            t.update(voterRef, {
+                hasVoted: true,
+                votingStatus: "ASSISTED VOTED",
+                integrityStatus: "ASSISTED VOTED",
+                assistedVoted: true,
+                recoveryRef: pkg.ref,
+                assistedByAdminUid: req.user?.uid || null,
+                assistedByAdminEmail: req.user?.email || null,
+                votedAt: coarseTimestamp(),
+                ballotCommit: receiptCommitment(hashedLVN, receipt)
+            });
+
+            // 3. Store sealed receipt recovery so the student's device can also reconcile
+            t.set(receiptRecoveryRef, {
+                ballotKey: retryKey,
+                sealed: sealJson({ receipt, hash: currentHash, shardId }),
+                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + RECOVERY_TTL_MS)
+            });
+
+            // 4. Record completed QR recovery package
+            t.set(recoveryDocRef, {
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                voterId: hashedLVN,
+                grade,
+                outcome: "confirmed",
+                statusLabel: "ASSISTED VOTED",
+                reason: "Ballot verified, linked to voter, and recorded as ASSISTED VOTED.",
+                receipt,
+                receiptMask: masked.mask,
+                hash: currentHash,
+                shardId,
+                sequence,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                processedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 5. Update shard chain head
+            t.set(chainRef, {
+                hash: currentHash,
+                count: sequence,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 6. Write immutable audit record for admin and transaction
+            t.set(auditRef, {
+                event: "ASSISTED_VOTE_QR_RECOVERY",
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                voterId: hashedLVN,
+                grade,
+                votingStatus: "ASSISTED VOTED",
+                receiptMask: masked.mask,
+                blockHash: currentHash,
+                shardId,
+                sequence,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                ip: getClientIp(req),
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return {
+                alreadyProcessed: false,
+                receipt,
+                hash: currentHash,
+                shardId,
+                receiptMask: masked.mask
+            };
+        });
+
+        // Update runtime cache so student's polling screen (/recovery/status) transitions to CONFIRMED
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "CONFIRMED",
+            receipt: txResult.receipt,
+            hash: txResult.hash,
+            votingStatus: "ASSISTED VOTED",
+            updatedAt: Date.now()
+        });
+
+        if (!txResult.alreadyProcessed) {
+            lastVoteCommittedAt = Date.now();
+            incrementDashboardMemory(validatedSelections, grade);
+            if (GlobalCache.dashboard?.stats) {
+                GlobalCache.dashboard.stats.voted = (GlobalCache.dashboard.stats.voted || 0) + 1;
+                if (GlobalCache.dashboard.stats.grades?.[grade]) {
+                    GlobalCache.dashboard.stats.grades[grade].voted++;
+                }
+                if (GlobalCache.dashboard.stats.total > 0) {
+                    GlobalCache.dashboard.stats.percentage = (
+                        (GlobalCache.dashboard.stats.voted / GlobalCache.dashboard.stats.total) * 100
+                    ).toFixed(1);
+                }
+            }
+            markDashboardDirty();
+
+            const cachedVoter = VotersStaticCache.data.find(v => v.id === hashedLVN);
+            if (cachedVoter) {
+                cachedVoter.hasVoted = true;
+                cachedVoter.votingStatus = "ASSISTED VOTED";
+                cachedVoter.integrityStatus = "ASSISTED VOTED";
+            }
+
+            LiveVoterStatus[hashedLVN] = {
+                hasVoted: true,
+                isMissed: false,
+                integrityStatus: "ASSISTED VOTED",
+                votingStatus: "ASSISTED VOTED",
+                updatedAt: coarseMillis()
+            };
+
+            setImmediate(async () => {
+                try {
+                    await Promise.all([
+                        rtdb.ref(`voterStatus/${hashedLVN}`).set(LiveVoterStatus[hashedLVN]),
+                        rtdb.ref(`activeSessions/${hashedLVN}`).remove(),
+                        liveSystemStatus.isQueue === true ? releaseQueueSlot(hashedLVN, grade) : Promise.resolve()
+                    ]);
+                } catch (err) {
+                    console.error("[POST-RECOVERY RTDB SYNC]", err.message);
+                }
+            });
+        }
+
+        await logAdminAction(req, "PROCESS_QR_RECOVERY_ASSISTED_VOTE", {
+            reference: pkg.ref,
+            voterId: hashedLVN,
+            grade,
+            status: "ASSISTED VOTED",
+            receiptMask: txResult.receiptMask,
+            blockHash: txResult.hash
+        });
+
+        return res.json({
+            success: true,
+            outcome: "confirmed",
+            status: "ASSISTED VOTED",
+            reference: pkg.ref,
+            receipt: txResult.receipt,
+            receiptMask: txResult.receiptMask,
+            hash: txResult.hash,
+            reason: `Ballot verified and linked to voter (${evaluation.voterGrade ? "Grade " + evaluation.voterGrade : "Verified"}). Labeled as ASSISTED VOTED and audited.`,
+            recordedAt: new Date().toISOString()
+        });
+    } catch (e) {
+        if (e.message === "ALREADY_VOTED") {
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-DUPLICATE",
+                reason: "This voter has already cast a confirmed ballot.",
+                recordedAt: new Date().toISOString()
+            });
+        }
+        console.error("[QR RECOVERY PROCESS ERROR]", e);
+        return res.status(500).json({ error: "Failed to process recovery QR package." });
+    }
+});
+
 app.use("/admin", requireAuth, requireRole("admin"), adminLimiter, (req, res, next) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
         if (req.path === '/logout') return next();
@@ -4794,9 +6216,10 @@ app.get("/admin/voters", async (req, res) => {
                 grade: v.grade,
                 section: v.section,
                 code: accessCode,
-                hasVoted: s.hasVoted === true,
+                hasVoted: s.hasVoted === true || v.hasVoted === true,
                 isMissed: s.isMissed === true,
-                integrityStatus: s.integrityStatus || "PENDING",
+                integrityStatus: s.integrityStatus || v.integrityStatus || "PENDING",
+                votingStatus: s.votingStatus || v.votingStatus || (s.integrityStatus === "ASSISTED VOTED" ? "ASSISTED VOTED" : (s.hasVoted ? "VOTED" : "PENDING")),
                 addedAt: v.addedAt
             };
         });
@@ -5009,7 +6432,12 @@ app.get("/admin/voters/reveal-lvn/:id", revealLvnLimiter, async (req, res) => {
     }
 });
 
-app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
+app.post("/ai/voters/add", requireAIServiceOnly, aiMutationLimiter, async (req, res) => {
+    // A key that lives in browser code is public, so this route must not mint credentials while
+    // ballots are being cast. (Real fix: move registration behind an admin session.)
+    if (liveSystemStatus.isLive === true && process.env.AI_ADD_VOTERS_WHILE_LIVE !== "true") {
+        return res.status(409).json({ error: "Voter registration is closed while the election is live." });
+    }
     const grade = sanitizeInput(req.body.grade || '');
     const section = sanitizeInput(req.body.section || '');
     const names = Array.isArray(req.body.names)
@@ -5077,9 +6505,7 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
             const cleanName = rawName.toUpperCase().trim();
 
-            const randomSuffix = Math.floor(
-                1000000 + Math.random() * 9000000
-            ).toString();
+            const randomSuffix = crypto.randomInt(1000000, 10000000).toString();
 
             const lvn = `${gradePrefix}${sectionPrefix}${randomSuffix}`;
             const hashedLVN = hashLVN(lvn);
@@ -5089,7 +6515,7 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
             const encryptedCode = encryptAccessCode(accessCode);
             const bcryptCode = await bcrypt.hash(accessCode.toUpperCase(), 10);
 
-            batch.set(voterRef, {
+            batch.create(voterRef, {
                 lvnEncrypted: encryptLVN(lvn),
                 lvnLast4: lvn.slice(-4),
                 name: cleanName,
@@ -5108,11 +6534,7 @@ app.post("/ai/voters/add", requireAIServiceOnly, async (req, res) => {
 
         await batch.commit();
 
-        setImmediate(() =>
-            invalidateVotersCache().catch(err =>
-                console.error("[CACHE ERROR]", err)
-            )
-        );
+        invalidateVotersCacheSoon(); // debounced: avoids 10k voter reads per request
 
         await logSecurityEvent("AI_SERVICE_ADD_VOTERS", req, {
             grade: targetGrade,
@@ -5195,103 +6617,163 @@ app.post("/admin/voters/delete", async (req, res) => {
     }
 });
 
+const RESET_ERRORS = {
+    VOTER_NOT_FOUND: [404, "Voter not found."],
+    NO_VERIFIED_BALLOT: [409, "Cannot reset: this voter's ballot could not be identified. Provide the receipt the voter was given. Resetting without revoking would let the old ballot count twice."],
+    RECEIPT_MISMATCH: [403, "That receipt does not belong to this voter."],
+    LEGACY_RECORD_NEEDS_KEY: [403, "This voter was recorded before ownership proofs existed. A superadmin (or the X-Admin-Key) is required."],
+    BALLOT_NOT_FOUND: [404, "No active ballot found for that receipt."],
+    ALREADY_REVOKED: [409, "That ballot was already revoked."]
+};
+
 app.post("/admin/voters/reset", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
     try {
         const rawId = sanitizeInput(req.body.id || "");
         const rawLvn = sanitizeInput(req.body.lvn || "");
-        const providedReceipt = sanitizeInput(req.body.receipt || "");
+        const providedReceipt = sanitizeInput(req.body.receipt || "").toLowerCase();
         let docId;
-        if (rawId && /^[a-f0-9]{64}$/.test(rawId)) docId = rawId;
+        if (rawId && HEX64.test(rawId)) docId = rawId;
         else if (rawLvn) docId = hashLVN(rawLvn);
         else return res.status(400).json({ error: "Voter ID required." });
+        if (providedReceipt && !HEX64.test(providedReceipt)) {
+            return res.status(400).json({ error: "Invalid receipt format." });
+        }
+
+        const keyHeader = req.headers["x-admin-key"];
+        const breakGlass = req.user?.role === "superadmin" ||
+            (keyHeader && ADMIN_KEY && timingSafeEqualString(String(keyHeader), String(ADMIN_KEY)));
 
         const voterRef = db.collection("voters").doc(docId);
         const recoveryRef = db.collection("receipt_recovery").doc(docId);
+        let revoked = false;
+
         await db.runTransaction(async (t) => {
+            revoked = false;
             const [voterSnap, recoverySnap] = await Promise.all([t.get(voterRef), t.get(recoveryRef)]);
             if (!voterSnap.exists) throw new Error("VOTER_NOT_FOUND");
             const voterData = voterSnap.data() || {};
-            const targetReceipt = providedReceipt || (recoverySnap.exists ? recoverySnap.data().receipt : null) || voterData.receipt || null;
 
-            if (targetReceipt) {
-                const voteRef = db.collection("votes").doc(targetReceipt);
-                const voteSnap = await t.get(voteRef);
-                if (voteSnap.exists) {
-                    const voteData = voteSnap.data();
-                    const shardId = voteData.shardId || `chain_shard_${String(parseInt(docId.slice(0, 4), 16) % SHARD_COUNT).padStart(2, "0")}`;
-                    const chainRef = db.collection("_meta").doc(shardId);
-                    const chainSnap = await t.get(chainRef);
-                    const prevHash = chainSnap.exists ? chainSnap.data().hash : `GENESIS_${shardId}`;
-                    const prevCount = chainSnap.exists ? (chainSnap.data().count || 0) : 0;
-                    const sequence = prevCount + 1;
-                    const payloadToHash = `REVOKE:${targetReceipt}:${prevHash}`;
-                    const revocationHash = crypto.createHash("sha256").update(payloadToHash).digest("hex");
-                    const revocationDocId = `revoke_${crypto.randomBytes(16).toString("hex")}`;
-                    t.set(db.collection("votes").doc(revocationDocId), {
-                        type: "REVOCATION", targetReceipt, shardId, hash: revocationHash, prevHash, sequence,
-                        createdAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                    t.set(chainRef, { hash: revocationHash, count: sequence, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+            if (voterData.hasVoted === true) {
+                let targetReceipt = providedReceipt || null;
+                if (!targetReceipt && recoverySnap.exists) {
+                    const rec = recoverySnap.data();
+                    const sealed = (rec.expiresAt?.toMillis?.() || 0) > Date.now() ? openSealedJson(rec.sealed) : null;
+                    targetReceipt = sealed?.receipt || null;
                 }
+                if (!targetReceipt) throw new Error("NO_VERIFIED_BALLOT");
+
+                // Ownership proof: the receipt must match the voter's commitment.
+                if (voterData.ballotCommit) {
+                    if (!timingSafeEqualString(voterData.ballotCommit, receiptCommitment(docId, targetReceipt))) {
+                        throw new Error("RECEIPT_MISMATCH");
+                    }
+                } else if (!breakGlass) {
+                    throw new Error("LEGACY_RECORD_NEEDS_KEY");
+                }
+
+                const voteRef = db.collection("votes").doc(targetReceipt);
+                // Deterministic ID: a ballot can only ever be revoked once.
+                const revokeRef = db.collection("votes").doc(
+                    `revoke_${crypto.createHash("sha256").update(targetReceipt).digest("hex")}`
+                );
+                const [voteSnap, revokeSnap] = await Promise.all([t.get(voteRef), t.get(revokeRef)]);
+                if (!voteSnap.exists || voteSnap.data().type === "REVOCATION") throw new Error("BALLOT_NOT_FOUND");
+                if (revokeSnap.exists) throw new Error("ALREADY_REVOKED");
+
+                const voteData = voteSnap.data();
+                const shardId = voteData.shardId ||
+                    `chain_shard_${String(parseInt(docId.slice(0, 4), 16) % SHARD_COUNT).padStart(2, "0")}`;
+                const chainRef = db.collection("_meta").doc(shardId);
+                const chainSnap = await t.get(chainRef);
+                const prevHash = chainSnap.exists ? chainSnap.data().hash : `GENESIS_${shardId}`;
+                const prevCount = chainSnap.exists ? (chainSnap.data().count || 0) : 0;
+                const sequence = prevCount + 1;
+                const revocationHash = crypto.createHash("sha256")
+                    .update(`REVOKE:${targetReceipt}:${prevHash}`).digest("hex");
+
+                // Append-only: the ballot itself is never edited or deleted.
+                t.set(revokeRef, {
+                    type: "REVOCATION", targetReceipt, shardId, hash: revocationHash, prevHash, sequence,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                t.set(chainRef, { hash: revocationHash, count: sequence, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+                revoked = true;
             }
+
             t.update(voterRef, {
                 hasVoted: false,
                 receipt: admin.firestore.FieldValue.delete(),
                 lastBallotId: admin.firestore.FieldValue.delete(),
+                ballotCommit: admin.firestore.FieldValue.delete(),
                 votedAt: admin.firestore.FieldValue.delete()
             });
             if (recoverySnap.exists) t.delete(recoveryRef);
         });
 
         await updateVoterStatusInRTDB(docId, { hasVoted: false, isMissed: false, integrityStatus: "PENDING" });
-        await rebuildAggregates();
-        await logAdminAction(req, "VOTER_RESET", { voterId: docId });
-        return res.json({ success: true });
+        scheduleAggregateRebuild(); // debounced: one rebuild for many resets, not one full scan each
+        await logAdminAction(req, "VOTER_RESET", { voterId: docId, ballotRevoked: revoked });
+        return res.json({ success: true, ballotRevoked: revoked });
     } catch (e) {
+        const mapped = RESET_ERRORS[e.message];
+        if (mapped) return res.status(mapped[0]).json({ error: mapped[1] });
         console.error("Voter reset error:", e);
-        if (e.message === "VOTER_NOT_FOUND") return res.status(404).json({ error: "Voter not found." });
-        return res.status(500).json({ error: "Reset failed: " + e.message });
+        return res.status(500).json({ error: "Reset failed." });
     }
 });
 
+function isElectionLive() {
+    return liveSystemStatus.isLive === true && liveSystemStatus.isMockElection !== true;
+}
 
 app.post("/admin/purge", requireAdminKey, async (req, res) => {
     try {
+        if (isElectionLive()) {
+            return res.status(409).json({ error: "Stop the election before purging data." });
+        }
         await logAdminAction(req, "PURGE_ELECTION_DATA", { initiated: true });
         const { json, hash } = await createElectionBackup(db);
         const url = await uploadToGitHub(json, hash);
 
-        await alertManager.createAlert(
-            'backup',
-            'minor',
-            '💾 Archived Created',
-            'Election backup saved. Click the archive link below to view all archived election results.',
-            {
-                archiveUrl: url
-            },
-            24 * 60 * 60 * 1000
-        );
-
+        // Verify the backup BEFORE announcing it or deleting anything (the alert used to be created first).
         if (!hash || !url) {
             throw new Error("Backup failed. Purge aborted.");
         }
+        await alertManager.createAlert(
+            'backup',
+            'minor',
+            'Archive Created',
+            'Election backup saved. Click the archive link below to view all archived election results.',
+            { archiveUrl: url },
+            24 * 60 * 60 * 1000
+        );
 
         await purgeElectionData();
+
+        // Synchronize in-memory cache so frontend and database match 1:1
+        await invalidateVotersCache();
+        VerifiedShardCheckpoints.clear();
+        GlobalCache.dashboard = {
+            isLive: liveSystemStatus?.isLive === true,
+            stats: { total: 0, voted: 0, percentage: 0, grades: {} },
+            leaderboard: {}
+        };
+        await refreshLocalResults();
 
         await alertManager.detectSystemHealth();
 
         await alertManager.createAlert(
             'election_deleted',
             'major',
-            'Election Data Deleted',
-            'All election data has been cleared.',
+            'Election Data Reset',
+            'All votes, tallies, and receipts have been purged. Voter roster preserved.',
             {},
             null
         );
 
         res.json({
             success: true,
-            message: "Election purged with backup 🔥",
+            message: "Election data reset and archived successfully.",
             backupHash: hash,
             backupUrl: url
         });
@@ -5302,23 +6784,47 @@ app.post("/admin/purge", requireAdminKey, async (req, res) => {
     }
 });
 
+// Restore is destructive and was reachable with one header. It is now OFF unless explicitly enabled,
+// refuses to run during a live election, and needs a typed confirmation bound to the backup hash.
 app.post("/admin/restore", requireAdminKey, async (req, res) => {
     try {
-        const { backupUrl, backupHash } = req.body;
+        if (process.env.ALLOW_DESTRUCTIVE_RESTORE !== "true") {
+            return res.status(403).json({ error: "Restore is disabled. Set ALLOW_DESTRUCTIVE_RESTORE=true for a controlled recovery." });
+        }
+        if (isElectionLive()) {
+            return res.status(409).json({ error: "Cannot restore while the election is live." });
+        }
+        const { backupUrl, backupHash, confirmation } = req.body;
 
         if (!backupUrl || !backupHash) {
             return res.status(400).json({ error: "Backup URL and hash required" });
         }
+        if (typeof backupHash !== "string" || !HEX64.test(backupHash) ||
+            confirmation !== `RESTORE ${backupHash.slice(0, 8)}`) {
+            return res.status(400).json({ error: `Type the confirmation: RESTORE ${String(backupHash || "").slice(0, 8)}` });
+        }
 
-        if (!/^https:\/\/raw\.githubusercontent\.com\//.test(backupUrl) &&
-            !/^https:\/\/api\.github\.com\/repos\//.test(backupUrl)) {
+        // Only OUR backup repository (the old check accepted any repo on GitHub).
+        const repo = String(process.env.GITHUB_REPO || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const allowed = repo && (
+            new RegExp(`^https://raw\\.githubusercontent\\.com/${repo}/`).test(backupUrl) ||
+            new RegExp(`^https://api\\.github\\.com/repos/${repo}/`).test(backupUrl)
+        );
+        if (!allowed) {
             return res.status(400).json({ error: "Untrusted backup URL" });
         }
 
-        const response = await axios.get(backupUrl, { responseType: 'text' });
-        const jsonData = response.data;
+        const response = await axios.get(backupUrl, {
+            responseType: 'text',
+            timeout: 60000,
+            headers: {
+                Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                Accept: "application/vnd.github.raw"
+            }
+        });
 
-        const result = await restoreElectionFromBackup(jsonData, backupHash);
+        await logAdminAction(req, "RESTORE_ELECTION", { initiated: true });
+        const result = await restoreElectionFromBackup(response.data, backupHash);
 
         await alertManager.detectSystemHealth();
 
@@ -5349,16 +6855,18 @@ app.post("/admin/retally", async (req, res) => {
 
 app.post("/admin/publish/candidates", async (req, res) => {
     try {
+        if (liveSystemStatus.isLive === true && req.body?.allowWhileLive !== true) {
+            return res.status(409).json({ error: "Candidates are locked while the election is live. Send allowWhileLive:true to override." });
+        }
         const freshData = await fetchRawCandidatesFromSource();
         if (freshData) {
             await db.collection("app_config").doc("candidates_static").set({
                 payload: freshData,
                 lastUpdated: admin.firestore.FieldValue.serverTimestamp()
             });
-            GlobalCache.candidates = freshData;
-            Object.freeze(GlobalCache.candidates);
-            GlobalCache.timestamps.candidates = new Date().toISOString();
-            await logAdminAction(req, "PUBLISH_CANDIDATES", { success: true });
+            // Rebuilds candidates AND candidateHashMap (the map used to go stale, so new candidates failed validation).
+            if (!(await refreshLocalCandidates())) throw new Error("Candidate cache refresh failed.");
+            await logAdminAction(req, "PUBLISH_CANDIDATES", { success: true, allowWhileLive: liveSystemStatus.isLive === true });
             await alertManager.createAlert(
                 'candidate_sync',
                 'minor',
@@ -5527,6 +7035,7 @@ app.post("/admin/delete", async (req, res) => {
 app.post("/admin/election/reset", requireAdminKey, async (req, res) => {
     const confirmation = sanitizeInput(req.body.confirmation || '');
     if (confirmation !== "DELETE ELECTION DATA") return res.status(403).json({ error: "Security Mismatch." });
+    if (isElectionLive()) return res.status(409).json({ error: "Stop the election before resetting election data." });
     try {
         await db.collection("immutable_audit").add({
             event: "ELECTION_RESET",
@@ -5535,35 +7044,39 @@ app.post("/admin/election/reset", requireAdminKey, async (req, res) => {
             timestamp: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        const batchLimit = 400;
-        const votersRef = db.collection("voters").where("hasVoted", "==", true);
-        const votersSnapshot = await votersRef.get();
-        const chunks = [];
-        let currentBatch = db.batch();
-        let counter = 0;
-        votersSnapshot.docs.forEach((doc) => {
-            currentBatch.update(doc.ref, {
+        // 1. Un-vote every voter (sequential batches: no unbounded concurrency).
+        const votersSnapshot = await db.collection("voters").where("hasVoted", "==", true).get();
+        for (let i = 0; i < votersSnapshot.docs.length; i += 400) {
+            const batch = db.batch();
+            votersSnapshot.docs.slice(i, i + 400).forEach((doc) => batch.update(doc.ref, {
                 hasVoted: false,
                 votedAt: admin.firestore.FieldValue.delete(),
-                receipt: admin.firestore.FieldValue.delete()
-            });
-            counter++;
-            if (counter >= batchLimit) {
-                chunks.push(currentBatch.commit());
-                currentBatch = db.batch();
-                counter = 0;
-            }
-        });
-        if (counter > 0) chunks.push(currentBatch.commit());
-        await deleteCollectionInBatches(db.collection("votes"), 500);
-        await deleteCollectionInBatches(db.collection("results"), 500);
-        await Promise.all(chunks);
+                receipt: admin.firestore.FieldValue.delete(),
+                lastBallotId: admin.firestore.FieldValue.delete(),
+                ballotCommit: admin.firestore.FieldValue.delete()
+            }));
+            await batch.commit();
+        }
+
+        // 2. Delete ballots AND everything that continued the old chain. Without clearing the shard
+        //    heads the next ballot chained to a deleted record and verification failed forever.
+        for (const name of ["votes", "results", "_meta", "used_nonces", "receipt_recovery"]) {
+            await deleteCollectionInBatches(db.collection(name), 500);
+        }
+        await rtdb.ref("voterStatus").remove().catch(() => {});
+        await rtdb.ref("activeSessions").remove().catch(() => {});
+        VerifiedShardCheckpoints.clear();
+        lastIntegrityResult = null;
+
+        GlobalCache.dashboard = GlobalCache.dashboard || {};
         GlobalCache.dashboard.stats = { total: 0, voted: 0, percentage: 0, grades: {} };
         GlobalCache.dashboard.leaderboard = {};
+        await invalidateVotersCache();
         await refreshLocalResults();
         await logAdminAction(req, "ELECTION_RESET", { success: true });
         res.json({ success: true, message: "Election system successfully reset." });
     } catch (e) {
+        console.error("Election reset error:", e);
         res.status(500).json({ error: "Reset failed partially. Check logs." });
     }
 });
@@ -6259,8 +7772,10 @@ app.post("/admin/session/end", async (req, res) => {
         let count = 0;
         const commits = [];
 
+        const rtdbMissed = {};
         snapshot.forEach(doc => {
             if (!doc.data().isMissed) {
+                rtdbMissed[`${doc.id}/isMissed`] = true;
                 currentBatch.update(doc.ref, {
                     isMissed: true,
                     missedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -6275,6 +7790,10 @@ app.post("/admin/session/end", async (req, res) => {
 
         if (count % BATCH_LIMIT !== 0) commits.push(currentBatch.commit());
         await Promise.all(commits);
+        // The admin list reads voterStatus (RTDB): without this "MISSED" never displayed.
+        if (Object.keys(rtdbMissed).length > 0) {
+            await rtdb.ref("voterStatus").update(rtdbMissed).catch(e => console.error("[SESSION END] RTDB sync failed:", e.message));
+        }
 
         await logAdminAction(req, "SESSION_END", { count });
         res.json({ success: true, count });
@@ -6333,50 +7852,31 @@ app.get("/admin/forms/submissions", async (req, res) => {
 
 app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req, res) => {
     try {
-        const votersSnap = await db.collection("voters").get();
-        const votesSnap = await db.collection("votes").get();
-
-        const totalRegistered = votersSnap.size;
-        const totalVotes = votesSnap.size;
-
-        const turnoutRate = totalRegistered === 0
-            ? 0
-            : ((totalVotes / totalRegistered) * 100);
-
-        const remainingVotes = totalRegistered - totalVotes;
+        // Zero Firestore reads: the aggregate already counts registered voters and ACTIVE ballots.
+        let stats = GlobalCache.dashboard?.stats;
+        if (!stats || !Number.isFinite(Number(stats.total))) {
+            await ensureSystemReady();
+            stats = GlobalCache.dashboard?.stats || { total: 0, voted: 0, grades: {} };
+        }
+        const totalRegistered = Number(stats.total) || 0;
+        const totalVotes = Number(stats.voted) || 0;
+        const turnoutRate = totalRegistered === 0 ? 0 : (totalVotes / totalRegistered) * 100;
 
         const gradeStats = {};
+        for (const [g, s] of Object.entries(stats.grades || {})) {
+            const total = Number(s.total) || 0;
+            const voted = Number(s.voted) || 0;
+            gradeStats[g] = { total, voted, turnout: total === 0 ? 0 : (voted / total) * 100 };
+        }
 
-        votersSnap.forEach(doc => {
-            const g = doc.data().grade;
-            if (!gradeStats[g]) {
-                gradeStats[g] = { total: 0, voted: 0 };
-            }
-            gradeStats[g].total++;
-        });
-
-        votesSnap.forEach(doc => {
-            const g = doc.data().grade;
-            if (gradeStats[g]) {
-                gradeStats[g].voted++;
-            }
-        });
-
-        Object.keys(gradeStats).forEach(g => {
-            const s = gradeStats[g];
-            s.turnout = s.total === 0 ? 0 : ((s.voted / s.total) * 100);
-        });
-
-        // ✅ FIXED HERE
         const systemHealth = await alertManager.detectSystemHealth();
 
         res.json({
             REG_USR: totalRegistered,
             VT_CST: totalVotes,
             TN_RT: turnoutRate.toFixed(2) + "%",
-            RG_VT: remainingVotes,
+            RG_VT: totalRegistered - totalVotes,
             CURRENTDATEANDTIME: new Date().toLocaleString(),
-
             gradeStats,
             systemHealth
         });
@@ -6388,8 +7888,16 @@ app.get("/api/admin/report-data", requireAuth, requireRole("admin"), async (req,
 });
 
 app.get("/api/system/health", async (req, res) => {
-    const health = await alertManager.detectSystemHealth();
-    res.json(health);
+    try {
+        // Anonymous callers (uptime monitors / Render) get a cheap liveness answer: no reads, no writes.
+        if (!(await isAdminRequest(req))) {
+            return res.json({ status: "ok", time: new Date().toISOString() });
+        }
+        const health = await alertManager.detectSystemHealth();
+        return res.json(health);
+    } catch (e) {
+        return res.status(500).json({ error: "Health check failed" });
+    }
 });
 
 // ============================================
@@ -6844,6 +8352,133 @@ app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
         console.error('[MANUAL VERIFICATION] Error:', error);
         res.status(500).json({ error: "Failed to submit manual verification request" });
     }
+});
+
+// --- Routes the front ends call (audit F4) ---------------------------------
+// A voter may ask only "was MY ballot recorded?" - a boolean, never a receipt or choices.
+app.get("/vote/status", requireAuth, requireRole("voter"), async (req, res) => {
+    try {
+        const snap = await db.collection("voters").doc(req.user.uid).get();
+        res.set("Cache-Control", "no-store");
+        return res.json({ recorded: snap.exists && snap.data().hasVoted === true });
+    } catch (e) {
+        return res.status(500).json({ error: "Status unavailable" });
+    }
+});
+
+app.post("/admin/logout", async (req, res) => {
+    try {
+        const decoded = req.user;
+        if (decoded?.jti) await revokeJti(decoded.jti);
+        res.clearCookie("__session", { httpOnly: true, secure: true, sameSite: "none", path: "/" });
+        return res.json({ success: true });
+    } catch (e) {
+        return res.status(500).json({ error: "Logout failed" });
+    }
+});
+
+// Live polling endpoint for student's waiting screen during QR ballot recovery
+app.get("/recovery/status", async (req, res) => {
+    try {
+        const ref = sanitizeInput(req.query.ref || "").toUpperCase();
+        if (!ref) return res.json({ status: "NONE" });
+
+        const cached = RecoveryPackageRuntimeCache.get(ref);
+        if (cached && cached.status === "CONFIRMED") {
+            return res.json({
+                status: "CONFIRMED",
+                receipt: cached.receipt,
+                hash: cached.hash,
+                votingStatus: "ASSISTED VOTED"
+            });
+        }
+
+        const doc = await db.collection("qr_recoveries").doc(ref).get();
+        if (doc.exists) {
+            const d = doc.data() || {};
+            if (d.outcome === "confirmed") {
+                return res.json({
+                    status: "CONFIRMED",
+                    receipt: d.receipt,
+                    hash: d.hash,
+                    votingStatus: "ASSISTED VOTED"
+                });
+            }
+            if (d.outcome === "rejected") {
+                return res.json({ status: "REJECTED", reason: d.reason });
+            }
+            if (d.outcome === "review") {
+                return res.json({ status: "VALIDATING", reason: d.reason });
+            }
+        }
+
+        if (cached) {
+            return res.json({ status: cached.status });
+        }
+        return res.json({ status: "NONE" });
+    } catch (e) {
+        return res.json({ status: "NONE" });
+    }
+});
+
+app.post("/adviser-alerts", async (req, res) => {
+    try {
+        const body = req.body || {};
+        await db.collection("adviser_alerts").add({
+            alertId: sanitizeInput(String(body.alertId || "")),
+            type: sanitizeInput(String(body.type || "CONNECTION_INTERRUPTED")),
+            session: body.session || {},
+            connection: body.connection || {},
+            ballot: body.ballot || {},
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return res.json({ delivered: true });
+    } catch (e) {
+        return res.status(500).json({ delivered: false });
+    }
+});
+
+// Explicit "not implemented" (501) for remaining legacy stubs
+app.all(["/admin/settings/submission-timer", "/admin/activate-queue"],
+    (req, res) => res.status(501).json({ error: "Not implemented on this server.", code: "NOT_IMPLEMENTED", delivered: false })
+);
+
+// One-time privacy migration: removes voter->ballot linkage that earlier versions stored.
+// Run once, BEFORE the election (it refuses to run while voting is live).
+app.post("/admin/privacy/scrub", requireRole("superadmin"), async (req, res) => {
+    try {
+        if (liveSystemStatus.isLive === true) {
+            return res.status(409).json({ error: "Stop the election before running the privacy scrub." });
+        }
+        let scrubbed = 0;
+        for (;;) {
+            const snap = await db.collection("voters").orderBy("lastBallotId").limit(400).get();
+            if (snap.empty) break;
+            const batch = db.batch();
+            snap.docs.forEach((d) => batch.update(d.ref, {
+                lastBallotId: admin.firestore.FieldValue.delete(),
+                receipt: admin.firestore.FieldValue.delete()
+            }));
+            await batch.commit();
+            scrubbed += snap.size;
+        }
+        await deleteCollectionInBatches(db.collection("receipt_recovery"), 400); // legacy plaintext receipts
+        await logAdminAction(req, "PRIVACY_SCRUB", { scrubbed });
+        return res.json({ success: true, votersScrubbed: scrubbed });
+    } catch (e) {
+        console.error("Privacy scrub error:", e);
+        return res.status(500).json({ error: "Scrub failed" });
+    }
+});
+
+// Final error handler: no stack traces to clients, no hung requests.
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err?.message?.startsWith?.("CORS Policy")) return res.status(403).json({ error: "Origin not allowed" });
+    if (err?.type === "entity.too.large") return res.status(413).json({ error: "Request too large" });
+    if (err?.type === "entity.parse.failed") return res.status(400).json({ error: "Malformed JSON" });
+    console.error("[ROUTE ERROR]", req.method, req.path, err?.message);
+    return res.status(500).json({ error: "Internal server error" });
 });
 
 const PORT = process.env.PORT || 3000;
