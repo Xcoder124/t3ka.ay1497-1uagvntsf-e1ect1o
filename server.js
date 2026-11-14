@@ -410,7 +410,7 @@ app.use(cookieParser());
 
 const allowedOrigins = process.env.NODE_ENV === "production"
     ? [
-        "https://tsf-g-digital-election.web.app",
+        "https://e-boto-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
         "https://e-boto.pages.dev"
@@ -418,7 +418,7 @@ const allowedOrigins = process.env.NODE_ENV === "production"
     : [
         "http://127.0.0.1:5500",
         "http://localhost:3000",
-        "https://tsf-g-digital-election.web.app",
+        "https://e-boto-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
         "https://e-boto.pages.dev"
@@ -446,9 +446,9 @@ const corsOptions = {
         "X-Admin-Key",
         "X-Reauth-Token",
         "x-ai-service-key",
-        "X-TSF-Client-Surface",
-        "X-TSF-Device-Class",
-        "X-TSF-PC-Device-ID"
+        "X-e-boto-Client-Surface",
+        "X-e-boto-Device-Class",
+        "X-e-boto-PC-Device-ID"
     ]
 };
 
@@ -493,8 +493,8 @@ app.use((req, res, next) => {
                 "https://identitytoolkit.googleapis.com",
                 "https://securetoken.googleapis.com",
                 "https://challenges.cloudflare.com",
-                "https://tsf-sslg-election-endpoint.onrender.com",
-                "https://tsf-g-digital-election.web.app",
+                "https://e-boto-sslg-election-endpoint.onrender.com",
+                "https://e-boto-g-digital-election.web.app",
                 "https://tanauanschooloffisheries.web.app",
                 "https://adesportstorres-v2.web.app"
             ],
@@ -519,11 +519,11 @@ app.use((req, res, next) => {
 });
 
 const ALLOWED_AI_ORIGINS = [
-    'https://tsf-g-digital-election.web.app/conversation',
-    'https://tsf-g-digital-election.web.app/conversation.html',
+    'https://e-boto-g-digital-election.web.app/conversation',
+    'https://e-boto-g-digital-election.web.app/conversation.html',
     'https://tanauanschooloffisheries.web.app/conversation',
     'https://tanauanschooloffisheries.web.app/conversation.html',
-    'https://tsf-g-digital-election.web.app',
+    'https://e-boto-g-digital-election.web.app',
     'https://tanauanschooloffisheries.web.app'
 ];
 const AI_SERVICE_KEY = process.env.AI_SERVICE_KEY;
@@ -718,7 +718,7 @@ async function getVoterStatusCache() {
 
 const ACCESS_CODE_KEY = crypto.scryptSync(
     process.env.BACKUP_SECRET || "",
-    "tsf-access-code-kdf-salt-v1",
+    "e-boto-access-code-kdf-salt-v1",
     32
 );
 
@@ -888,7 +888,7 @@ function getManilaDateKey(date) {
 }
 
 function buildWhitelistToken() {
-    return `TSF-WL-${toBase64Url(crypto.randomBytes(32))}`;
+    return `${toBase64Url(crypto.randomBytes(32))}`;
 }
 
 const WHITELIST_USE_EXTRA_DEVICES = "extra_devices";
@@ -896,7 +896,7 @@ const WHITELIST_USE_PC_VOTING_SESSION = "pc_voting_session";
 const BADGE_TRUSTED_STUDENT_DEVICE = "trusted_student_device";
 const BADGE_FACILITY_VOTING_DEVICE = "facility_voting_device";
 const FACULTY_GRADE_LEVEL = "Faculty";
-const FACULTY_DEVICE_NAME_PREFIX = "TSF Faculty Device";
+const FACULTY_DEVICE_NAME_PREFIX = "Faculty Device";
 const WHITELIST_TOKEN_ACTIVATION_TTL_MS = 2 * 60 * 60 * 1000;
 
 function normalizeClientIp(value = '') {
@@ -914,7 +914,7 @@ function getClientIp(req) {
 }
 
 function getVotingPcDeviceId(req) {
-    const raw = String(req.headers["x-tsf-pc-device-id"] || '').trim();
+    const raw = String(req.headers["x-e-boto-pc-device-id"] || '').trim();
     return /^[A-Za-z0-9_-]{16,96}$/.test(raw) ? raw : "";
 }
 
@@ -931,11 +931,11 @@ function getOrSetDeviceToken(req, res) {
         return crypto.createHash("sha256").update(`pc:${pcHeaderId}`).digest("hex");
     }
 
-    let deviceToken = req.cookies?.__tsf_did || req.headers["x-tsf-device-id"];
+    let deviceToken = req.cookies?.__e-boto_did || req.headers["x-e-boto-device-id"];
     if (!deviceToken || !/^[a-f0-9]{32}$/.test(String(deviceToken))) {
         deviceToken = crypto.randomBytes(16).toString("hex");
         if (res && !res.headersSent) {
-            res.cookie("__tsf_did", deviceToken, {
+            res.cookie("__e-boto_did", deviceToken, {
                 httpOnly: true,
                 secure: true,
                 sameSite: "none",
@@ -968,12 +968,12 @@ function isLikelyPcDeviceRequest(req) {
 }
 
 function isVotingPcSurfaceRequest(req) {
-    return String(req.headers["x-tsf-client-surface"] || "").trim().toLowerCase() === "votepc";
+    return String(req.headers["x-e-boto-client-surface"] || "").trim().toLowerCase() === "votepc";
 }
 
 function isVotingPcDeviceRequest(req) {
     return isVotingPcSurfaceRequest(req) &&
-        String(req.headers["x-tsf-device-class"] || "").trim().toLowerCase() === "pc" &&
+        String(req.headers["x-e-boto-device-class"] || "").trim().toLowerCase() === "pc" &&
         !!getVotingPcDeviceId(req) &&
         isLikelyPcDeviceRequest(req);
 }
@@ -1004,7 +1004,7 @@ function extractFacultyDeviceNumber(data = {}) {
     if (Number.isInteger(numeric) && numeric > 0) return numeric;
 
     const label = `${data.representativeName || ""} ${data.deviceName || ""}`;
-    const match = label.match(/TSF Faculty Device\s+(\d+)/i);
+    const match = label.match(/e-boto Faculty Device\s+(\d+)/i);
     return match ? Number(match[1]) : null;
 }
 
@@ -1021,7 +1021,7 @@ function getNextFacultyDeviceNumberFromSnapshot(snapshot, now = new Date()) {
             expiresAt > now;
         const looksFaculty =
             isFacultyGradeLevel(data.representativeGradeLevel || data.gradeLevel) ||
-            /^TSF Faculty Device\s+\d+/i.test(String(data.representativeName || data.deviceName || ""));
+            /^e-boto Faculty Device\s+\d+/i.test(String(data.representativeName || data.deviceName || ""));
 
         if (!active || !looksFaculty) return;
 
@@ -1043,7 +1043,7 @@ async function buildFacultyDeviceIdentityForTransaction(tx, now = new Date()) {
     return {
         facultyDeviceNumber,
         representativeName: label,
-        representativeFirstName: "TSF",
+        representativeFirstName: "e-boto",
         deviceName: label
     };
 }
@@ -1053,7 +1053,7 @@ function getNextFacultyDeviceNumberFromActiveDevices(devices = []) {
     devices.forEach((device) => {
         const looksFaculty =
             isFacultyGradeLevel(device.representativeGradeLevel || device.gradeLevel) ||
-            /^TSF Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""));
+            /^e-boto Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""));
         if (!looksFaculty) return;
 
         const number = extractFacultyDeviceNumber(device);
@@ -2946,7 +2946,7 @@ function hashLVN(lvn) {
 
 const _LVN_ENC_KEY = crypto.scryptSync(
     LVN_ENCRYPTION_KEY,
-    'tsf-lvn-enc-salt-v1',
+    'e-boto-lvn-enc-salt-v1',
     32
 );
 
@@ -7234,7 +7234,7 @@ app.post("/admin/whitelist-tokens", requireAuth, requireRole("admin"), async (re
             : null;
         if (isFacultyDeviceToken) {
             representativeName = buildFacultyDeviceName(facultyDeviceNumberPreview);
-            representativeFirstName = "TSF";
+            representativeFirstName = "e-boto";
         }
 
         const rawToken = buildWhitelistToken();
@@ -7383,7 +7383,7 @@ app.get("/admin/whitelist-devices", requireAuth, requireRole("admin"), async (re
 
         const activeFacultyDeviceCount = devices.filter((device) =>
             isFacultyGradeLevel(device.representativeGradeLevel) ||
-            /^TSF Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""))
+            /^e-boto Faculty Device\s+\d+/i.test(String(device.representativeName || device.deviceName || ""))
         ).length;
         const nextFacultyDeviceNumber = getNextFacultyDeviceNumberFromActiveDevices(devices);
 
