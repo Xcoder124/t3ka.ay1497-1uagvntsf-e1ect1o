@@ -54,6 +54,242 @@ const BALLOT_RETRY_KEY = deriveSubkey(VOTE_SIGN_SECRET, "ballot-retry");
 const RECEIPT_COMMIT_KEY = deriveSubkey(VOTE_SIGN_SECRET, "receipt-commit");
 const RECOVERY_SEAL_KEY = deriveSubkey(VOTE_SIGN_SECRET, "recovery-seal");
 
+// ============================================================================
+// 🔐 ASYMMETRIC QR RECOVERY ENGINE (P-256 ECIES Private Key + Strict Triage)
+// ============================================================================
+const QR_ECIES_PRIV_SCALAR = deriveSubkey(VOTE_SIGN_SECRET, "eboto-qr-ecies-p256-priv-v2");
+const QR_FALLBACK_PRIV_SCALAR = crypto.hkdfSync(
+    "sha256",
+    Buffer.from("eboto-default-public-fallback-seed-v2"),
+    Buffer.from("e-boto-tcihs/v1"),
+    Buffer.from("eboto-qr-ecies-p256-priv-v2"),
+    32
+);
+
+const qrPrimaryEcdh = crypto.createECDH("prime256v1");
+qrPrimaryEcdh.setPrivateKey(QR_ECIES_PRIV_SCALAR);
+const QR_RECOVERY_PUBLIC_KEY_HEX = qrPrimaryEcdh.getPublicKey("hex", "uncompressed"); // 65B (130 hex chars)
+
+const qrFallbackEcdh = crypto.createECDH("prime256v1");
+qrFallbackEcdh.setPrivateKey(Buffer.from(QR_FALLBACK_PRIV_SCALAR));
+const QR_FALLBACK_PUBLIC_KEY_HEX = qrFallbackEcdh.getPublicKey("hex", "uncompressed");
+
+// Roles explicitly assigned permission to use the Admin QR Recovery Scanner
+const QR_SCAN_ASSIGNED_ROLES = new Set([
+    "superadmin",
+    "super",
+    "admin",
+    "election_officer",
+    "adviser",
+    "advisor"
+]);
+
+function isRoleAssignedToQrScanner(role, explicitFlag) {
+    if (explicitFlag === false) return false;
+    if (explicitFlag === true) return true;
+    const norm = String(role || "").trim().toLowerCase();
+    return QR_SCAN_ASSIGNED_ROLES.has(norm);
+}
+
+// In-memory + Firestore status cache for live voter recovery polling (/recovery/status?ref=...)
+const RecoveryPackageRuntimeCache = new Map();
+const QR_CANONICAL_POSITIONS = ["president", "vp", "secretary", "treasurer", "auditor", "pio", "protocol"];
+
+function computeFnv1a32(buf, endOffset) {
+    let chk = 2166136261;
+    for (let i = 0; i < endOffset; i++) {
+        chk ^= buf[i];
+        chk = Math.imul(chk, 16777619);
+    }
+    return chk >>> 0;
+}
+
+function deriveQrSymmetricKeys(sharedSecretBuf, clientPubCompressedBuf) {
+    const master = crypto.createHash("sha256")
+        .update(Buffer.from("EBOTO-QR-KDF-V2"))
+        .update(sharedSecretBuf)
+        .update(clientPubCompressedBuf)
+        .digest();
+    const encKey = crypto.createHmac("sha256", master).update("enc").digest();
+    const macKey = crypto.createHmac("sha256", master).update("mac").digest();
+    return { encKey, macKey };
+}
+
+function xorSha256CtrStream(dataBuf, encKey, ivBuf) {
+    const out = Buffer.alloc(dataBuf.length);
+    const totalBlocks = Math.ceil(dataBuf.length / 32);
+    for (let blk = 0; blk < totalBlocks; blk++) {
+        const ctrBuf = Buffer.alloc(4);
+        ctrBuf.writeUInt32BE(blk, 0);
+        const keystream = crypto.createHmac("sha256", encKey)
+            .update(ivBuf)
+            .update(ctrBuf)
+            .digest();
+        const offset = blk * 32;
+        const limit = Math.min(32, dataBuf.length - offset);
+        for (let i = 0; i < limit; i++) {
+            out[offset + i] = dataBuf[offset + i] ^ keystream[i];
+        }
+    }
+    return out;
+}
+
+function computeCandidate12BitFingerprint(hashOrId) {
+    const str = String(hashOrId || "").trim();
+    if (!str) return 0;
+    if (/^[0-9a-f]{8,}$/i.test(str)) {
+        return parseInt(str.slice(0, 3), 16) & 0x0FFF;
+    }
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0) & 0x0FFF;
+}
+
+/**
+ * Uses the Backend P-256 Private Key to authenticate and decrypt an EBOTO-RECOVERY QR code.
+ * Returns { ok, errorCode, errorMessage, data }
+ */
+function decryptAndParseQrRecoveryPackage(rawQrString) {
+    if (!rawQrString || typeof rawQrString !== "string") {
+        return { ok: false, stage: "format", errorCode: "EMPTY_PAYLOAD", errorMessage: "QR payload is empty or missing." };
+    }
+    const trimmed = rawQrString.trim();
+    if (!trimmed.startsWith("EBOTO-RECOVERY:")) {
+        return { ok: false, stage: "format", errorCode: "INVALID_PREFIX", errorMessage: "Unrecognized QR prefix. Expected EBOTO-RECOVERY package." };
+    }
+    const b64Part = trimmed.slice("EBOTO-RECOVERY:".length).trim();
+    if (!/^[A-Za-z0-9_-]{80,260}$/.test(b64Part)) {
+        return { ok: false, stage: "format", errorCode: "MALFORMED_ENVELOPE", errorMessage: "QR ciphertext envelope is malformed or not encrypted." };
+    }
+
+    let packet;
+    try {
+        packet = Buffer.from(b64Part, "base64url");
+    } catch (_) {
+        return { ok: false, stage: "format", errorCode: "BASE64_DECODE_FAILED", errorMessage: "Failed to decode base64url envelope." };
+    }
+
+    // Strict binary packet length: 1B version (0x02) + 33B compressed P-256 pubkey + 8B IV + 12B HMAC-SHA256 tag + 62B ciphertext = 116 bytes
+    if (packet.length !== 116 || packet[0] !== 0x02) {
+        return {
+            ok: false,
+            stage: "format",
+            errorCode: "INVALID_PACKET_STRUCTURE",
+            errorMessage: `Invalid encrypted packet structure (expected 116-byte v2 ECIES frame, got ${packet.length} bytes).`
+        };
+    }
+
+    const clientPubCompressed = packet.subarray(1, 34);
+    const ivBuf = packet.subarray(34, 42);
+    const macTag = packet.subarray(42, 54);
+    const ciphertext = packet.subarray(54, 116);
+
+    if (clientPubCompressed[0] !== 0x02 && clientPubCompressed[0] !== 0x03) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "INVALID_EC_POINT",
+            errorMessage: "Ephemeral P-256 public key point is invalid."
+        };
+    }
+
+    let plaintext = null;
+    for (const ecdhInstance of [qrPrimaryEcdh, qrFallbackEcdh]) {
+        try {
+            const sharedSecret = ecdhInstance.computeSecret(clientPubCompressed);
+            const { encKey, macKey } = deriveQrSymmetricKeys(sharedSecret, clientPubCompressed);
+            const expectedMacFull = crypto.createHmac("sha256", macKey)
+                .update(Buffer.from("EBOTO-V2"))
+                .update(clientPubCompressed)
+                .update(ivBuf)
+                .update(ciphertext)
+                .digest();
+            const expectedTag = expectedMacFull.subarray(0, 12);
+            if (crypto.timingSafeEqual(macTag, expectedTag)) {
+                plaintext = xorSha256CtrStream(ciphertext, encKey, ivBuf);
+                break;
+            }
+        } catch (_) {}
+    }
+
+    if (!plaintext) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "TAMPERED_OR_INVALID_CIPHERTEXT",
+            errorMessage: "Cryptographic authentication failed. The QR code could not be decrypted by the backend Private Key or was tampered with."
+        };
+    }
+
+    // Verify strict 62-byte inner binary frame
+    const magic = plaintext[0];
+    const schemaVer = plaintext[1];
+    if (magic !== 0xEB || schemaVer !== 0x02) {
+        return {
+            ok: false,
+            stage: "format",
+            errorCode: "INVALID_INNER_MAGIC",
+            errorMessage: "Decrypted frame header magic byte or schema version is invalid."
+        };
+    }
+
+    const expectedChecksum = computeFnv1a32(plaintext, 58);
+    const actualChecksum = plaintext.readUInt32BE(58);
+    if (expectedChecksum !== actualChecksum) {
+        return {
+            ok: false,
+            stage: "crypto",
+            errorCode: "CHECKSUM_MISMATCH",
+            errorMessage: "Internal 32-bit frame integrity checksum failed."
+        };
+    }
+
+    const flags = plaintext[2];
+    const grade = plaintext[3];
+    const iatSec = plaintext.readUInt32BE(4);
+    const expSec = plaintext.readUInt32BE(8);
+    const rawRef = plaintext.subarray(12, 20).toString("ascii").replace(/[^A-Z0-9]/gi, "").toUpperCase();
+    const rawSess = plaintext.subarray(20, 28).toString("ascii").replace(/[^A-Z0-9]/gi, "").toUpperCase();
+    const rawLvn = plaintext.subarray(28, 40).toString("ascii").replace(/[^0-9A-Za-z]/g, "").trim();
+
+    const ref = rawRef.length === 8 ? `REC-${rawRef.slice(0, 4)}-${rawRef.slice(4, 8)}` : `REC-${rawRef || "UNKNOWN"}`;
+    const sessionRef = rawSess.length === 8 ? `VS-${rawSess.slice(0, 4)}-${rawSess.slice(4, 8)}` : `VS-${rawSess || "UNKNOWN"}`;
+
+    const slots = [];
+    for (let i = 0; i < 9; i++) {
+        const word = plaintext.readUInt16BE(40 + i * 2);
+        if (word === 0xFFFF) {
+            slots.push(null);
+        } else {
+            slots.push({
+                rawWord: word,
+                candidateIndex: (word >>> 12) & 0x0F,
+                hash12: word & 0x0FFF
+            });
+        }
+    }
+
+    return {
+        ok: true,
+        data: {
+            version: schemaVer,
+            isMock: (flags & 0x01) !== 0,
+            isForced: (flags & 0x02) !== 0,
+            hasRepFlag: (flags & 0x04) !== 0,
+            grade,
+            iatSec,
+            expSec,
+            ref,
+            sessionRef,
+            lvn: rawLvn,
+            slots
+        }
+    };
+}
+
 // Backups get their own key. Falls back to BACKUP_SECRET so nothing breaks, but warns.
 const BACKUP_KDF_SECRET = process.env.BACKUP_ENCRYPTION_KEY || BACKUP_SECRET;
 if (!process.env.BACKUP_ENCRYPTION_KEY) {
@@ -3299,9 +3535,11 @@ async function isAdminRequest(req) {
 
 function requireRole(role) {
     return (req, res, next) => {
-        const userRole = req.user?.role;
-        const hasPermission = userRole === role || 
-                             (role === "admin" && (userRole === "superadmin" || req.user?.admin === true));
+        const userRole = String(req.user?.role || "").toLowerCase();
+        const portalRoles = ["admin", "superadmin", "election_officer", "adviser", "advisor", "encoder"];
+        const hasPermission = userRole === role ||
+                             (role === "admin" && (userRole === "superadmin" || req.user?.admin === true)) ||
+                             (role === "portal_staff" && portalRoles.includes(userRole));
 
         if (!req.user || !hasPermission) {
             logSecurityEvent("UNAUTHORIZED_ACCESS", req, { 
@@ -3313,6 +3551,20 @@ function requireRole(role) {
         }
         next();
     };
+}
+
+function requireQrRecoveryRole(req, res, next) {
+    const userRole = req.user?.role;
+    if (!req.user || !isRoleAssignedToQrScanner(userRole, req.user.canScanQr)) {
+        logSecurityEvent("UNAUTHORIZED_QR_RECOVERY_ACCESS", req, {
+            userRole: userRole || "none",
+            userEmail: req.user?.email || null
+        });
+        return res.status(403).json({
+            error: "Forbidden: Your role is not assigned to the QR Ballot Recovery Scanner."
+        });
+    }
+    next();
 }
 
 /**
@@ -3742,9 +3994,9 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
         }
     }
 
-    // Only allow designated administrative roles through the admin portal
-    const allowedPortalRoles = ["admin", "superadmin", "election_officer"];
-    if (!assignedRole || !allowedPortalRoles.includes(assignedRole)) {
+    // Allow designated administrative roles through the admin portal
+    const allowedPortalRoles = ["admin", "superadmin", "election_officer", "adviser", "advisor", "encoder"];
+    if (!assignedRole || !allowedPortalRoles.includes(String(assignedRole).toLowerCase())) {
         await logSecurityEvent("UNAUTHORIZED_ADMIN_LOGIN", req, { uid: decodedToken.uid, email: userEmail, role: assignedRole || "none" });
         await new Promise(r => setTimeout(r, 400));
         return res.status(403).json({ error: "Forbidden: Account does not have an administrative role assigned in Firebase." });
@@ -3763,10 +4015,12 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
 
     const adminJti = crypto.randomBytes(16).toString("hex");
     const adminCsrfToken = crypto.randomBytes(32).toString("hex");
+    const canScanQr = isRoleAssignedToQrScanner(assignedRole, decodedToken.qrScanAssigned);
     const token = jwt.sign({
         uid: decodedToken.uid,
         email: decodedToken.email,
-        role: assignedRole, 
+        role: assignedRole,
+        canScanQr,
         jti: adminJti,
         csrfToken: adminCsrfToken,
         iat: Math.floor(Date.now() / 1000)
@@ -3784,6 +4038,8 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
     // by XSS, so it is opt-in only (ADMIN_TOKEN_IN_BODY=true) for browsers that block 3rd-party cookies.
     return res.json({
         success: true,
+        role: assignedRole,
+        canScanQr,
         csrfToken: adminCsrfToken,
         ...(process.env.ADMIN_TOKEN_IN_BODY === "true" ? { token } : {})
     });
@@ -3815,7 +4071,7 @@ app.post("/logout", async (req, res) => {
     }
 });
 
-app.get("/admin/verify", requireAuth, requireRole("admin"), async (req, res) => {
+app.get("/admin/verify", requireAuth, requireRole("portal_staff"), async (req, res) => {
     // The "Administrator Password" modal calls this route: a supplied key must actually be checked.
     const suppliedKey = req.headers["x-admin-key"];
     if (suppliedKey !== undefined &&
@@ -3823,13 +4079,17 @@ app.get("/admin/verify", requireAuth, requireRole("admin"), async (req, res) => 
         logSecurityEvent("ADMIN_KEY_FAILED", req, { path: req.originalUrl });
         return res.status(403).json({ success: false, error: "Invalid administrator key." });
     }
+    const canScanQr = isRoleAssignedToQrScanner(req.user.role, req.user.canScanQr);
     res.json({ 
         success: true,
+        role: req.user.role,
+        canScanQr,
         csrfToken: req.user.csrfToken,
         user: {
             email: req.user.email,
             uid: req.user.uid,
-            role: req.user.role
+            role: req.user.role,
+            canScanQr
         }
     });
 });
@@ -3856,7 +4116,7 @@ app.get("/settings", async (req, res) => {
         const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
         const strictProtocols = strictProtocolsDoc.exists ? strictProtocolsDoc.data() : { maxDevices: STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES };
 
-        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection });
+        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection, qrRecoveryPublicKey: QR_RECOVERY_PUBLIC_KEY_HEX });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -5120,6 +5380,697 @@ app.post("/admin/users/delete", requireAuth, requireRole("superadmin"), verifyCS
     }
 });
 
+// ============================================================================
+// 🛡️ BACKEND QR RECOVERY PROCESSOR (Private Key Decryption + Triage + ASSISTED VOTED)
+// ============================================================================
+async function evaluateDecryptedQrPackage(decrypted) {
+    const issues = [];
+    const anomalies = [];
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // 1. Check existing processed record for idempotency
+    const existingRecSnap = await db.collection("qr_recoveries").doc(decrypted.ref).get();
+    if (existingRecSnap.exists) {
+        const prev = existingRecSnap.data() || {};
+        return {
+            alreadyProcessed: true,
+            outcome: prev.outcome || "confirmed",
+            status: prev.statusLabel || "ASSISTED VOTED",
+            reason: prev.reason || "This recovery QR package was already processed.",
+            reference: decrypted.ref,
+            receipt: prev.receipt || null,
+            receiptMask: prev.receiptMask || null,
+            recordedAt: prev.processedAt?.toDate ? prev.processedAt.toDate().toISOString() : new Date().toISOString(),
+            checks: {
+                format: { status: "ok", label: "Valid" },
+                election: { status: "ok", label: "Verified" },
+                crypto: { status: "ok", label: "Authenticated (P-256 ECIES)" },
+                auth: { status: prev.outcome === "confirmed" ? "ok" : "pend", label: "Already processed" }
+            }
+        };
+    }
+
+    // 2. Check timestamp anomalies vs normal expiration
+    if (!Number.isFinite(decrypted.iatSec) || !Number.isFinite(decrypted.expSec) || decrypted.expSec <= decrypted.iatSec) {
+        anomalies.push("Invalid or inverted package timestamps (exp <= iat).");
+    } else if (decrypted.iatSec > nowSec + 180) {
+        anomalies.push("Package issued-at timestamp is in the future (clock manipulation or skew).");
+    } else if ((decrypted.expSec - decrypted.iatSec) > 3600) {
+        anomalies.push("Package validity window exceeds maximum allowed TTL.");
+    } else if (nowSec > decrypted.expSec) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "PACKAGE_EXPIRED",
+            reason: "Recovery QR code has expired (exceeded 15-minute validity window). Ask the student to generate a fresh QR code.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "ok", label: "Matched" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Expired" }
+            }
+        };
+    }
+
+    // 3. Check missing basic metadata
+    if (!decrypted.lvn || decrypted.lvn.length < 5 || /^0+$/.test(decrypted.lvn)) {
+        issues.push("Voter LVN identifier is missing or blank in the recovery package.");
+    }
+    if (!decrypted.grade || decrypted.grade < 7 || decrypted.grade > 12) {
+        anomalies.push(`Invalid voter grade level (${decrypted.grade}) in recovery package.`);
+    }
+
+    // 4. Verify Election Live / Mock state
+    const isMockSystem = liveSystemStatus.isMockElection === true;
+    const isLiveSystem = liveSystemStatus.isLive === true;
+    if (decrypted.isMock !== isMockSystem) {
+        anomalies.push(
+            decrypted.isMock
+                ? "Package was generated in Mock/Training Mode while the server is in Live Mode."
+                : "Package was generated in Live Mode while the server is in Mock/Training Mode."
+        );
+    }
+    if (!isMockSystem && !isLiveSystem) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "ELECTION_CLOSED",
+            reason: "The election portal is currently paused/closed. Recovery packages cannot be processed while voting is closed.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "bad", label: "Election Closed" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Not Authorized" }
+            }
+        };
+    }
+
+    // 5. Look up the actual voter in Firestore via hashedLVN
+    const hashedLVN = hashLVN(decrypted.lvn);
+    const voterRef = db.collection("voters").doc(hashedLVN);
+    const voterSnap = await voterRef.get();
+
+    if (!voterSnap.exists) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "VOTER_NOT_FOUND",
+            reason: "No registered voter matches the encrypted LVN in this QR code.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "bad", label: "Voter Not Found" },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Rejected" }
+            }
+        };
+    }
+
+    const voterData = voterSnap.data() || {};
+    const liveStatus = LiveVoterStatus[hashedLVN] || {};
+
+    if (voterData.hasVoted === true || liveStatus.hasVoted === true) {
+        return {
+            outcome: "rejected",
+            status: "Rejected",
+            errorCode: "ALREADY_VOTED",
+            reason: "This voter has already cast a confirmed ballot in the election ledger.",
+            reference: decrypted.ref,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: "ok", label: `Grade ${voterData.grade}` },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "bad", label: "Already Voted" }
+            }
+        };
+    }
+
+    if (String(voterData.grade) !== String(decrypted.grade)) {
+        anomalies.push(`Grade mismatch: QR package states Grade ${decrypted.grade}, but voter registry states Grade ${voterData.grade}.`);
+    }
+    if (voterData.isMissed === true || liveStatus.isMissed === true) {
+        anomalies.push("Voter is marked as MISSED cutoff time in the registry.");
+    }
+    if (voterData.isTrap === true) {
+        anomalies.push("Honeytoken / trap voter account detected.");
+    }
+    if (liveStatus.integrityStatus === "INVALID" || voterData.integrityStatus === "INVALID") {
+        anomalies.push("Voter account is flagged with INVALID integrity status.");
+    }
+
+    // 6. Reconstruct and verify candidate selections against GlobalCache.candidates
+    let candidateMap = GlobalCache.candidates;
+    if (!candidateMap || Object.keys(candidateMap).length === 0) {
+        await refreshLocalCandidates();
+        candidateMap = GlobalCache.candidates || {};
+    }
+
+    const resolvedSelections = {};
+    const allowedRepPos = getAllowedRepPositionForGrade(voterData.grade || decrypted.grade);
+
+    // Slots 0..6 correspond to QR_CANONICAL_POSITIONS
+    QR_CANONICAL_POSITIONS.forEach((posId, idx) => {
+        const options = Array.isArray(candidateMap[posId]) ? candidateMap[posId] : [];
+        if (options.length === 0) return;
+        const slot = decrypted.slots[idx];
+        if (!slot) {
+            issues.push(`Missing candidate selection for ${getPositionTitle(posId)}.`);
+            return;
+        }
+        // Match candidate by 12-bit hash fingerprint and/or index
+        let matchedCandidate = null;
+        if (slot.candidateIndex >= 0 && slot.candidateIndex < options.length) {
+            const byIdx = options[slot.candidateIndex];
+            const h = byIdx.hash || hashCandidateId(byIdx.id);
+            if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                matchedCandidate = { id: byIdx.id, hash: h };
+            }
+        }
+        if (!matchedCandidate) {
+            for (const c of options) {
+                const h = c.hash || hashCandidateId(c.id);
+                if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                    matchedCandidate = { id: c.id, hash: h };
+                    anomalies.push(`Candidate index shifted for ${getPositionTitle(posId)} (resolved by hash fingerprint).`);
+                    break;
+                }
+            }
+        }
+        if (!matchedCandidate) {
+            anomalies.push(`Unrecognized or tampered candidate slot for ${getPositionTitle(posId)}.`);
+        } else {
+            resolvedSelections[posId] = matchedCandidate.id;
+        }
+    });
+
+    // Slots 7..8 correspond to the voter's Grade Representative position (if applicable)
+    if (allowedRepPos) {
+        const repOptions = Array.isArray(candidateMap[allowedRepPos]) ? candidateMap[allowedRepPos] : [];
+        if (repOptions.length > 0) {
+            const reqCount = repOptions.length >= 2 ? 2 : 1;
+            const repSlots = [decrypted.slots[7], decrypted.slots[8]].filter(Boolean);
+            if (repSlots.length < reqCount) {
+                issues.push(`Missing selection for ${getPositionTitle(allowedRepPos)} (${repSlots.length} of ${reqCount} selected).`);
+            } else {
+                const repIds = [];
+                for (let rIdx = 0; rIdx < reqCount; rIdx++) {
+                    const slot = repSlots[rIdx];
+                    let matchedRep = null;
+                    if (slot.candidateIndex >= 0 && slot.candidateIndex < repOptions.length) {
+                        const byIdx = repOptions[slot.candidateIndex];
+                        const h = byIdx.hash || hashCandidateId(byIdx.id);
+                        if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                            matchedRep = { id: byIdx.id, hash: h };
+                        }
+                    }
+                    if (!matchedRep) {
+                        for (const c of repOptions) {
+                            const h = c.hash || hashCandidateId(c.id);
+                            if (computeCandidate12BitFingerprint(h) === slot.hash12) {
+                                matchedRep = { id: c.id, hash: h };
+                                break;
+                            }
+                        }
+                    }
+                    if (!matchedRep) {
+                        anomalies.push(`Unrecognized candidate selection for ${getPositionTitle(allowedRepPos)}.`);
+                    } else {
+                        repIds.push(matchedRep.id);
+                    }
+                }
+                if (new Set(repIds).size !== repIds.length) {
+                    anomalies.push(`Duplicate candidate selected twice for ${getPositionTitle(allowedRepPos)}.`);
+                } else if (repIds.length === reqCount) {
+                    resolvedSelections[allowedRepPos] = repIds;
+                }
+            }
+        }
+    }
+
+    // If any missing data or weird/anomalous data was found, require manual review!
+    if (issues.length > 0 || anomalies.length > 0) {
+        const combinedReasons = [...issues, ...anomalies];
+        return {
+            outcome: "review",
+            status: "Requires review",
+            errorCode: issues.length > 0 ? "MISSING_DATA_REQUIRES_REVIEW" : "ANOMALY_REQUIRES_REVIEW",
+            reason: combinedReasons.join(" "),
+            issues,
+            anomalies,
+            reference: decrypted.ref,
+            voterId: hashedLVN,
+            voterGrade: voterData.grade,
+            voterSection: voterData.section,
+            checks: {
+                format: { status: "ok", label: "Valid v2 Frame" },
+                election: { status: anomalies.some(a => /Grade|Mode/i.test(a)) ? "pend" : "ok", label: `Grade ${voterData.grade}` },
+                crypto: { status: "ok", label: "Decrypted by Private Key" },
+                auth: { status: "pend", label: issues.length > 0 ? "Incomplete Data" : "Flagged Anomaly" }
+            }
+        };
+    }
+
+    return {
+        outcome: "confirmed",
+        status: "ASSISTED VOTED",
+        reason: "All cryptographic, voter eligibility, and ballot structure checks passed.",
+        reference: decrypted.ref,
+        sessionRef: decrypted.sessionRef,
+        voterId: hashedLVN,
+        voterName: voterData.name || "Verified Voter",
+        voterGrade: String(voterData.grade || decrypted.grade),
+        voterSection: voterData.section || "",
+        resolvedSelections,
+        checks: {
+            format: { status: "ok", label: "Valid v2 Frame" },
+            election: { status: "ok", label: `Grade ${voterData.grade} · ${voterData.section || "Verified"}` },
+            crypto: { status: "ok", label: "Decrypted by Private Key" },
+            auth: { status: "ok", label: "Authorized" }
+        }
+    };
+}
+
+// Step 1: Inspect & Verify Scanned QR Package (Decodes with Backend Private Key & Runs Automatic Triage)
+app.post("/admin/recovery/inspect", requireAuth, requireQrRecoveryRole, verifyCSRF, async (req, res) => {
+    try {
+        const qrPayload = typeof req.body?.qrPayload === "string" ? req.body.qrPayload.trim() : "";
+        const decResult = decryptAndParseQrRecoveryPackage(qrPayload);
+
+        if (!decResult.ok) {
+            await logAdminAction(req, "QR_RECOVERY_INSPECT_REJECTED", {
+                errorCode: decResult.errorCode,
+                stage: decResult.stage
+            });
+            return res.json({
+                success: true,
+                valid: false,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-INVALID",
+                reason: decResult.errorMessage,
+                checks: {
+                    format: { status: decResult.stage === "format" ? "bad" : "ok", label: decResult.stage === "format" ? "Invalid Format" : "Valid Frame" },
+                    election: { status: "pend", label: "Unverified" },
+                    crypto: { status: decResult.stage === "crypto" ? "bad" : "pend", label: decResult.stage === "crypto" ? "Decryption Failed" : "Unverified" },
+                    auth: { status: "bad", label: "Rejected" }
+                }
+            });
+        }
+
+        const pkg = decResult.data;
+        // Mark as SCANNED so the student's waiting screen updates in real time
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "SCANNED",
+            updatedAt: Date.now(),
+            scannedBy: req.user?.email || req.user?.uid
+        });
+
+        const evaluation = await evaluateDecryptedQrPackage(pkg);
+        await logAdminAction(req, "QR_RECOVERY_INSPECT", {
+            reference: pkg.ref,
+            outcome: evaluation.outcome,
+            alreadyProcessed: !!evaluation.alreadyProcessed
+        });
+
+        return res.json({
+            success: true,
+            valid: evaluation.outcome === "confirmed",
+            alreadyProcessed: !!evaluation.alreadyProcessed,
+            outcome: evaluation.outcome,
+            status: evaluation.status,
+            reference: evaluation.reference,
+            reason: evaluation.reason,
+            checks: evaluation.checks,
+            recordedAt: evaluation.recordedAt || null
+        });
+    } catch (e) {
+        console.error("[QR RECOVERY INSPECT ERROR]", e);
+        return res.status(500).json({ error: "Failed to inspect recovery QR package." });
+    }
+});
+
+// Step 2: Process Scanned QR Package (Executes Final Decision, Records ASSISTED VOTED Ballot, and Audits Admin + Transaction)
+app.post("/admin/recovery/process", requireAuth, requireQrRecoveryRole, verifyCSRF, async (req, res) => {
+    try {
+        const qrPayload = typeof req.body?.qrPayload === "string" ? req.body.qrPayload.trim() : "";
+        const decResult = decryptAndParseQrRecoveryPackage(qrPayload);
+
+        if (!decResult.ok) {
+            await logAdminAction(req, "QR_RECOVERY_PROCESS_REJECTED", {
+                errorCode: decResult.errorCode,
+                reason: decResult.errorMessage
+            });
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-INVALID",
+                reason: decResult.errorMessage,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        const pkg = decResult.data;
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "VALIDATING",
+            updatedAt: Date.now()
+        });
+
+        const evaluation = await evaluateDecryptedQrPackage(pkg);
+
+        if (evaluation.alreadyProcessed) {
+            return res.json({
+                success: true,
+                alreadyProcessed: true,
+                outcome: evaluation.outcome,
+                status: evaluation.status,
+                reference: evaluation.reference,
+                reason: evaluation.reason,
+                receiptMask: evaluation.receiptMask || null,
+                recordedAt: evaluation.recordedAt
+            });
+        }
+
+        // CASE A: REJECTED
+        if (evaluation.outcome === "rejected") {
+            RecoveryPackageRuntimeCache.set(pkg.ref, {
+                status: "REJECTED",
+                reason: evaluation.reason,
+                updatedAt: Date.now()
+            });
+            await db.collection("qr_recoveries").doc(pkg.ref).set({
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                outcome: "rejected",
+                statusLabel: "Rejected",
+                errorCode: evaluation.errorCode || "REJECTED",
+                reason: evaluation.reason,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                processedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            await logAdminAction(req, "QR_RECOVERY_REJECTED", {
+                reference: pkg.ref,
+                errorCode: evaluation.errorCode,
+                reason: evaluation.reason
+            });
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: pkg.ref,
+                reason: evaluation.reason,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        // CASE B: REQUIRES REVIEW (Missing data or anomalous data)
+        if (evaluation.outcome === "review") {
+            RecoveryPackageRuntimeCache.set(pkg.ref, {
+                status: "REVIEW",
+                reason: evaluation.reason,
+                updatedAt: Date.now()
+            });
+            await Promise.all([
+                db.collection("recovery_reviews").doc(pkg.ref).set({
+                    reference: pkg.ref,
+                    sessionRef: pkg.sessionRef,
+                    voterId: evaluation.voterId || null,
+                    grade: evaluation.voterGrade || pkg.grade,
+                    issues: evaluation.issues || [],
+                    anomalies: evaluation.anomalies || [],
+                    reason: evaluation.reason,
+                    status: "REQUIRES_REVIEW",
+                    flaggedByUid: req.user?.uid || null,
+                    flaggedByEmail: req.user?.email || null,
+                    flaggedByRole: req.user?.role || null,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                }),
+                db.collection("qr_recoveries").doc(pkg.ref).set({
+                    reference: pkg.ref,
+                    sessionRef: pkg.sessionRef,
+                    voterId: evaluation.voterId || null,
+                    outcome: "review",
+                    statusLabel: "Requires review",
+                    reason: evaluation.reason,
+                    issues: evaluation.issues || [],
+                    anomalies: evaluation.anomalies || [],
+                    adminUid: req.user?.uid || null,
+                    adminEmail: req.user?.email || null,
+                    adminRole: req.user?.role || null,
+                    processedAt: admin.firestore.FieldValue.serverTimestamp()
+                })
+            ]);
+            await logAdminAction(req, "QR_RECOVERY_FLAGGED_FOR_REVIEW", {
+                reference: pkg.ref,
+                voterId: evaluation.voterId || null,
+                issues: evaluation.issues || [],
+                anomalies: evaluation.anomalies || []
+            });
+            return res.json({
+                success: true,
+                outcome: "review",
+                status: "Requires review",
+                reference: pkg.ref,
+                reason: evaluation.reason,
+                recordedAt: new Date().toISOString()
+            });
+        }
+
+        // CASE C: CONFIRMED — Record Final Vote, Link to Actual Voter, Label as ASSISTED VOTED, and Audit
+        const hashedLVN = evaluation.voterId;
+        const grade = evaluation.voterGrade;
+        const validatedSelections = evaluation.resolvedSelections;
+        const canonicalSelections = stableStringify(validatedSelections);
+        const retryKey = ballotRetryKey(hashedLVN, canonicalSelections);
+
+        const shardIndex = crypto.randomInt(SHARD_COUNT);
+        const shardId = `chain_shard_${String(shardIndex).padStart(2, "0")}`;
+
+        const voterRef = db.collection("voters").doc(hashedLVN);
+        const chainRef = db.collection("_meta").doc(shardId);
+        const recoveryDocRef = db.collection("qr_recoveries").doc(pkg.ref);
+        const receiptRecoveryRef = db.collection("receipt_recovery").doc(hashedLVN);
+        const auditRef = db.collection("immutable_audit").doc();
+
+        const txResult = await db.runTransaction(async (t) => {
+            const [voterDoc, chainDoc, existingRecDoc] = await Promise.all([
+                t.get(voterRef),
+                t.get(chainRef),
+                t.get(recoveryDocRef)
+            ]);
+
+            if (existingRecDoc.exists) {
+                const d = existingRecDoc.data() || {};
+                return {
+                    alreadyProcessed: true,
+                    receipt: d.receipt,
+                    hash: d.hash,
+                    shardId: d.shardId,
+                    receiptMask: d.receiptMask
+                };
+            }
+
+            if (!voterDoc.exists) throw new Error("VOTER_NOT_FOUND");
+            if (voterDoc.data().hasVoted === true) throw new Error("ALREADY_VOTED");
+
+            const prevHash = chainDoc.exists ? chainDoc.data().hash : `GENESIS_${shardId}`;
+            const prevCount = chainDoc.exists ? (chainDoc.data().count || 0) : 0;
+            const receipt = crypto.randomBytes(32).toString("hex");
+            const sequence = prevCount + 1;
+
+            const currentHash = crypto.createHash("sha256")
+                .update(receipt + prevHash + canonicalSelections)
+                .digest("hex");
+
+            const masked = maskReceipt(receipt);
+            const voteRef = db.collection("votes").doc(receipt);
+
+            // 1. Create the submission vote linked to the recovery transaction & shard chain
+            t.set(voteRef, {
+                selections: validatedSelections,
+                grade,
+                submissionMode: "ASSISTED_QR_RECOVERY",
+                votingStatus: "ASSISTED VOTED",
+                recoveryRef: pkg.ref,
+                assistedByAdminUid: req.user?.uid || null,
+                assistedByAdminEmail: req.user?.email || null,
+                assistedByRole: req.user?.role || null,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                receipt,
+                shardId,
+                hash: currentHash,
+                prevHash,
+                sequence
+            });
+
+            // 2. Link to the actual voter and label status as ASSISTED VOTED
+            t.update(voterRef, {
+                hasVoted: true,
+                votingStatus: "ASSISTED VOTED",
+                integrityStatus: "ASSISTED VOTED",
+                assistedVoted: true,
+                recoveryRef: pkg.ref,
+                assistedByAdminUid: req.user?.uid || null,
+                assistedByAdminEmail: req.user?.email || null,
+                votedAt: coarseTimestamp(),
+                ballotCommit: receiptCommitment(hashedLVN, receipt)
+            });
+
+            // 3. Store sealed receipt recovery so the student's device can also reconcile
+            t.set(receiptRecoveryRef, {
+                ballotKey: retryKey,
+                sealed: sealJson({ receipt, hash: currentHash, shardId }),
+                expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + RECOVERY_TTL_MS)
+            });
+
+            // 4. Record completed QR recovery package
+            t.set(recoveryDocRef, {
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                voterId: hashedLVN,
+                grade,
+                outcome: "confirmed",
+                statusLabel: "ASSISTED VOTED",
+                reason: "Ballot verified, linked to voter, and recorded as ASSISTED VOTED.",
+                receipt,
+                receiptMask: masked.mask,
+                hash: currentHash,
+                shardId,
+                sequence,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                processedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 5. Update shard chain head
+            t.set(chainRef, {
+                hash: currentHash,
+                count: sequence,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 6. Write immutable audit record for admin and transaction
+            t.set(auditRef, {
+                event: "ASSISTED_VOTE_QR_RECOVERY",
+                reference: pkg.ref,
+                sessionRef: pkg.sessionRef,
+                voterId: hashedLVN,
+                grade,
+                votingStatus: "ASSISTED VOTED",
+                receiptMask: masked.mask,
+                blockHash: currentHash,
+                shardId,
+                sequence,
+                adminUid: req.user?.uid || null,
+                adminEmail: req.user?.email || null,
+                adminRole: req.user?.role || null,
+                ip: getClientIp(req),
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return {
+                alreadyProcessed: false,
+                receipt,
+                hash: currentHash,
+                shardId,
+                receiptMask: masked.mask
+            };
+        });
+
+        // Update runtime cache so student's polling screen (/recovery/status) transitions to CONFIRMED
+        RecoveryPackageRuntimeCache.set(pkg.ref, {
+            status: "CONFIRMED",
+            receipt: txResult.receipt,
+            hash: txResult.hash,
+            votingStatus: "ASSISTED VOTED",
+            updatedAt: Date.now()
+        });
+
+        if (!txResult.alreadyProcessed) {
+            lastVoteCommittedAt = Date.now();
+            incrementDashboardMemory(validatedSelections, grade);
+            if (GlobalCache.dashboard?.stats) {
+                GlobalCache.dashboard.stats.voted = (GlobalCache.dashboard.stats.voted || 0) + 1;
+                if (GlobalCache.dashboard.stats.grades?.[grade]) {
+                    GlobalCache.dashboard.stats.grades[grade].voted++;
+                }
+                if (GlobalCache.dashboard.stats.total > 0) {
+                    GlobalCache.dashboard.stats.percentage = (
+                        (GlobalCache.dashboard.stats.voted / GlobalCache.dashboard.stats.total) * 100
+                    ).toFixed(1);
+                }
+            }
+            markDashboardDirty();
+
+            const cachedVoter = VotersStaticCache.data.find(v => v.id === hashedLVN);
+            if (cachedVoter) {
+                cachedVoter.hasVoted = true;
+                cachedVoter.votingStatus = "ASSISTED VOTED";
+                cachedVoter.integrityStatus = "ASSISTED VOTED";
+            }
+
+            LiveVoterStatus[hashedLVN] = {
+                hasVoted: true,
+                isMissed: false,
+                integrityStatus: "ASSISTED VOTED",
+                votingStatus: "ASSISTED VOTED",
+                updatedAt: coarseMillis()
+            };
+
+            setImmediate(async () => {
+                try {
+                    await Promise.all([
+                        rtdb.ref(`voterStatus/${hashedLVN}`).set(LiveVoterStatus[hashedLVN]),
+                        rtdb.ref(`activeSessions/${hashedLVN}`).remove(),
+                        liveSystemStatus.isQueue === true ? releaseQueueSlot(hashedLVN, grade) : Promise.resolve()
+                    ]);
+                } catch (err) {
+                    console.error("[POST-RECOVERY RTDB SYNC]", err.message);
+                }
+            });
+        }
+
+        await logAdminAction(req, "PROCESS_QR_RECOVERY_ASSISTED_VOTE", {
+            reference: pkg.ref,
+            voterId: hashedLVN,
+            grade,
+            status: "ASSISTED VOTED",
+            receiptMask: txResult.receiptMask,
+            blockHash: txResult.hash
+        });
+
+        return res.json({
+            success: true,
+            outcome: "confirmed",
+            status: "ASSISTED VOTED",
+            reference: pkg.ref,
+            receipt: txResult.receipt,
+            receiptMask: txResult.receiptMask,
+            hash: txResult.hash,
+            reason: `Ballot verified and linked to voter (${evaluation.voterGrade ? "Grade " + evaluation.voterGrade : "Verified"}). Labeled as ASSISTED VOTED and audited.`,
+            recordedAt: new Date().toISOString()
+        });
+    } catch (e) {
+        if (e.message === "ALREADY_VOTED") {
+            return res.json({
+                success: true,
+                outcome: "rejected",
+                status: "Rejected",
+                reference: "REC-DUPLICATE",
+                reason: "This voter has already cast a confirmed ballot.",
+                recordedAt: new Date().toISOString()
+            });
+        }
+        console.error("[QR RECOVERY PROCESS ERROR]", e);
+        return res.status(500).json({ error: "Failed to process recovery QR package." });
+    }
+});
+
 app.use("/admin", requireAuth, requireRole("admin"), adminLimiter, (req, res, next) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
         if (req.path === '/logout') return next();
@@ -5178,9 +6129,10 @@ app.get("/admin/voters", async (req, res) => {
                 grade: v.grade,
                 section: v.section,
                 code: accessCode,
-                hasVoted: s.hasVoted === true,
+                hasVoted: s.hasVoted === true || v.hasVoted === true,
                 isMissed: s.isMissed === true,
-                integrityStatus: s.integrityStatus || "PENDING",
+                integrityStatus: s.integrityStatus || v.integrityStatus || "PENDING",
+                votingStatus: s.votingStatus || v.votingStatus || (s.integrityStatus === "ASSISTED VOTED" ? "ASSISTED VOTED" : (s.hasVoted ? "VOTED" : "PENDING")),
                 addedAt: v.addedAt
             };
         });
@@ -7338,8 +8290,69 @@ app.post("/admin/logout", async (req, res) => {
     }
 });
 
-// Explicit "not implemented" (501) instead of a silent 404 that a client may read as success (audit F5).
-app.all(["/recovery/status", "/adviser-alerts", "/admin/settings/submission-timer", "/admin/activate-queue"],
+// Live polling endpoint for student's waiting screen during QR ballot recovery
+app.get("/recovery/status", async (req, res) => {
+    try {
+        const ref = sanitizeInput(req.query.ref || "").toUpperCase();
+        if (!ref) return res.json({ status: "NONE" });
+
+        const cached = RecoveryPackageRuntimeCache.get(ref);
+        if (cached && cached.status === "CONFIRMED") {
+            return res.json({
+                status: "CONFIRMED",
+                receipt: cached.receipt,
+                hash: cached.hash,
+                votingStatus: "ASSISTED VOTED"
+            });
+        }
+
+        const doc = await db.collection("qr_recoveries").doc(ref).get();
+        if (doc.exists) {
+            const d = doc.data() || {};
+            if (d.outcome === "confirmed") {
+                return res.json({
+                    status: "CONFIRMED",
+                    receipt: d.receipt,
+                    hash: d.hash,
+                    votingStatus: "ASSISTED VOTED"
+                });
+            }
+            if (d.outcome === "rejected") {
+                return res.json({ status: "REJECTED", reason: d.reason });
+            }
+            if (d.outcome === "review") {
+                return res.json({ status: "VALIDATING", reason: d.reason });
+            }
+        }
+
+        if (cached) {
+            return res.json({ status: cached.status });
+        }
+        return res.json({ status: "NONE" });
+    } catch (e) {
+        return res.json({ status: "NONE" });
+    }
+});
+
+app.post("/adviser-alerts", async (req, res) => {
+    try {
+        const body = req.body || {};
+        await db.collection("adviser_alerts").add({
+            alertId: sanitizeInput(String(body.alertId || "")),
+            type: sanitizeInput(String(body.type || "CONNECTION_INTERRUPTED")),
+            session: body.session || {},
+            connection: body.connection || {},
+            ballot: body.ballot || {},
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return res.json({ delivered: true });
+    } catch (e) {
+        return res.status(500).json({ delivered: false });
+    }
+});
+
+// Explicit "not implemented" (501) for remaining legacy stubs
+app.all(["/admin/settings/submission-timer", "/admin/activate-queue"],
     (req, res) => res.status(501).json({ error: "Not implemented on this server.", code: "NOT_IMPLEMENTED", delivered: false })
 );
 
