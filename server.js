@@ -410,7 +410,7 @@ app.use(cookieParser());
 
 const allowedOrigins = process.env.NODE_ENV === "production"
     ? [
-        "https://e-boto-g-digital-election.web.app",
+        "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
         "https://e-boto.pages.dev"
@@ -418,7 +418,7 @@ const allowedOrigins = process.env.NODE_ENV === "production"
     : [
         "http://127.0.0.1:5500",
         "http://localhost:3000",
-        "https://e-boto-g-digital-election.web.app",
+        "https://tsf-g-digital-election.web.app",
         "https://tanauanschooloffisheries.web.app",
         "https://adesportstorres-v2.web.app",
         "https://e-boto.pages.dev"
@@ -446,9 +446,9 @@ const corsOptions = {
         "X-Admin-Key",
         "X-Reauth-Token",
         "x-ai-service-key",
-        "X-e-boto-Client-Surface",
-        "X-e-boto-Device-Class",
-        "X-e-boto-PC-Device-ID"
+        "x-tsf-Client-Surface",
+        "x-tsf-Device-Class",
+        "x-tsf-PC-Device-ID"
     ]
 };
 
@@ -493,8 +493,8 @@ app.use((req, res, next) => {
                 "https://identitytoolkit.googleapis.com",
                 "https://securetoken.googleapis.com",
                 "https://challenges.cloudflare.com",
-                "https://e-boto-sslg-election-endpoint.onrender.com",
-                "https://e-boto-g-digital-election.web.app",
+                "https://tsf-sslg-election-endpoint.onrender.com",
+                "https://tsf-g-digital-election.web.app",
                 "https://tanauanschooloffisheries.web.app",
                 "https://adesportstorres-v2.web.app"
             ],
@@ -519,11 +519,11 @@ app.use((req, res, next) => {
 });
 
 const ALLOWED_AI_ORIGINS = [
-    'https://e-boto-g-digital-election.web.app/conversation',
-    'https://e-boto-g-digital-election.web.app/conversation.html',
+    'https://tsf-g-digital-election.web.app/conversation',
+    'https://tsf-g-digital-election.web.app/conversation.html',
     'https://tanauanschooloffisheries.web.app/conversation',
     'https://tanauanschooloffisheries.web.app/conversation.html',
-    'https://e-boto-g-digital-election.web.app',
+    'https://tsf-g-digital-election.web.app',
     'https://tanauanschooloffisheries.web.app'
 ];
 const AI_SERVICE_KEY = process.env.AI_SERVICE_KEY;
@@ -914,7 +914,7 @@ function getClientIp(req) {
 }
 
 function getVotingPcDeviceId(req) {
-    const raw = String(req.headers["x-e-boto-pc-device-id"] || '').trim();
+    const raw = String(req.headers["x-tsf-pc-device-id"] || '').trim();
     return /^[A-Za-z0-9_-]{16,96}$/.test(raw) ? raw : "";
 }
 
@@ -931,7 +931,7 @@ function getOrSetDeviceToken(req, res) {
         return crypto.createHash("sha256").update(`pc:${pcHeaderId}`).digest("hex");
     }
 
-    let deviceToken = req.cookies?.__e-boto_did || req.headers["x-e-boto-device-id"];
+    let deviceToken = req.cookies?.__e-boto_did || req.headers["x-tsf-device-id"];
     if (!deviceToken || !/^[a-f0-9]{32}$/.test(String(deviceToken))) {
         deviceToken = crypto.randomBytes(16).toString("hex");
         if (res && !res.headersSent) {
@@ -968,12 +968,12 @@ function isLikelyPcDeviceRequest(req) {
 }
 
 function isVotingPcSurfaceRequest(req) {
-    return String(req.headers["x-e-boto-client-surface"] || "").trim().toLowerCase() === "votepc";
+    return String(req.headers["x-tsf-client-surface"] || "").trim().toLowerCase() === "votepc";
 }
 
 function isVotingPcDeviceRequest(req) {
     return isVotingPcSurfaceRequest(req) &&
-        String(req.headers["x-e-boto-device-class"] || "").trim().toLowerCase() === "pc" &&
+        String(req.headers["x-tsf-device-class"] || "").trim().toLowerCase() === "pc" &&
         !!getVotingPcDeviceId(req) &&
         isLikelyPcDeviceRequest(req);
 }
