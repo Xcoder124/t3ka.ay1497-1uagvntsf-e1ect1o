@@ -60,6 +60,7 @@ const RECOVERY_SEAL_KEY = deriveSubkey(VOTE_SIGN_SECRET, "recovery-seal");
 // PUBLIC fallback seed) was removed. See ./qr-recovery.js for the authoritative implementation.
 // ============================================================================
 const QR = require("./qr-recovery");
+const ElectionMgmt = require("./election-management");
 
 // Roles explicitly assigned permission to use the Admin QR Recovery Scanner
 const QR_SCAN_ASSIGNED_ROLES = new Set([
@@ -329,8 +330,130 @@ const MASK_SECRET = process.env.JWT_SECRET;
 let liveSystemStatus = {
     isLive: false,
     isQueue: false,
+    isPaused: false,
+    isMockElection: false,
     endTime: null
 };
+
+let unifiedElectionConfigCache = null;
+let unifiedElectionConfigLoadedAt = 0;
+const UNIFIED_CONFIG_CACHE_TTL_MS = 15 * 1000;
+
+async function getUnifiedElectionConfig(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && unifiedElectionConfigCache && (now - unifiedElectionConfigLoadedAt) < UNIFIED_CONFIG_CACHE_TTL_MS) {
+        return unifiedElectionConfigCache;
+    }
+    const [statusDoc, configDoc, rtdbSnap] = await Promise.all([
+        db.collection("settings").doc("electionStatus").get(),
+        db.collection("settings").doc("config").get(),
+        rtdb.ref("status").once("value")
+    ]);
+    const electionStatusDoc = statusDoc.exists ? (statusDoc.data() || {}) : {};
+    const configDocData = configDoc.exists ? (configDoc.data() || {}) : {};
+    const rtdbStatus = rtdbSnap.val() || {};
+    liveSystemStatus = { ...rtdbStatus };
+    const unified = ElectionMgmt.migrateLegacyConfig({
+        electionStatusDoc,
+        configDoc: configDocData,
+        rtdbStatus
+    });
+    unifiedElectionConfigCache = unified;
+    unifiedElectionConfigLoadedAt = now;
+    return unified;
+}
+
+async function updateUnifiedElectionConfig({ expectedVersion, req, auditAction, reason = null, mutator }) {
+    const statusRef = db.collection("settings").doc("electionStatus");
+    const configRef = db.collection("settings").doc("config");
+    let previousSnapshot = null;
+    let nextConfig = null;
+
+    const rtdbSnap = await rtdb.ref("status").once("value");
+    const rtdbStatus = rtdbSnap.val() || {};
+
+    await db.runTransaction(async (tx) => {
+        const [statusDoc, configDoc] = await Promise.all([tx.get(statusRef), tx.get(configRef)]);
+        const current = ElectionMgmt.migrateLegacyConfig({
+            electionStatusDoc: statusDoc.exists ? (statusDoc.data() || {}) : {},
+            configDoc: configDoc.exists ? (configDoc.data() || {}) : {},
+            rtdbStatus
+        });
+
+        if (expectedVersion !== undefined && expectedVersion !== null && Number(expectedVersion) !== current.configVersion) {
+            const err = new Error("Configuration was modified by another administrator. Refresh and try again.");
+            err.code = "STALE_CONFIG";
+            err.currentVersion = current.configVersion;
+            throw err;
+        }
+
+        previousSnapshot = JSON.parse(JSON.stringify(current));
+        const mutated = await mutator(current);
+        const nextVersion = current.configVersion + 1;
+
+        nextConfig = {
+            ...current,
+            operational: mutated.operational || current.operational,
+            schedule: mutated.schedule || current.schedule,
+            configVersion: nextVersion
+        };
+
+        tx.set(statusRef, {
+            configVersion: nextVersion,
+            electionId: nextConfig.electionId,
+            timezone: nextConfig.timezone,
+            isPaused: nextConfig.operational.isPaused === true,
+            activeGrade: nextConfig.operational.activeGrade,
+            gradeSessions: nextConfig.operational.gradeSessions,
+            votingTimeLimitMinutes: nextConfig.operational.votingTimeLimitMinutes,
+            schedule: nextConfig.schedule,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: req.user?.email || req.user?.uid || "admin"
+        }, { merge: true });
+
+        tx.set(configRef, {
+            voterTimeoutMinutes: nextConfig.operational.votingTimeLimitMinutes,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    });
+
+    const lifecycle = ElectionMgmt.deriveElectionLifecycle(nextConfig, Date.now());
+    const rtdbUpdates = {
+        "status/isLive": nextConfig.operational.isLive === true,
+        "status/isPaused": nextConfig.operational.isPaused === true,
+        "status/isQueue": nextConfig.operational.isQueue === true,
+        "status/isMockElection": nextConfig.operational.isMockElection === true,
+        "status/lifecycleState": lifecycle.state,
+        "status/configVersion": nextConfig.configVersion
+    };
+    await rtdb.ref("/").update(rtdbUpdates);
+
+    unifiedElectionConfigCache = nextConfig;
+    unifiedElectionConfigLoadedAt = Date.now();
+    liveSystemStatus = {
+        ...liveSystemStatus,
+        isLive: nextConfig.operational.isLive === true,
+        isPaused: nextConfig.operational.isPaused === true,
+        isQueue: nextConfig.operational.isQueue === true,
+        isMockElection: nextConfig.operational.isMockElection === true,
+        lifecycleState: lifecycle.state,
+        configVersion: nextConfig.configVersion
+    };
+
+    await db.collection("admin_audit").add({
+        action: String(auditAction || "UPDATE_ELECTION_CONFIG"),
+        adminId: req.user?.uid || null,
+        adminEmail: req.user?.email || null,
+        electionId: nextConfig.electionId,
+        previousValue: previousSnapshot,
+        newValue: nextConfig,
+        reason: reason ? sanitizeInput(String(reason)) : null,
+        ip: req.ip || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }).catch(() => {});
+
+    return { config: nextConfig, lifecycle };
+}
 const STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES = 30;
 const STRICT_PROTOCOLS_MAX_LIMIT = 60;
 const STRICT_PROTOCOLS_CACHE_TTL_MS = 30 * 1000;
@@ -3533,7 +3656,23 @@ app.get("/admin/alerts", requireAuth, requireRole("admin"), async (req, res) => 
 
 app.post("/admin/correct-name", requireAuth, requireRole("admin"), verifyCSRF, async (req, res) => {
     try {
-        const { lvn, id, newName, reason } = req.body;
+        const { lvn, id, newName, reason, adminOverride, overrideReason } = req.body;
+        const electionConfig = await getUnifiedElectionConfig(false);
+        const regAuth = ElectionMgmt.authorizeRegistrationAction({
+            config: electionConfig,
+            adminOverride: adminOverride === true,
+            overrideReason: overrideReason || reason || "",
+            nowMs: Date.now()
+        });
+        if (!regAuth.allowed) {
+            return res.status(regAuth.status).json({ error: regAuth.error, code: regAuth.code });
+        }
+        if (regAuth.overridden) {
+            await logAdminAction(req, "REGISTRATION_OVERRIDE_CORRECTION", {
+                reason: sanitizeInput(overrideReason || reason || "Admin override"),
+                electionId: electionConfig.electionId
+            });
+        }
         if ((!lvn && !id) || !newName) return res.status(400).json({ error: "Voter LVN/ID and newName are required." });
         const cleanName = sanitizeInput(newName).trim().toUpperCase().replace(/\s+/g, " ");
         const normalizedId = String(id || "").trim();
@@ -3647,32 +3786,37 @@ app.get("/admin/alerts/status", requireAuth, requireRole("admin"), async (req, r
 
 app.post("/admin/system/status", requireAuth, requireRole("admin"), async (req, res) => {
     try {
-        const { isLive, isQueue } = req.body;
-
-        // Validate inputs
-        if (typeof isLive !== "boolean" && typeof isQueue !== "boolean") {
+        const { isLive, isPaused, isQueue, expectedConfigVersion, reason } = req.body;
+        if (typeof isLive !== "boolean" && typeof isPaused !== "boolean" && typeof isQueue !== "boolean") {
             return res.status(400).json({ error: "Invalid status values" });
         }
-
-        const updates = {};
-
-        if (typeof isLive === "boolean") updates["status/isLive"] = isLive;
-        if (typeof isQueue === "boolean") updates["status/isQueue"] = isQueue;
-
-        await rtdb.ref("/").update(updates);
-
-        await logAdminAction(req, "UPDATE_SYSTEM_STATUS", {
-            isLive,
-            isQueue
+        const activeSessionCount = await getActiveSessionCountAndPrune();
+        const result = await updateUnifiedElectionConfig({
+            expectedVersion: expectedConfigVersion,
+            req,
+            auditAction: "UPDATE_SYSTEM_STATUS",
+            reason,
+            mutator: (current) => {
+                const check = ElectionMgmt.validateOperationalUpdate(current, { isLive, isPaused, isQueue }, { activeSessionCount, nowMs: Date.now() });
+                if (!check.ok) {
+                    const err = new Error(Object.values(check.errors)[0]);
+                    err.code = "VALIDATION_ERROR";
+                    err.errors = check.errors;
+                    throw err;
+                }
+                return { operational: check.nextOperational };
+            }
         });
-
         res.json({
             success: true,
             message: "System status updated",
-            updates
+            configVersion: result.config.configVersion,
+            operational: result.config.operational,
+            lifecycle: result.lifecycle
         });
-
     } catch (e) {
+        if (e.code === "STALE_CONFIG") return res.status(409).json({ error: e.message, code: e.code, currentVersion: e.currentVersion });
+        if (e.code === "VALIDATION_ERROR") return res.status(400).json({ error: e.message, errors: e.errors });
         console.error("Update status error:", e);
         res.status(500).json({ error: "Failed to update system status" });
     }
@@ -3976,26 +4120,32 @@ function gateMockElectionToggle(req, res, next) {
 // --- PUBLIC ROUTES ---
 app.get("/settings", async (req, res) => {
     try {
-        // Fetch Firestore config docs and RTDB status in parallel
-        const [configDoc, statusDoc, strictProtocolsDoc, rtdbStatusSnap] = await Promise.all([
-            db.collection("settings").doc("config").get(),
-            db.collection("settings").doc("electionStatus").get(),
-            db.collection("settings").doc("strictProtocols").get(),
-            rtdb.ref("status").once("value")
+        const [unified, strictProtocolsDoc] = await Promise.all([
+            getUnifiedElectionConfig(true),
+            db.collection("settings").doc("strictProtocols").get()
         ]);
-
-        // ✅ isLive and isQueue come exclusively from RTDB
-        const rtdbStatus = rtdbStatusSnap.val() || {};
-        const isLive = rtdbStatus.isLive === true;
-        const isQueue = rtdbStatus.isQueue === true;
-        const isMockElection = rtdbStatus.isMockElection === true;
-
-        // All other fields (activeGrade, sessionTimer, endTime, etc.) still come from Firestore
-        const statusData = statusDoc.exists ? statusDoc.data() : {};
-        const config = configDoc.exists ? configDoc.data() : { voterTimeoutMinutes: 60 };
+        const nowMs = Date.now();
+        const lifecycle = ElectionMgmt.deriveElectionLifecycle(unified, nowMs);
         const strictProtocols = strictProtocolsDoc.exists ? strictProtocolsDoc.data() : { maxDevices: STRICT_PROTOCOLS_DEFAULT_MAX_DEVICES };
 
-        res.json({ ...config, ...statusData, strictProtocols, isLive, isQueue, isMockElection });
+        res.set("Cache-Control", "no-store");
+        res.json({
+            configVersion: unified.configVersion,
+            electionId: unified.electionId,
+            timezone: unified.timezone,
+            serverTimeMs: nowMs,
+            isLive: unified.operational.isLive,
+            isPaused: unified.operational.isPaused,
+            isQueue: unified.operational.isQueue,
+            isMockElection: unified.operational.isMockElection,
+            activeGrade: unified.operational.activeGrade,
+            gradeSessions: unified.operational.gradeSessions,
+            votingTimeLimitMinutes: unified.operational.votingTimeLimitMinutes,
+            voterTimeoutMinutes: unified.operational.votingTimeLimitMinutes,
+            schedule: unified.schedule,
+            lifecycle,
+            strictProtocols
+        });
     } catch (e) {
         res.status(500).json({ error: "Settings Error" });
     }
@@ -4540,36 +4690,34 @@ app.post("/verify", loginLimiter, loginFailLimiter, async (req, res) => {
             });
         }
 
-        if (!isLive) {
-            return res.status(403).json({ error: "Election PAUSED." });
-        }
+        const unifiedConfig = await getUnifiedElectionConfig(false);
+        const nowMs = Date.now();
+        const loginAuth = ElectionMgmt.authorizeVoterLogin({
+            config: unifiedConfig,
+            voter: { exists: true, ...d },
+            nowMs
+        });
 
-        if (d.hasVoted) {
-            if (isQueue) {
-                setImmediate(async () => {
-                    try {
-                        // ✅ Use the per-grade path — root 'queue' has no flat users map
-                        const userGrade = d.grade || settingsData.activeGrade;
-                        if (userGrade) {
-                            await rtdb.ref(`queue/sessionG${userGrade}/users/${hashedLVN}`).remove();
+        if (!loginAuth.allowed) {
+            if (loginAuth.code === "ALREADY_VOTED") {
+                if (isQueue) {
+                    setImmediate(async () => {
+                        try {
+                            const userGrade = d.grade || settingsData.activeGrade;
+                            if (userGrade) {
+                                await rtdb.ref(`queue/sessionG${userGrade}/users/${hashedLVN}`).remove();
+                            }
+                        } catch (err) {
+                            console.error("Failed to cleanup voted user from queue:", err);
                         }
-                    } catch (err) {
-                        console.error("Failed to cleanup voted user from queue:", err);
-                    }
-                });
+                    });
+                }
+                await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
             }
-
-            await logSecurityEvent("DUPLICATE_VOTE_ATTEMPT", req, { hashedLVN });
-            return res.status(403).json({ error: "Already Voted." });
+            return res.status(loginAuth.status).json({ error: loginAuth.error, code: loginAuth.code });
         }
 
-        const activeGrade = settingsData.activeGrade;
-
-        if (activeGrade && String(activeGrade) !== "ALL" && String(activeGrade) !== "0") {
-            if (String(d.grade) !== String(activeGrade)) {
-                return res.status(403).json({ error: `Grade ${activeGrade} Only.` });
-            }
-        }
+        const activeGrade = unifiedConfig.operational.activeGrade;
 
         // isQueue already derived from RTDB above
         if (isQueue && !hasQueueBypassDevice) {
@@ -4581,16 +4729,34 @@ app.post("/verify", loginLimiter, loginFailLimiter, async (req, res) => {
             lastLogin: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // 🔥 ✅ ACTIVE SESSION SET (CORRECT PLACE)
+        // Per-student individual voting session time limit (persisted so refreshes cannot reset timer)
         const userRef = rtdb.ref(`activeSessions/${hashedLVN}`);
+        const existingSessionSnap = await userRef.once("value");
+        const existingSession = existingSessionSnap.exists() ? existingSessionSnap.val() : null;
+        const limitMinutes = unifiedConfig.operational.votingTimeLimitMinutes || ElectionMgmt.DEFAULT_VOTING_TIME_LIMIT_MINUTES;
+        let sessionStartedAtMs = nowMs;
+        let sessionExpiresAtMs = nowMs + limitMinutes * 60 * 1000;
+
+        if (existingSession && Number.isFinite(Number(existingSession.sessionExpiresAtMs))) {
+            if (nowMs > Number(existingSession.sessionExpiresAtMs)) {
+                return res.status(403).json({
+                    error: "Your individual voting session time limit has expired.",
+                    code: "SESSION_EXPIRED"
+                });
+            }
+            sessionStartedAtMs = Number(existingSession.startedAt) || nowMs;
+            sessionExpiresAtMs = Number(existingSession.sessionExpiresAtMs);
+        }
+
         await userRef.set({
-            startedAt: Date.now(),
-            lastSeenAt: Date.now()
+            startedAt: sessionStartedAtMs,
+            lastSeenAt: nowMs,
+            sessionExpiresAtMs
         });
-        // Do not register onDisconnect on the Admin SDK server socket; stale sessions are pruned separately.
 
         const csrfToken = crypto.randomBytes(32).toString('hex');
         const jti = crypto.randomBytes(16).toString("hex");
+        const jwtTtlSeconds = Math.max(60, Math.ceil((sessionExpiresAtMs - nowMs) / 1000) + 300);
 
         const sessionToken = jwt.sign(
             {
@@ -4599,10 +4765,11 @@ app.post("/verify", loginLimiter, loginFailLimiter, async (req, res) => {
                 role: "voter",
                 csrfToken,
                 jti,
+                sessionExpiresAtMs,
                 queueBypass: hasQueueBypassDevice === true
             },
             SECRET,
-            { expiresIn: "60m" }
+            { expiresIn: jwtTtlSeconds }
         );
 
         res.cookie("__session", sessionToken, {
@@ -4789,12 +4956,27 @@ app.post("/vote", requireAuth, requireRole("voter"), voteLimiter, verifyCSRF, as
         if (!nonce || typeof nonce !== "string" || nonce.length < 20) {
             return res.status(400).json({ error: "Invalid security nonce." });
         }
-        if (liveSystemStatus.isLive !== true) {
-            return res.status(403).json({ error: "Election closed." });
-        }
-        // Soft-Close Grace Period: Give already-authenticated voters 5 minutes after timer hits 00:00
-        if (liveSystemStatus.endTime && Date.now() > Number(liveSystemStatus.endTime) + GRACE_PERIOD_MS) {
-            return res.status(403).json({ error: "Voting period ended." });
+        const unifiedConfig = await getUnifiedElectionConfig(false);
+        const nowMs = Date.now();
+        // Verify authoritative server-side individual session expiration from RTDB if present
+        const activeSessSnap = await rtdb.ref(`activeSessions/${hashedLVN}`).once("value");
+        const activeSessData = activeSessSnap.exists() ? activeSessSnap.val() : null;
+        const authoritativeExpiresAtMs = activeSessData && Number.isFinite(Number(activeSessData.sessionExpiresAtMs))
+            ? Number(activeSessData.sessionExpiresAtMs)
+            : Number(req.user.sessionExpiresAtMs);
+
+        const preAuth = ElectionMgmt.authorizeBallotSubmission({
+            config: unifiedConfig,
+            voter: { exists: true, grade, hasVoted: false, isTrap: false, isMissed: false },
+            session: {
+                expiresAtMs: authoritativeExpiresAtMs,
+                isMockElection: req.user?.isMockElection === true
+            },
+            submissionMode: req.user?.isMockElection === true ? "MOCK" : "OFFICIAL",
+            nowMs
+        });
+        if (!preAuth.allowed) {
+            return res.status(preAuth.status).json({ error: preAuth.error, code: preAuth.code });
         }
 
         const validatedSelections = await validateSelections(selections, grade);
@@ -5291,12 +5473,18 @@ function requireSuperAdmin(req, res, next) {
 const qrService = new QR.QrRecoveryService({
     db,
     keyring: qrKeyring,
-    getElectionStatus: () => ({
-        isLive: liveSystemStatus.isLive === true,
-        isMock: liveSystemStatus.isMockElection === true,
-        endTimeMs: Number(liveSystemStatus.endTime) || null,
-        graceMs: GRACE_PERIOD_MS
-    }),
+    getElectionStatus: () => {
+        const cfg = unifiedElectionConfigCache;
+        const isOpen = cfg
+            ? ElectionMgmt.deriveElectionLifecycle(cfg, Date.now()).canVoteNow
+            : (liveSystemStatus.isLive === true && liveSystemStatus.isPaused !== true);
+        return {
+            isLive: isOpen,
+            isMock: cfg ? cfg.operational.isMockElection === true : (liveSystemStatus.isMockElection === true),
+            endTimeMs: cfg?.schedule?.voting?.closesAtMs || Number(liveSystemStatus.endTime) || null,
+            graceMs: GRACE_PERIOD_MS
+        };
+    },
     getCandidates: async () => {
         if (!GlobalCache.candidates || Object.keys(GlobalCache.candidates).length === 0) await refreshLocalCandidates();
         return { candidateMap: GlobalCache.candidates || {}, candidateHashMap: GlobalCache.candidateHashMap || {} };
@@ -5491,6 +5679,22 @@ app.post("/admin/voters/cache-refresh", async (req, res) => {
 });
 
 app.post("/admin/voters/add", async (req, res) => {
+    const electionConfig = await getUnifiedElectionConfig(false);
+    const regAuth = ElectionMgmt.authorizeRegistrationAction({
+        config: electionConfig,
+        adminOverride: req.body?.adminOverride === true,
+        overrideReason: req.body?.overrideReason || "",
+        nowMs: Date.now()
+    });
+    if (!regAuth.allowed) {
+        return res.status(regAuth.status).json({ error: regAuth.error, code: regAuth.code });
+    }
+    if (regAuth.overridden) {
+        await logAdminAction(req, "REGISTRATION_OVERRIDE_BULK_ADD", {
+            reason: sanitizeInput(req.body?.overrideReason || "Admin override"),
+            electionId: electionConfig.electionId
+        });
+    }
     const grade = sanitizeInput(req.body.grade || "");
     const section = sanitizeInput(req.body.section || "").toUpperCase();
     const names = Array.isArray(req.body.names) ? req.body.names.map((n) => sanitizeInput(n)) : [];
@@ -5674,6 +5878,11 @@ app.post("/ai/voters/add", requireAIServiceOnly, aiMutationLimiter, async (req, 
     // ballots are being cast. (Real fix: move registration behind an admin session.)
     if (liveSystemStatus.isLive === true && process.env.AI_ADD_VOTERS_WHILE_LIVE !== "true") {
         return res.status(409).json({ error: "Voter registration is closed while the election is live." });
+    }
+    const electionConfig = await getUnifiedElectionConfig(false);
+    const regAuth = ElectionMgmt.authorizeRegistrationAction({ config: electionConfig, nowMs: Date.now() });
+    if (!regAuth.allowed) {
+        return res.status(regAuth.status).json({ error: regAuth.error, code: regAuth.code });
     }
     const grade = sanitizeInput(req.body.grade || '');
     const section = sanitizeInput(req.body.section || '');
@@ -6318,41 +6527,151 @@ app.post("/admin/election/reset", requireAdminKey, async (req, res) => {
     }
 });
 
+app.get("/admin/election/state", async (req, res) => {
+    try {
+        const unified = await getUnifiedElectionConfig(true);
+        const nowMs = Date.now();
+        const lifecycle = ElectionMgmt.deriveElectionLifecycle(unified, nowMs);
+        const activeSessionCount = await getActiveSessionCountAndPrune();
+        return res.json({
+            success: true,
+            serverTimeMs: nowMs,
+            activeSessionCount,
+            config: unified,
+            lifecycle
+        });
+    } catch (e) {
+        return res.status(500).json({ error: "Failed to load election state." });
+    }
+});
+
+app.get("/admin/election/audit", async (req, res) => {
+    try {
+        const snap = await db.collection("admin_audit")
+            .orderBy("createdAt", "desc")
+            .limit(30)
+            .get();
+        const logs = snap.docs.map((doc) => {
+            const d = doc.data() || {};
+            return {
+                id: doc.id,
+                action: d.action || "UNKNOWN",
+                adminEmail: d.adminEmail || "system",
+                electionId: d.electionId || null,
+                reason: d.reason || null,
+                createdAt: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : null
+            };
+        });
+        return res.json({ success: true, logs });
+    } catch (e) {
+        return res.status(500).json({ error: "Failed to load election audit logs." });
+    }
+});
+
 app.post("/admin/settings/session", gateMockElectionToggle, async (req, res) => {
     try {
-        const { voterTime, activeGrade, isLive, isQueue, isMockElection } = req.body;
-        const firestoreUpdate = {};
-        const rtdbUpdates = {};
+        const {
+            voterTime,
+            votingTimeLimitMinutes,
+            activeGrade,
+            gradeSessions,
+            isLive,
+            isPaused,
+            isQueue,
+            isMockElection,
+            expectedConfigVersion,
+            reason
+        } = req.body || {};
 
-        if (typeof isLive === "boolean") rtdbUpdates["status/isLive"] = isLive;
-        if (typeof isQueue === "boolean") rtdbUpdates["status/isQueue"] = isQueue;
-        if (typeof isMockElection === "boolean") rtdbUpdates["status/isMockElection"] = isMockElection;
+        const resolvedTimeLimit = votingTimeLimitMinutes !== undefined
+            ? votingTimeLimitMinutes
+            : (voterTime !== undefined && voterTime !== "" ? Number(voterTime) : undefined);
 
-        if (activeGrade !== undefined) {
-            firestoreUpdate.activeGrade = activeGrade === "ALL" ? "ALL" : Number(activeGrade);
-        }
+        const activeSessionCount = await getActiveSessionCountAndPrune();
+        const result = await updateUnifiedElectionConfig({
+            expectedVersion: expectedConfigVersion,
+            req,
+            auditAction: "SET_ELECTION_OPERATIONAL_STATE",
+            reason,
+            mutator: (current) => {
+                const check = ElectionMgmt.validateOperationalUpdate(current, {
+                    isLive,
+                    isPaused,
+                    isQueue,
+                    isMockElection,
+                    activeGrade,
+                    gradeSessions,
+                    votingTimeLimitMinutes: resolvedTimeLimit
+                }, { activeSessionCount, nowMs: Date.now() });
 
-        // CRITICAL FIX: Sync endTime to RTDB `status/endTime` so /vote actually enforces the countdown timer!
-        if (voterTime && !isNaN(voterTime) && Number(voterTime) > 0) {
-            const endTimeMs = Date.now() + Number(voterTime) * 60 * 1000;
-            firestoreUpdate.sessionTimer = new Date(endTimeMs).toISOString();
-            rtdbUpdates["status/endTime"] = endTimeMs;
-        } else if (Number(voterTime) === 0) {
-            firestoreUpdate.sessionTimer = admin.firestore.FieldValue.delete();
-            rtdbUpdates["status/endTime"] = null;
-        }
+                if (!check.ok) {
+                    const err = new Error(Object.values(check.errors)[0]);
+                    err.code = "VALIDATION_ERROR";
+                    err.errors = check.errors;
+                    throw err;
+                }
+                return { operational: check.nextOperational };
+            }
+        });
 
-        await Promise.all([
-            Object.keys(rtdbUpdates).length > 0 ? rtdb.ref("/").update(rtdbUpdates) : Promise.resolve(),
-            Object.keys(firestoreUpdate).length > 0
-                ? db.collection("settings").doc("electionStatus").set(firestoreUpdate, { merge: true })
-                : Promise.resolve()
-        ]);
-
-        await logAdminAction(req, "SET_ELECTION_SESSION", { isLive, isQueue, isMockElection, activeGrade, voterTime });
-        return res.json({ success: true, isLive, isQueue, isMockElection, activeGrade });
+        return res.json({
+            success: true,
+            configVersion: result.config.configVersion,
+            operational: result.config.operational,
+            lifecycle: result.lifecycle,
+            isLive: result.config.operational.isLive,
+            isPaused: result.config.operational.isPaused,
+            isQueue: result.config.operational.isQueue,
+            isMockElection: result.config.operational.isMockElection,
+            activeGrade: result.config.operational.activeGrade,
+            gradeSessions: result.config.operational.gradeSessions,
+            votingTimeLimitMinutes: result.config.operational.votingTimeLimitMinutes
+        });
     } catch (e) {
-        return res.status(500).json({ error: "Failed to update election status" });
+        if (e.code === "STALE_CONFIG") {
+            return res.status(409).json({ error: e.message, code: e.code, currentVersion: e.currentVersion });
+        }
+        if (e.code === "VALIDATION_ERROR") {
+            return res.status(400).json({ error: e.message, errors: e.errors });
+        }
+        return res.status(500).json({ error: "Failed to update election status." });
+    }
+});
+
+app.post("/admin/settings/schedule", async (req, res) => {
+    try {
+        const { registration, voting, expectedConfigVersion, reason } = req.body || {};
+        const result = await updateUnifiedElectionConfig({
+            expectedVersion: expectedConfigVersion,
+            req,
+            auditAction: "UPDATE_ELECTION_SCHEDULE",
+            reason,
+            mutator: (current) => {
+                const check = ElectionMgmt.validateScheduleUpdate(current, { registration, voting }, Date.now());
+                if (!check.ok) {
+                    const err = new Error(Object.values(check.errors)[0]);
+                    err.code = "VALIDATION_ERROR";
+                    err.errors = check.errors;
+                    throw err;
+                }
+                return { schedule: check.nextSchedule };
+            }
+        });
+
+        return res.json({
+            success: true,
+            configVersion: result.config.configVersion,
+            schedule: result.config.schedule,
+            lifecycle: result.lifecycle
+        });
+    } catch (e) {
+        if (e.code === "STALE_CONFIG") {
+            return res.status(409).json({ error: e.message, code: e.code, currentVersion: e.currentVersion });
+        }
+        if (e.code === "VALIDATION_ERROR") {
+            return res.status(400).json({ error: e.message, errors: e.errors });
+        }
+        return res.status(500).json({ error: "Failed to update election schedule." });
     }
 });
 
@@ -7552,6 +7871,11 @@ app.get("/ai/manual-verification/:id/status", requireAIServiceOnly, async (req, 
 
 app.post("/ai/manual-verification", requireAIServiceOnly, async (req, res) => {
     try {
+        const electionConfig = await getUnifiedElectionConfig(false);
+        const regAuth = ElectionMgmt.authorizeRegistrationAction({ config: electionConfig, nowMs: Date.now() });
+        if (!regAuth.allowed) {
+            return res.status(regAuth.status).json({ error: regAuth.error, code: regAuth.code });
+        }
         const { name, grade, section, reason, validationScore, geminiReasoning } = req.body;
 
         if (!name || !grade || !section) {
